@@ -213,3 +213,34 @@ def test_env_profile_loads_telegram_interval(tmp_path, monkeypatch):
     (tmp_path / "config" / "paper.env").write_text("TELEGRAM_REPORT_INTERVAL_SECONDS=123\n")
     cfg = BotConfig.from_env()
     assert cfg.telegram_report_interval_seconds == 123
+
+
+def test_fill_model_defaults_to_conservative_when_env_missing(monkeypatch):
+    monkeypatch.delenv("FILL_MODEL", raising=False)
+    cfg = BotConfig.from_env()
+    assert cfg.fill_model == "conservative"
+
+
+def test_paper_metrics_reflect_post_fill_state(tmp_path):
+    from src.main import _paper_metrics
+
+    class DummyCfg:
+        paper_mode = True
+        paper_start_balance_usd = 500.0
+
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "post_fill_state.json"), True, False, start_balance=500.0)
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 100.0, "size": 1.0}]
+    latest_close = 100.0
+
+    pre_unrealized, pre_equity, pre_notional = _paper_metrics(DummyCfg(), eng, DummyClient(), latest_close)
+    assert pre_unrealized == 0.0
+    assert pre_equity == 500.0
+    assert pre_notional == 0.0
+
+    fills = eng.on_candle({"open": 100.0, "high": 101.0, "low": 99.0, "close": latest_close})
+    assert len(fills) == 1
+
+    post_unrealized, post_equity, post_notional = _paper_metrics(DummyCfg(), eng, DummyClient(), latest_close)
+    assert post_unrealized == 0.0
+    assert post_equity < pre_equity
+    assert post_notional == 100.0
