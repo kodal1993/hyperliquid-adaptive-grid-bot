@@ -12,6 +12,13 @@ class MarketRegime(str, Enum):
     HIGH_VOL = "HIGH_VOL"
 
 
+class GridMode(str, Enum):
+    NEUTRAL = "neutral"
+    LONG_BIASED = "long_biased"
+    SHORT_BIASED = "short_biased"
+    REDUCE_ONLY = "reduce_only"
+
+
 @dataclass(slots=True)
 class GridLevel:
     price: float

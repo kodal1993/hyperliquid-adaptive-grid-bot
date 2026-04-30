@@ -14,8 +14,10 @@ class TelegramHandler:
     def send(self, text: str) -> None:
         if not self.token or not self.chat_id:
             return
-        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         try:
-            requests.post(url, json={"chat_id": self.chat_id, "text": text}, timeout=10)
+            requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage", json={"chat_id": self.chat_id, "text": text}, timeout=10)
         except Exception as exc:
             logger.warning("Telegram send failed: %s", exc)
+
+    def command_handlers(self) -> list[str]:
+        return ["/status", "/pause", "/resume", "/risk", "/positions", "/orders"]
