@@ -38,6 +38,11 @@ class BotConfig:
     emergency_stop_file: str
     telegram_bot_token: str
     telegram_chat_id: str
+    telegram_report_interval_seconds: int
+    telegram_send_startup: bool
+    telegram_send_fills: bool
+    telegram_send_risk_alerts: bool
+    telegram_send_periodic_status: bool
     state_file: str
     paper_mode: bool
     enable_live_trading: bool
@@ -92,6 +97,11 @@ class BotConfig:
             emergency_stop_file=os.getenv("EMERGENCY_STOP_FILE", "state/STOP"),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+            telegram_report_interval_seconds=int(os.getenv("TELEGRAM_REPORT_INTERVAL_SECONDS", "300")),
+            telegram_send_startup=os.getenv("TELEGRAM_SEND_STARTUP", "true").lower() == "true",
+            telegram_send_fills=os.getenv("TELEGRAM_SEND_FILLS", "true").lower() == "true",
+            telegram_send_risk_alerts=os.getenv("TELEGRAM_SEND_RISK_ALERTS", "true").lower() == "true",
+            telegram_send_periodic_status=os.getenv("TELEGRAM_SEND_PERIODIC_STATUS", "true").lower() == "true",
             state_file=os.getenv("STATE_FILE", "state/bot_state.json"),
             paper_mode=os.getenv("PAPER_MODE", "true").lower() == "true",
             enable_live_trading=os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true",

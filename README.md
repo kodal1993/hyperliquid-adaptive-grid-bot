@@ -80,3 +80,24 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now hyperliquid-grid-bot
 sudo systemctl status hyperliquid-grid-bot
 ```
+
+## Telegram Monitoring
+Set Telegram env vars in your local `.env` (never commit real tokens):
+
+```bash
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+TELEGRAM_REPORT_INTERVAL_SECONDS=300
+TELEGRAM_SEND_STARTUP=true
+TELEGRAM_SEND_FILLS=true
+TELEGRAM_SEND_RISK_ALERTS=true
+TELEGRAM_SEND_PERIODIC_STATUS=true
+```
+
+What the bot sends:
+- Startup report (once per process start).
+- Periodic status report (default every 300s).
+- Fill summaries (when fills occur).
+- Risk-block alerts (only once per reason change to avoid spam).
+
+⚠️ Never commit your Telegram bot token or chat ID to git.
