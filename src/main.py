@@ -21,6 +21,13 @@ def to_df(candles: list[dict]) -> pd.DataFrame:
     return pd.DataFrame([{"open": float(c["o"]), "high": float(c["h"]), "low": float(c["l"]), "close": float(c["c"])} for c in candles])
 
 
+def _paper_metrics(cfg: BotConfig, engine: ExecutionEngine, client: HyperliquidClient, latest_close: float) -> tuple[float, float, float]:
+    unrealized_pnl = engine.unrealized_pnl(latest_close) if cfg.paper_mode else 0.0
+    equity = engine.equity(latest_close) if cfg.paper_mode else client.get_balance().get("equity", cfg.paper_start_balance_usd)
+    position_notional = abs(engine.paper.position_size * latest_close) if cfg.paper_mode else 0.0
+    return unrealized_pnl, equity, position_notional
+
+
 def run() -> None:
     cfg = BotConfig.from_env()
     setup_logging(cfg.log_level)
@@ -62,8 +69,7 @@ def run() -> None:
         candles_raw = client.get_candles(cfg.default_symbol, lookback=200)
         candles = to_df(candles_raw)
         latest_close = float(candles["close"].iloc[-1])
-        unrealized_pnl = engine.unrealized_pnl(latest_close) if cfg.paper_mode else 0.0
-        equity = engine.equity(latest_close) if cfg.paper_mode else client.get_balance().get("equity", cfg.paper_start_balance_usd)
+        unrealized_pnl, equity, position_notional = _paper_metrics(cfg, engine, client, latest_close)
         now_day = datetime.now(timezone.utc).date()
         if now_day != current_day:
             current_day = now_day
@@ -72,9 +78,9 @@ def run() -> None:
             engine.paper.daily_start_equity = daily_start_equity
             engine.save_state()
         daily_pnl_pct = 0.0 if daily_start_equity <= 0 else (equity - daily_start_equity) / daily_start_equity
-        position_notional = abs(engine.paper.position_size * latest_close) if cfg.paper_mode else 0.0
         status = orchestrator.on_tick(candles, equity=equity, daily_pnl_pct=daily_pnl_pct, symbol=cfg.default_symbol, position_notional=position_notional)
         fills = engine.on_candle(candles.iloc[-1].to_dict())
+        unrealized_pnl, equity, position_notional = _paper_metrics(cfg, engine, client, latest_close)
 
         for f in fills:
             append_csv("logs/trades.csv", [time.time(), f["symbol"], f["side"], f["price"], f["size"]], ["ts", "symbol", "side", "price", "size"])

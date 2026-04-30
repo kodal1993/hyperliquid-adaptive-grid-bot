@@ -54,7 +54,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 # edit .env (keep PAPER_MODE=true first)
-pytest -q
+PYTHONPATH=. pytest -q
 python -m py_compile src/*.py
 ```
 
