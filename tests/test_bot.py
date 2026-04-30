@@ -69,3 +69,66 @@ def test_paper_equity_includes_unrealized():
     eng.paper.avg_entry = 100.0
     assert eng.unrealized_pnl(110.0) == 10.0
     assert eng.equity(110.0) == 510.0
+
+
+def test_apply_fill_partial_close(tmp_path):
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "s.json"))
+    eng.paper.position_size = 2.0
+    eng.paper.avg_entry = 100.0
+    eng._apply_fill({"side": "sell", "price": 110.0, "size": 1.0})
+    assert eng.paper.position_size == 1.0
+    assert eng.paper.realized_pnl > 9.9
+    assert eng.paper.avg_entry == 100.0
+
+
+def test_apply_fill_full_close_resets_avg(tmp_path):
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "s2.json"))
+    eng.paper.position_size = 1.0
+    eng.paper.avg_entry = 100.0
+    eng._apply_fill({"side": "sell", "price": 105.0, "size": 1.0})
+    assert eng.paper.position_size == 0.0
+    assert eng.paper.avg_entry == 0.0
+
+
+def test_apply_fill_long_to_short_flip(tmp_path):
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "s3.json"))
+    eng.paper.position_size = 1.0
+    eng.paper.avg_entry = 100.0
+    eng._apply_fill({"side": "sell", "price": 110.0, "size": 2.0})
+    assert eng.paper.position_size == -1.0
+    assert eng.paper.realized_pnl > 9.9
+    assert eng.paper.avg_entry == 110.0
+
+
+def test_apply_fill_short_to_long_flip(tmp_path):
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "s4.json"))
+    eng.paper.position_size = -1.0
+    eng.paper.avg_entry = 100.0
+    eng._apply_fill({"side": "buy", "price": 90.0, "size": 2.0})
+    assert eng.paper.position_size == 1.0
+    assert eng.paper.realized_pnl > 9.9
+    assert eng.paper.avg_entry == 90.0
+
+
+def test_conservative_fill_model_wide_candle(tmp_path):
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "s5.json"), fill_model="conservative")
+    eng.open_orders = [
+        {"symbol": "BTC", "side": "buy", "price": 95, "size": 1},
+        {"symbol": "BTC", "side": "buy", "price": 90, "size": 1},
+        {"symbol": "BTC", "side": "sell", "price": 105, "size": 1},
+        {"symbol": "BTC", "side": "sell", "price": 110, "size": 1},
+    ]
+    fills = eng.on_candle({"open": 100, "high": 112, "low": 88, "close": 101})
+    assert len(fills) == 2
+    assert {f["price"] for f in fills} == {95, 105}
+
+
+def test_daily_state_persistence(tmp_path):
+    state_file = str(tmp_path / "persist.json")
+    eng = ExecutionEngine(DummyClient(), state_file)
+    eng.paper.current_day = "2026-04-29"
+    eng.paper.daily_start_equity = 777.0
+    eng.save_state()
+    eng2 = ExecutionEngine(DummyClient(), state_file)
+    assert eng2.paper.current_day == "2026-04-29"
+    assert eng2.paper.daily_start_equity == 777.0

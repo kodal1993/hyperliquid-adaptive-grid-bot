@@ -45,6 +45,7 @@ class BotConfig:
     allow_short_biased: bool
     log_level: str
     paper_start_balance_usd: float
+    fill_model: str
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -98,4 +99,5 @@ class BotConfig:
             allow_short_biased=os.getenv("ALLOW_SHORT_BIASED", "false").lower() == "true",
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             paper_start_balance_usd=float(os.getenv("PAPER_START_BALANCE_USD", "500")),
+            fill_model=os.getenv("FILL_MODEL", "optimistic").lower(),
         )
