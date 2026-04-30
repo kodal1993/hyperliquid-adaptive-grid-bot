@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 import requests
 
@@ -39,16 +40,24 @@ class HyperliquidClient:
         return float(mids[symbol])
 
     def get_candles(self, symbol: str, interval: str = "1m", lookback: int = 200) -> list[dict[str, Any]]:
+        interval_minutes = self._interval_minutes(interval)
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - lookback * interval_minutes * 60 * 1000
         if self.info is not None:
             try:
-                import time
-
-                end_ms = int(time.time() * 1000)
-                start_ms = end_ms - lookback * 60 * 1000
                 return self.info.candles_snapshot(symbol, interval, start_ms, end_ms)
             except Exception:
                 pass
-        return self._post_info({"type": "candleSnapshot", "req": {"coin": symbol, "interval": interval, "startTime": 0, "endTime": 0}})
+        return self._post_info({"type": "candleSnapshot", "req": {"coin": symbol, "interval": interval, "startTime": start_ms, "endTime": end_ms}})
+
+    def _interval_minutes(self, interval: str) -> int:
+        if interval.endswith("m"):
+            return max(1, int(interval[:-1]))
+        if interval.endswith("h"):
+            return max(1, int(interval[:-1]) * 60)
+        if interval.endswith("d"):
+            return max(1, int(interval[:-1]) * 24 * 60)
+        return 1
 
     def get_balance(self) -> dict[str, Any]:
         if self.info is not None and self.account_address:

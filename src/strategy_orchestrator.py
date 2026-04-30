@@ -32,6 +32,23 @@ class StrategyOrchestrator:
             return {"status": "paused", "regime": regime.value, "risk": risk_state}
 
         vol = candles["close"].pct_change().std()
-        plan: GridPlan = self.grid_manager.build_grid(float(candles["close"].iloc[-1]), self.config.grid_levels, self.config.grid_spacing_pct, float(vol), regime, max(1.0, self.config.max_notional_per_trade_usd / float(candles["close"].iloc[-1])), self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode)
+        price = float(candles["close"].iloc[-1])
+        order_size = self._calculate_order_size(price)
+        order_notional = order_size * price
+        plan: GridPlan = self.grid_manager.build_grid(price, self.config.grid_levels, self.config.grid_spacing_pct, float(vol), regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode)
         result = self.execution_engine.cancel_replace_grid(symbol, plan)
-        return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value}
+        return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional}
+
+    def _calculate_order_size(self, price: float) -> float:
+        raw_size = self.config.max_notional_per_trade_usd / max(price, 1e-9)
+        size = min(max(raw_size, self.config.min_order_size), self.config.max_order_size)
+        notional = size * price
+        if notional > self.config.max_notional_per_trade_usd:
+            size = self.config.max_notional_per_trade_usd / max(price, 1e-9)
+            notional = size * price
+        if notional < self.config.min_notional_usd:
+            size = self.config.min_notional_usd / max(price, 1e-9)
+        size = min(size, self.config.max_order_size)
+        if size * price > self.config.max_notional_per_trade_usd:
+            size = self.config.max_notional_per_trade_usd / max(price, 1e-9)
+        return max(size, 0.0)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 import pandas as pd
 
 from .config import BotConfig
@@ -30,17 +31,33 @@ def run() -> None:
     engine = ExecutionEngine(client=client, state_file=cfg.state_file, paper_mode=cfg.paper_mode, enable_live_trading=cfg.enable_live_trading, start_balance=cfg.paper_start_balance_usd)
     orchestrator = StrategyOrchestrator(config=cfg, execution_engine=engine)
     tg = TelegramHandler(cfg.telegram_bot_token, cfg.telegram_chat_id)
+    current_day = datetime.now(timezone.utc).date()
+    daily_start_equity = cfg.paper_start_balance_usd
 
     while True:
         candles_raw = client.get_candles(cfg.default_symbol, lookback=200)
         candles = to_df(candles_raw)
-        equity = engine.paper.cash if cfg.paper_mode else client.get_balance().get("equity", cfg.paper_start_balance_usd)
-        status = orchestrator.on_tick(candles, equity=equity, daily_pnl_pct=0.0, symbol=cfg.default_symbol)
+        latest_close = float(candles["close"].iloc[-1])
+        unrealized_pnl = engine.unrealized_pnl(latest_close) if cfg.paper_mode else 0.0
+        equity = engine.equity(latest_close) if cfg.paper_mode else client.get_balance().get("equity", cfg.paper_start_balance_usd)
+        now_day = datetime.now(timezone.utc).date()
+        if now_day != current_day:
+            current_day = now_day
+            daily_start_equity = equity
+        daily_pnl_pct = 0.0 if daily_start_equity <= 0 else (equity - daily_start_equity) / daily_start_equity
+        status = orchestrator.on_tick(candles, equity=equity, daily_pnl_pct=daily_pnl_pct, symbol=cfg.default_symbol)
         fills = engine.on_candle(candles.iloc[-1].to_dict())
         for f in fills:
             append_csv("logs/trades.csv", [time.time(), f["symbol"], f["side"], f["price"], f["size"]], ["ts", "symbol", "side", "price", "size"])
-        append_csv("logs/equity_curve.csv", [time.time(), engine.paper.cash, engine.paper.realized_pnl], ["ts", "equity", "realized_pnl"])
+        append_csv("logs/equity_curve.csv", [time.time(), equity, engine.paper.cash, engine.paper.realized_pnl, unrealized_pnl, engine.paper.fees_paid], ["ts", "equity", "cash", "realized_pnl", "unrealized_pnl", "fees_paid"])
         save_json(cfg.state_file, {"status": str(status), "paper": engine.paper.__dict__})
+        position_notional = abs(engine.paper.position_size * latest_close) if cfg.paper_mode else 0.0
+        logger.info(
+            "tick symbol=%s price=%.6f regime=%s mode=%s order_size=%.8f order_notional=%.6f position_size=%.8f position_notional=%.6f cash=%.6f realized_pnl=%.6f unrealized_pnl=%.6f fees_paid=%.6f equity=%.6f daily_pnl_pct=%.6f risk_state=%s pause_reason=%s",
+            cfg.default_symbol, latest_close, status.get("regime"), status.get("mode"), status.get("order_size", 0.0), status.get("order_notional", 0.0),
+            engine.paper.position_size, position_notional, engine.paper.cash, engine.paper.realized_pnl, unrealized_pnl, engine.paper.fees_paid, equity, daily_pnl_pct,
+            getattr(status.get("risk"), "reason", ""), status.get("reason", ""),
+        )
         tg.send(f"[{cfg.env_profile}] regime={status.get('regime')} status={status['status']}")
         time.sleep(cfg.tick_seconds)
 
