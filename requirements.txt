@@ -1,0 +1,7 @@
+hyperliquid-python-sdk
+python-dotenv
+pandas
+numpy
+requests
+python-telegram-bot>=21.0
+ccxt
