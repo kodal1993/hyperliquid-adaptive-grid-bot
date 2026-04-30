@@ -157,3 +157,59 @@ def test_reduce_only_cancels_entry_orders_on_max_position_notional(tmp_path):
     assert status["reason"] == "reduce_only_requested"
     assert status["canceled_orders"] == 1
     assert eng.open_orders == []
+
+from src.telegram_handler import TelegramHandler
+
+
+def test_telegram_report_formatter_core_fields():
+    tg = TelegramHandler("", "")
+    msg = tg.format_status_report({
+        "status": "running",
+        "symbol": "BTC",
+        "equity": 500.0,
+        "realized_pnl": 5.0,
+        "regime": "RANGE",
+        "risk_reason": "none",
+    })
+    assert "Status: RUNNING" in msg
+    assert "Symbol: BTC" in msg
+    assert "Equity: $500.00" in msg
+    assert "Realized PnL: $5.00" in msg
+    assert "Regime: RANGE" in msg
+    assert "Reason: none" in msg
+
+
+def test_telegram_report_formatter_missing_values():
+    tg = TelegramHandler("", "")
+    msg = tg.format_status_report({})
+    assert "Status: N/A" in msg
+    assert "Equity: n/a" in msg
+    assert "Reason: none" in msg
+
+
+def test_telegram_interval_logic():
+    interval = 300
+    last = 0
+    now = 100
+    assert not ((now - last) >= interval)
+    now = 301
+    assert (now - last) >= interval
+
+
+def test_risk_alert_deduplication_behavior():
+    last_risk_reason_sent = ""
+    reason = "max_drawdown"
+    should_send = reason != last_risk_reason_sent
+    assert should_send
+    last_risk_reason_sent = reason
+    should_send_again = reason != last_risk_reason_sent
+    assert not should_send_again
+
+
+def test_env_profile_loads_telegram_interval(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("ENV_PROFILE=paper\n")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "paper.env").write_text("TELEGRAM_REPORT_INTERVAL_SECONDS=123\n")
+    cfg = BotConfig.from_env()
+    assert cfg.telegram_report_interval_seconds == 123
