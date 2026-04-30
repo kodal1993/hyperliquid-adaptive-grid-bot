@@ -46,7 +46,7 @@ def test_paper_fill_simulation(tmp_path):
 
 
 def test_regime_detector_basic():
-    df = pd.DataFrame({"close": [100 + i for i in range(40)], "high": [101 + i for i in range(40)], "low": [99 + i for i in range(40)]})
+    df = pd.DataFrame({"close": [100 for _ in range(40)], "high": [101 for _ in range(40)], "low": [99 for _ in range(40)]})
     regime = RegimeDetector().detect(df)
     assert regime in {MarketRegime.TREND_UP, MarketRegime.HIGH_VOL, MarketRegime.RANGE}
 
@@ -132,3 +132,28 @@ def test_daily_state_persistence(tmp_path):
     eng2 = ExecutionEngine(DummyClient(), state_file)
     assert eng2.paper.current_day == "2026-04-29"
     assert eng2.paper.daily_start_equity == 777.0
+
+
+def test_paper_profile_uses_conservative_fill_model(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("ENV_PROFILE=paper\n")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "paper.env").write_text("FILL_MODEL=conservative\n")
+    cfg = BotConfig.from_env()
+    assert cfg.fill_model == "conservative"
+
+
+def test_reduce_only_cancels_entry_orders_on_max_position_notional(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.max_position_notional_usd = 10
+    cfg.max_drawdown_pct = 0.9
+    cfg.daily_loss_limit_pct = 0.9
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "state_reduce_only.json"), True, False)
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 1.0}]
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 for _ in range(40)], "high": [101 for _ in range(40)], "low": [99 for _ in range(40)]})
+    status = orch.on_tick(candles, equity=100.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=20.0)
+    assert status["status"] == "paused"
+    assert status["reason"] == "reduce_only_requested"
+    assert status["canceled_orders"] == 1
+    assert eng.open_orders == []

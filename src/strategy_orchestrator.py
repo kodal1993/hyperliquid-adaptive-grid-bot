@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import pandas as pd
 from .config import BotConfig
 from .execution_engine import ExecutionEngine
@@ -7,6 +8,9 @@ from .grid_manager import GridManager, GridPlan
 from .regime_detector import RegimeDetector
 from .risk_manager import RiskManager
 from .types import GridMode, MarketRegime
+
+
+logger = logging.getLogger(__name__)
 
 
 class StrategyOrchestrator:
@@ -36,7 +40,11 @@ class StrategyOrchestrator:
             liquidation_distance_pct=liquidation_distance_pct, min_liquidation_distance_pct=self.config.liquidation_distance_min_pct,
         )
         if not risk_state.can_trade or regime == MarketRegime.RISK_OFF:
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": risk_state.reason == "max_position_notional"}
+            if risk_state.reason == "max_position_notional":
+                canceled = self.execution_engine.cancel_all_orders(symbol)
+                logger.warning("reduce_only_requested symbol=%s reason=%s canceled_orders=%s", symbol, risk_state.reason, canceled)
+                return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": False}
 
         vol = candles["close"].pct_change().std()
         price = float(candles["close"].iloc[-1])

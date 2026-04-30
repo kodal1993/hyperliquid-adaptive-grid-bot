@@ -45,6 +45,11 @@ class ExecutionEngine:
         self.open_orders = [{"symbol": symbol, "side": o.side, "price": o.price, "size": o.size} for o in (plan.long_levels + plan.short_levels)]
         return {"canceled": 0, "placed": len(self.open_orders), "symbol": symbol}
 
+    def cancel_all_orders(self, symbol: str) -> int:
+        before = len(self.open_orders)
+        self.open_orders = [o for o in self.open_orders if o.get("symbol") != symbol]
+        return before - len(self.open_orders)
+
     def on_candle(self, candle: dict) -> list[dict]:
         high, low = float(candle["high"]), float(candle["low"])
         fills = self._pick_fills(candle, high, low)
