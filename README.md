@@ -29,6 +29,7 @@ cp .env.example .env
 - Per-trade sizing: `MIN_NOTIONAL_USD`, `MAX_NOTIONAL_PER_TRADE_USD`, `MIN_ORDER_SIZE`, `MAX_ORDER_SIZE`
 - Exposure/risk: `MAX_POSITION_NOTIONAL_USD`, `MAX_ONE_DIRECTION_EXPOSURE_PCT`, `MAX_DRAWDOWN_PCT`, `DAILY_LOSS_LIMIT_PCT`
 - Execution model: `FILL_MODEL=optimistic|conservative|ohlc_path`
+- Recommended paper profile: `FILL_MODEL=conservative` (avoid `optimistic` for realistic fills).
 - Runtime guard: `PAPER_MODE=true`, `ENABLE_LIVE_TRADING=false`
 
 ## Run

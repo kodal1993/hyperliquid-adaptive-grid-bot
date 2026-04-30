@@ -23,7 +23,7 @@ def to_df(candles: list[dict]) -> pd.DataFrame:
 def run() -> None:
     cfg = BotConfig.from_env()
     setup_logging(cfg.log_level)
-    logger.info("Startup profile=%s paper_mode=%s", cfg.env_profile, cfg.paper_mode)
+    logger.info("Startup profile=%s paper_mode=%s fill_model=%s", cfg.env_profile, cfg.paper_mode, cfg.fill_model)
     run_startup_validation(cfg)
 
     client = HyperliquidClient(cfg.private_key, cfg.account_address, cfg.hl_network)
