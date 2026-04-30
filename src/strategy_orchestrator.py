@@ -17,7 +17,7 @@ class StrategyOrchestrator:
         self.risk = RiskManager(config.max_drawdown_pct, config.daily_loss_limit_pct)
         self.grid_manager = GridManager()
 
-    def on_tick(self, candles: pd.DataFrame, equity: float, daily_pnl_pct: float, symbol: str) -> dict:
+    def on_tick(self, candles: pd.DataFrame, equity: float, daily_pnl_pct: float, symbol: str, position_notional: float = 0.0) -> dict:
         regime = self.detector.detect(candles)
         mode = GridMode.NEUTRAL
         if regime == MarketRegime.TREND_UP and self.config.allow_long_biased:
@@ -27,9 +27,16 @@ class StrategyOrchestrator:
         elif regime in (MarketRegime.TREND_UP, MarketRegime.TREND_DOWN):
             return {"status": "paused", "regime": regime.value, "reason": "neutral_blocked_in_trend"}
 
-        risk_state = self.risk.evaluate(equity=equity, daily_pnl_pct=daily_pnl_pct, emergency_stop=self.config.emergency_stop, stop_file=self.config.emergency_stop_file)
+        liquidation_distance_pct = 1.0 if self.config.paper_mode else 0.5
+        one_direction_exposure_pct = 0.0 if equity <= 0 else position_notional / equity
+        risk_state = self.risk.evaluate(
+            equity=equity, daily_pnl_pct=daily_pnl_pct, emergency_stop=self.config.emergency_stop, stop_file=self.config.emergency_stop_file,
+            position_notional=position_notional, max_position_notional=self.config.max_position_notional_usd,
+            one_direction_exposure_pct=one_direction_exposure_pct, max_one_direction_exposure_pct=self.config.max_one_direction_exposure_pct,
+            liquidation_distance_pct=liquidation_distance_pct, min_liquidation_distance_pct=self.config.liquidation_distance_min_pct,
+        )
         if not risk_state.can_trade or regime == MarketRegime.RISK_OFF:
-            return {"status": "paused", "regime": regime.value, "risk": risk_state}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": risk_state.reason == "max_position_notional"}
 
         vol = candles["close"].pct_change().std()
         price = float(candles["close"].iloc[-1])
