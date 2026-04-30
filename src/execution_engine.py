@@ -66,3 +66,11 @@ class ExecutionEngine:
             self.paper.realized_pnl += pnl
             self.paper.cash += pnl
         self.paper.position_size = new_pos
+
+    def unrealized_pnl(self, mark_price: float) -> float:
+        if self.paper.position_size == 0:
+            return 0.0
+        return (mark_price - self.paper.avg_entry) * self.paper.position_size
+
+    def equity(self, mark_price: float) -> float:
+        return self.paper.cash + self.unrealized_pnl(mark_price)

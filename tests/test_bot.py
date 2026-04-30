@@ -8,6 +8,7 @@ from src.regime_detector import RegimeDetector
 from src.risk_manager import RiskManager
 from src.types import MarketRegime, GridMode
 from src.execution_engine import ExecutionEngine
+from src.strategy_orchestrator import StrategyOrchestrator
 
 
 class DummyClient:
@@ -48,3 +49,23 @@ def test_regime_detector_basic():
     df = pd.DataFrame({"close": [100 + i for i in range(40)], "high": [101 + i for i in range(40)], "low": [99 + i for i in range(40)]})
     regime = RegimeDetector().detect(df)
     assert regime in {MarketRegime.TREND_UP, MarketRegime.HIGH_VOL, MarketRegime.RANGE}
+
+
+def test_order_size_notional_based():
+    cfg = BotConfig.from_env()
+    cfg.max_notional_per_trade_usd = 50
+    cfg.min_order_size = 0.0
+    cfg.max_order_size = 10.0
+    cfg.min_notional_usd = 1.0
+    orch = StrategyOrchestrator(cfg, ExecutionEngine(DummyClient(), "/tmp/state.json", True, False))
+    size = orch._calculate_order_size(60000)
+    assert abs(size - 0.0008333333) < 1e-6
+    assert size * 60000 <= 50.0
+
+
+def test_paper_equity_includes_unrealized():
+    eng = ExecutionEngine(DummyClient(), "/tmp/state2.json", True, False, start_balance=500)
+    eng.paper.position_size = 1.0
+    eng.paper.avg_entry = 100.0
+    assert eng.unrealized_pnl(110.0) == 10.0
+    assert eng.equity(110.0) == 510.0

@@ -26,6 +26,9 @@ class BotConfig:
     regrid_threshold_pct: float
     min_grid_profit_over_fees_pct: float
     max_notional_per_trade_usd: float
+    min_order_size: float
+    max_order_size: float
+    min_notional_usd: float
     max_position_notional_usd: float
     max_one_direction_exposure_pct: float
     max_drawdown_pct: float
@@ -76,6 +79,9 @@ class BotConfig:
             regrid_threshold_pct=float(os.getenv("REGRID_THRESHOLD_PCT", "0.003")),
             min_grid_profit_over_fees_pct=float(os.getenv("MIN_GRID_PROFIT_OVER_FEES_PCT", "0.0005")),
             max_notional_per_trade_usd=float(os.getenv("MAX_NOTIONAL_PER_TRADE_USD", "50")),
+            min_order_size=float(os.getenv("MIN_ORDER_SIZE", "0.0001")),
+            max_order_size=float(os.getenv("MAX_ORDER_SIZE", "10")),
+            min_notional_usd=float(os.getenv("MIN_NOTIONAL_USD", "10")),
             max_position_notional_usd=float(os.getenv("MAX_POSITION_NOTIONAL_USD", "500")),
             max_one_direction_exposure_pct=float(os.getenv("MAX_ONE_DIRECTION_EXPOSURE_PCT", "0.6")),
             max_drawdown_pct=float(os.getenv("MAX_DRAWDOWN_PCT", "0.30")),
