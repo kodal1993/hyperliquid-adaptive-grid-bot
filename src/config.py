@@ -31,6 +31,7 @@ class BotConfig:
     min_notional_usd: float
     max_position_notional_usd: float
     max_one_direction_exposure_pct: float
+    max_directional_exposure_pct: float
     max_drawdown_pct: float
     daily_loss_limit_pct: float
     liquidation_distance_min_pct: float
@@ -48,6 +49,11 @@ class BotConfig:
     enable_live_trading: bool
     allow_long_biased: bool
     allow_short_biased: bool
+    paper_auto_flatten_on_max_position: bool
+    trend_lookback_candles: int
+    trend_move_threshold_pct: float
+    ema_slope_threshold_pct: float
+    stuck_position_minutes: int
     log_level: str
     paper_start_balance_usd: float
     fill_model: str
@@ -90,6 +96,7 @@ class BotConfig:
             min_notional_usd=float(os.getenv("MIN_NOTIONAL_USD", "10")),
             max_position_notional_usd=float(os.getenv("MAX_POSITION_NOTIONAL_USD", "500")),
             max_one_direction_exposure_pct=float(os.getenv("MAX_ONE_DIRECTION_EXPOSURE_PCT", "0.6")),
+            max_directional_exposure_pct=float(os.getenv("MAX_DIRECTIONAL_EXPOSURE_PCT", "0.65")),
             max_drawdown_pct=float(os.getenv("MAX_DRAWDOWN_PCT", "0.30")),
             daily_loss_limit_pct=float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0.06")),
             liquidation_distance_min_pct=float(os.getenv("LIQUIDATION_DISTANCE_MIN_PCT", "0.05")),
@@ -107,6 +114,11 @@ class BotConfig:
             enable_live_trading=os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true",
             allow_long_biased=os.getenv("ALLOW_LONG_BIASED", "false").lower() == "true",
             allow_short_biased=os.getenv("ALLOW_SHORT_BIASED", "false").lower() == "true",
+            paper_auto_flatten_on_max_position=os.getenv("PAPER_AUTO_FLATTEN_ON_MAX_POSITION", "false").lower() == "true",
+            trend_lookback_candles=int(os.getenv("TREND_LOOKBACK_CANDLES", "60")),
+            trend_move_threshold_pct=float(os.getenv("TREND_MOVE_THRESHOLD_PCT", "0.006")),
+            ema_slope_threshold_pct=float(os.getenv("EMA_SLOPE_THRESHOLD_PCT", "0.003")),
+            stuck_position_minutes=int(os.getenv("STUCK_POSITION_MINUTES", "60")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             paper_start_balance_usd=float(os.getenv("PAPER_START_BALANCE_USD", "500")),
             fill_model=os.getenv("FILL_MODEL", "conservative").lower(),

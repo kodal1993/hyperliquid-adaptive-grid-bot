@@ -143,20 +143,22 @@ def test_paper_profile_uses_conservative_fill_model(tmp_path, monkeypatch):
     assert cfg.fill_model == "conservative"
 
 
-def test_reduce_only_cancels_entry_orders_on_max_position_notional(tmp_path):
+def test_reduce_only_places_directional_orders_on_max_position_notional(tmp_path):
     cfg = BotConfig.from_env()
     cfg.max_position_notional_usd = 10
     cfg.max_drawdown_pct = 0.9
     cfg.daily_loss_limit_pct = 0.9
     eng = ExecutionEngine(DummyClient(), str(tmp_path / "state_reduce_only.json"), True, False)
-    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 1.0}]
+    eng.paper.position_size = -2.0
+    eng.open_orders = [{"symbol": "BTC", "side": "sell", "price": 101.0, "size": 1.0}]
     orch = StrategyOrchestrator(cfg, eng)
     candles = pd.DataFrame({"close": [100 for _ in range(40)], "high": [101 for _ in range(40)], "low": [99 for _ in range(40)]})
     status = orch.on_tick(candles, equity=100.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=20.0)
     assert status["status"] == "paused"
     assert status["reason"] == "reduce_only_requested"
     assert status["canceled_orders"] == 1
-    assert eng.open_orders == []
+    assert status["reduce_only_placed"] > 0
+    assert all(o["side"] == "buy" for o in eng.open_orders)
 
 from src.telegram_handler import TelegramHandler
 
@@ -244,3 +246,47 @@ def test_paper_metrics_reflect_post_fill_state(tmp_path):
     assert post_unrealized == 0.0
     assert post_equity < pre_equity
     assert post_notional == 100.0
+
+
+def test_short_position_cannot_place_more_sell_expansion_orders(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.max_position_notional_usd = 100
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "state_short_guard.json"), True, False)
+    eng.paper.position_size = -1.0
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [101 for _ in range(80)], "low": [99 for _ in range(80)]})
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=100.0)
+    assert status["status"] == "running"
+    assert all(o["side"] == "buy" for o in eng.open_orders)
+
+
+def test_long_position_cannot_place_more_buy_expansion_orders(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.max_position_notional_usd = 100
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "state_long_guard.json"), True, False)
+    eng.paper.position_size = 1.0
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [101 for _ in range(80)], "low": [99 for _ in range(80)]})
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=100.0)
+    assert status["status"] == "running"
+    assert all(o["side"] == "sell" for o in eng.open_orders)
+
+
+def test_upward_price_drift_classified_trend_up():
+    closes = [100 + (i * 0.2) for i in range(120)]
+    df = pd.DataFrame({"close": closes, "high": [c * 1.001 for c in closes], "low": [c * 0.999 for c in closes]})
+    regime = RegimeDetector().detect(df, trend_lookback_candles=60, trend_move_threshold_pct=0.006, ema_slope_threshold_pct=0.003)
+    assert regime == MarketRegime.TREND_UP
+
+
+def test_neutral_grid_blocked_when_directional_exposure_high(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.max_position_notional_usd = 100
+    cfg.max_directional_exposure_pct = 0.65
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "state_dir_guard.json"), True, False)
+    eng.paper.position_size = -0.7  # $70 short at $100, above 65 threshold
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [101 for _ in range(80)], "low": [99 for _ in range(80)]})
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=70.0)
+    assert status["status"] == "running"
+    assert status["allow_sells"] is False

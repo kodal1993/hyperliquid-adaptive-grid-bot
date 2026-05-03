@@ -48,6 +48,8 @@ def run() -> None:
     last_risk_reason_sent = ""
     startup_report_sent = False
     first_fill_sent = False
+    stuck_since_ts: float | None = None
+    stuck_alert_sent = False
 
     if cfg.telegram_send_startup and not startup_report_sent:
         tg.send(
@@ -88,6 +90,20 @@ def run() -> None:
         engine.paper.current_day = current_day.isoformat()
         engine.paper.daily_start_equity = daily_start_equity
         engine.save_state()
+
+        stuck_threshold = cfg.max_position_notional_usd * 0.5
+        if position_notional > stuck_threshold:
+            if stuck_since_ts is None:
+                stuck_since_ts = time.time()
+                stuck_alert_sent = False
+            stuck_minutes = (time.time() - stuck_since_ts) / 60.0
+            if stuck_minutes >= cfg.stuck_position_minutes and not stuck_alert_sent:
+                logger.warning("stuck_inventory symbol=%s position_notional=%.2f threshold=%.2f minutes=%.2f", cfg.default_symbol, position_notional, stuck_threshold, stuck_minutes)
+                tg.send("\n".join(["⚠️ stuck_inventory", f"Symbol: {cfg.default_symbol}", f"Position Notional: ${position_notional:,.2f}", f"Threshold: ${stuck_threshold:,.2f}", f"Minutes: {stuck_minutes:.1f}"]))
+                stuck_alert_sent = True
+        else:
+            stuck_since_ts = None
+            stuck_alert_sent = False
 
         risk = status.get("risk")
         reason = status.get("reason") or (getattr(risk, "reason", "") if risk else "")
