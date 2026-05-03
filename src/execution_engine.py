@@ -50,6 +50,30 @@ class ExecutionEngine:
         self.open_orders = [o for o in self.open_orders if o.get("symbol") != symbol]
         return before - len(self.open_orders)
 
+
+    def place_reduce_only_orders(self, symbol: str, position_size: float, mark_price: float, order_size: float, levels: int = 3) -> int:
+        if abs(position_size) < 1e-12:
+            return 0
+        side = "buy" if position_size < 0 else "sell"
+        remaining = abs(position_size)
+        per_level = max(min(order_size, remaining), 0.0)
+        placed = 0
+        for i in range(levels):
+            if remaining <= 1e-12:
+                break
+            sz = min(per_level, remaining)
+            px = mark_price * (1 - 0.001 * (i + 1)) if side == "buy" else mark_price * (1 + 0.001 * (i + 1))
+            self.open_orders.append({"symbol": symbol, "side": side, "price": px, "size": sz, "reduce_only": True})
+            remaining -= sz
+            placed += 1
+        return placed
+
+    def flatten_position(self, symbol: str, mark_price: float) -> bool:
+        if abs(self.paper.position_size) < 1e-12:
+            return False
+        side = "buy" if self.paper.position_size < 0 else "sell"
+        self._apply_fill({"symbol": symbol, "side": side, "price": mark_price, "size": abs(self.paper.position_size)})
+        return True
     def on_candle(self, candle: dict) -> list[dict]:
         high, low = float(candle["high"]), float(candle["low"])
         fills = self._pick_fills(candle, high, low)
