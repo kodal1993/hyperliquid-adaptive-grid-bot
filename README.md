@@ -101,3 +101,17 @@ What the bot sends:
 - Risk-block alerts (only once per reason change to avoid spam).
 
 ⚠️ Never commit your Telegram bot token or chat ID to git.
+
+
+## Service Commands
+
+Bot:
+```bash
+sudo systemctl restart hyperliquid-grid-bot.service
+journalctl -u hyperliquid-grid-bot.service -f
+```
+
+Dashboard:
+```bash
+python -m src.dashboard_server --host 0.0.0.0 --port 8000
+```
