@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 import logging
+from datetime import datetime, timezone
 import time
 from pathlib import Path
+
 from .grid_manager import GridPlan
 from .hyperliquid_client import HyperliquidClient
 
@@ -21,6 +23,7 @@ class PaperState:
 
 
 logger = logging.getLogger(__name__)
+
 
 class ExecutionEngine:
     def __init__(self, client: HyperliquidClient, state_file: str, paper_mode: bool = True, enable_live_trading: bool = False, fee_rate: float = 0.0004, start_balance: float = 500.0, fill_model: str = "optimistic") -> None:
@@ -56,7 +59,6 @@ class ExecutionEngine:
         self.open_orders = [o for o in self.open_orders if o.get("symbol") != symbol]
         return before - len(self.open_orders)
 
-
     def place_reduce_only_orders(self, symbol: str, position_size: float, mark_price: float, order_size: float, levels: int = 3) -> int:
         if abs(position_size) < 1e-12:
             return 0
@@ -80,11 +82,12 @@ class ExecutionEngine:
         side = "buy" if self.paper.position_size < 0 else "sell"
         self._apply_fill({"symbol": symbol, "side": side, "price": mark_price, "size": abs(self.paper.position_size)})
         return True
-    def on_candle(self, candle: dict) -> list[dict]:
+
+    def on_candle(self, candle: dict, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "") -> list[dict]:
         high, low = float(candle["high"]), float(candle["low"])
         fills = self._pick_fills(candle, high, low)
         for fill in fills:
-            self._apply_fill(fill)
+            self._apply_fill(fill, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason)
             self.open_orders.remove(fill)
         self.save_state()
         return fills
@@ -97,7 +100,6 @@ class ExecutionEngine:
             buys = sorted([o for o in touched if o["side"] == "buy"], key=lambda x: x["price"], reverse=True)
             sells = sorted([o for o in touched if o["side"] == "sell"], key=lambda x: x["price"])
             return ([buys[0]] if buys else []) + ([sells[0]] if sells else [])
-        # ohlc_path
         open_p = float(candle.get("open", candle["close"]))
         close_p = float(candle["close"])
         path = [open_p, high, low, close_p] if close_p >= open_p else [open_p, low, high, close_p]
@@ -110,10 +112,9 @@ class ExecutionEngine:
                     break
         return result
 
-    def _apply_fill(self, fill: dict, reason: str = "grid_fill", regime: str = "unknown", mode: str = "unknown") -> None:
-        price, size = fill["price"], fill["size"]
+    def _apply_fill(self, fill: dict, reason: str = "grid_fill", regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "") -> None:
+        price, size = float(fill["price"]), float(fill["size"])
         position_before = self.paper.position_size
-        cash_before = self.paper.cash
         realized_before = self.paper.realized_pnl
         signed = size if fill["side"] == "buy" else -size
         fee = abs(price * size) * self.fee_rate
@@ -137,10 +138,31 @@ class ExecutionEngine:
             self.paper.avg_entry = 0.0
 
         realized_delta = self.paper.realized_pnl - realized_before
-        entry = {"ts": time.time(), "symbol": fill.get("symbol", ""), "side": fill["side"], "price": price, "qty": size, "notional": abs(price * size), "fee": fee, "realized_pnl_delta": realized_delta, "position_before": position_before, "position_after": self.paper.position_size, "cash_before": cash_before, "cash_after": self.paper.cash, "equity": self.equity(price), "reason": reason, "regime": regime, "mode": mode}
+        position_notional = abs(self.paper.position_size * price)
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": fill.get("symbol", ""),
+            "side": fill["side"],
+            "price": price,
+            "qty": size,
+            "notional": abs(price * size),
+            "fee": fee,
+            "realized_pnl_delta": realized_delta,
+            "realized_pnl_total": self.paper.realized_pnl,
+            "cash": self.paper.cash,
+            "equity": self.equity(price),
+            "position_before": position_before,
+            "position_after": self.paper.position_size,
+            "position_size": self.paper.position_size,
+            "position_notional": position_notional,
+            "regime": regime,
+            "mode": mode,
+            "risk_state": risk_state,
+            "pause_reason": pause_reason,
+            "reason": reason,
+        }
         self.trade_log.append(entry)
         self._append_trade_ledger(entry)
-        logger.info("fill symbol=%s side=%s price=%.6f qty=%.8f notional=%.6f fee=%.6f realized_pnl_delta=%.6f position_before=%.8f position_after=%.8f cash_before=%.6f cash_after=%.6f equity=%.6f reason=%s regime=%s mode=%s", entry["symbol"], entry["side"], entry["price"], entry["qty"], entry["notional"], entry["fee"], entry["realized_pnl_delta"], entry["position_before"], entry["position_after"], entry["cash_before"], entry["cash_after"], entry["equity"], reason, regime, mode)
 
     def unrealized_pnl(self, mark_price: float) -> float:
         if self.paper.position_size == 0:
@@ -152,14 +174,14 @@ class ExecutionEngine:
 
     def _append_trade_ledger(self, entry: dict) -> None:
         self.trade_ledger_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["ts","symbol","side","price","qty","notional","fee","realized_pnl_delta","position_before","position_after","cash_before","cash_after","equity","reason","regime","mode"]
+        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_size", "position_notional", "regime", "mode", "risk_state", "pause_reason", "reason"]
         write_header = not self.trade_ledger_csv.exists()
         with self.trade_ledger_csv.open("a", encoding="utf-8") as f:
             if write_header:
-                f.write(",".join(fields)+"\n")
-            f.write(",".join(str(entry.get(k, "")) for k in fields)+"\n")
+                f.write(",".join(fields) + "\n")
+            f.write(",".join(str(entry.get(k, "")) for k in fields) + "\n")
         with self.trade_ledger_jsonl.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry)+"\n")
+            f.write(json.dumps(entry) + "\n")
 
     def consume_trade_log(self) -> list[dict]:
         out = list(self.trade_log)

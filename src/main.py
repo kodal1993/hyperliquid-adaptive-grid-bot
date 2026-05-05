@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 
@@ -15,6 +17,7 @@ from .telegram_handler import TelegramHandler
 from .utils import append_csv, setup_logging
 
 logger = logging.getLogger(__name__)
+STATUS_FILE = Path("state/status.json")
 
 
 def to_df(candles: list[dict]) -> pd.DataFrame:
@@ -26,6 +29,11 @@ def _paper_metrics(cfg: BotConfig, engine: ExecutionEngine, client: HyperliquidC
     equity = engine.equity(latest_close) if cfg.paper_mode else client.get_balance().get("equity", cfg.paper_start_balance_usd)
     position_notional = abs(engine.paper.position_size * latest_close) if cfg.paper_mode else 0.0
     return unrealized_pnl, equity, position_notional
+
+
+def _write_status(payload: dict) -> None:
+    STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATUS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def run() -> None:
@@ -45,33 +53,19 @@ def run() -> None:
     daily_start_equity = engine.paper.daily_start_equity if engine.paper.daily_start_equity > 0 else cfg.paper_start_balance_usd
 
     last_telegram_report_ts = 0.0
-    last_risk_reason_sent = ""
     last_pause_reason = ""
     last_risk_state_value = ""
-    startup_report_sent = False
-    first_fill_sent = False
-    stuck_since_ts: float | None = None
-    stuck_alert_sent = False
 
-    if cfg.telegram_send_startup and not startup_report_sent:
-        tg.send(
-            "\n".join(
-                [
-                    "🚀 Hyperliquid Grid Bot Started",
-                    f"Mode: {'PAPER' if cfg.paper_mode else 'LIVE'}",
-                    f"Network: {cfg.hl_network}",
-                    f"Symbol: {cfg.default_symbol}",
-                    f"Fill Model: {cfg.fill_model}",
-                    f"Live Trading: {'ENABLED' if cfg.enable_live_trading else 'DISABLED'}",
-                    f"Profile: {cfg.env_profile}",
-                ]
-            )
-        )
-        startup_report_sent = True
+    if cfg.telegram_send_startup:
+        logger.info("telegram_startup_send_attempted")
+        ok = tg.send("\n".join(["🚀 Hyperliquid Grid Bot Started", f"Mode: {'PAPER' if cfg.paper_mode else 'LIVE'}", f"Network: {cfg.hl_network}", f"Symbol: {cfg.default_symbol}", f"Fill Model: {cfg.fill_model}", f"Live Trading: {'ENABLED' if cfg.enable_live_trading else 'DISABLED'}", f"Profile: {cfg.env_profile}"]))
+        if ok:
+            logger.info("telegram_startup_send_ok")
+        else:
+            logger.warning("telegram_startup_send_failed")
 
     while True:
-        candles_raw = client.get_candles(cfg.default_symbol, lookback=200)
-        candles = to_df(candles_raw)
+        candles = to_df(client.get_candles(cfg.default_symbol, lookback=200))
         latest_close = float(candles["close"].iloc[-1])
         unrealized_pnl, equity, position_notional = _paper_metrics(cfg, engine, client, latest_close)
         now_day = datetime.now(timezone.utc).date()
@@ -82,140 +76,75 @@ def run() -> None:
             engine.paper.daily_start_equity = daily_start_equity
             engine.save_state()
         daily_pnl_pct = 0.0 if daily_start_equity <= 0 else (equity - daily_start_equity) / daily_start_equity
+
         status = orchestrator.on_tick(candles, equity=equity, daily_pnl_pct=daily_pnl_pct, symbol=cfg.default_symbol, position_notional=position_notional)
-        fills = engine.on_candle(candles.iloc[-1].to_dict())
-        unrealized_pnl, equity, position_notional = _paper_metrics(cfg, engine, client, latest_close)
-
-        append_csv("logs/equity_curve.csv", [time.time(), equity, engine.paper.cash, engine.paper.realized_pnl, unrealized_pnl, engine.paper.fees_paid], ["ts", "equity", "cash", "realized_pnl", "unrealized_pnl", "fees_paid"])
-        engine.paper.current_day = current_day.isoformat()
-        engine.paper.daily_start_equity = daily_start_equity
-        engine.save_state()
-
-        stuck_threshold = cfg.max_position_notional_usd * 0.5
-        if position_notional > stuck_threshold:
-            if stuck_since_ts is None:
-                stuck_since_ts = time.time()
-                stuck_alert_sent = False
-            stuck_minutes = (time.time() - stuck_since_ts) / 60.0
-            if stuck_minutes >= cfg.stuck_position_minutes and not stuck_alert_sent:
-                logger.warning("stuck_inventory symbol=%s position_notional=%.2f threshold=%.2f minutes=%.2f", cfg.default_symbol, position_notional, stuck_threshold, stuck_minutes)
-                tg.send("\n".join(["⚠️ stuck_inventory", f"Symbol: {cfg.default_symbol}", f"Position Notional: ${position_notional:,.2f}", f"Threshold: ${stuck_threshold:,.2f}", f"Minutes: {stuck_minutes:.1f}"]))
-                stuck_alert_sent = True
-        else:
-            stuck_since_ts = None
-            stuck_alert_sent = False
-
         risk = status.get("risk")
         reason = status.get("reason") or (getattr(risk, "reason", "") if risk else "")
         risk_state = "OK" if status.get("status") == "running" else "BLOCKED"
         mode = status.get("mode", "reduce_only" if reason == "reduce_only_requested" else "neutral")
 
-        if cfg.telegram_send_risk_alerts and risk_state != last_risk_state_value:
-            tg.send("🛡 Risk state changed: " + f"{last_risk_state_value or 'INIT'} -> {risk_state}\nReason: {reason or 'none'}")
+        fills = engine.on_candle(candles.iloc[-1].to_dict(), regime=status.get("regime", "unknown"), mode=mode, risk_state=risk_state, pause_reason=reason)
+        trade_events = engine.consume_trade_log()
+        unrealized_pnl, equity, position_notional = _paper_metrics(cfg, engine, client, latest_close)
+
+        for tr in trade_events:
+            logger.info("trade_event side=%s symbol=%s price=%.6f qty=%.8f", tr["side"], tr["symbol"], tr["price"], tr["qty"])
+            if cfg.telegram_send_fills:
+                tg.send("\n".join([
+                    "✅ Trade / Fill",
+                    f"side: {tr['side']}",
+                    f"symbol: {tr['symbol']}",
+                    f"price: {tr['price']:.6f}",
+                    f"qty: {tr['qty']:.8f}",
+                    f"notional: {tr['notional']:.4f}",
+                    f"fee: {tr['fee']:.6f}",
+                    f"realized_pnl_delta: {tr['realized_pnl_delta']:.6f}",
+                    f"position_before: {tr['position_before']:.8f}",
+                    f"position_after: {tr['position_after']:.8f}",
+                    f"cash_after: {tr['cash']:.6f}",
+                    f"equity: {tr['equity']:.6f}",
+                    f"regime: {tr['regime']}",
+                    f"mode: {tr['mode']}",
+                    f"risk_state: {tr['risk_state']}",
+                    f"pause_reason: {tr['pause_reason'] or 'none'}",
+                ]))
+
+        if cfg.telegram_send_risk_alerts and (risk_state != last_risk_state_value or reason != last_pause_reason):
+            tg.send(f"🛡 Risk update\nrisk_state: {last_risk_state_value or 'INIT'} -> {risk_state}\npause_reason: {last_pause_reason or 'none'} -> {reason or 'none'}")
             last_risk_state_value = risk_state
-        if cfg.telegram_send_risk_alerts and reason != last_pause_reason:
-            tg.send(f"⏸ Pause reason changed: {last_pause_reason or 'none'} -> {reason or 'none'}")
-            if reason == "max_position_notional":
-                tg.send(f"🚨 Max position notional reached: ${position_notional:,.2f} / ${cfg.max_position_notional_usd:,.2f}")
-            if last_pause_reason and not reason:
-                tg.send("✅ Exposure returned to normal / trading unpaused")
             last_pause_reason = reason
 
-        if cfg.telegram_send_risk_alerts and risk_state != last_risk_state_value:
-            tg.send(f"🛡 Risk state changed: {last_risk_state_value or 'INIT'} -> {risk_state}\nReason: {reason or 'none'}")
-            last_risk_state_value = risk_state
-        if cfg.telegram_send_risk_alerts and reason != last_pause_reason:
-            tg.send(f"⏸ Pause reason changed: {last_pause_reason or 'none'} -> {reason or 'none'}")
-            if reason == "max_position_notional":
-                tg.send(f"🚨 Max position notional reached: ${position_notional:,.2f} / ${cfg.max_position_notional_usd:,.2f}")
-            if last_pause_reason and not reason:
-                tg.send("✅ Exposure returned to normal / trading unpaused")
-            last_pause_reason = reason
+        append_csv("logs/equity_curve.csv", [time.time(), equity, engine.paper.cash, engine.paper.realized_pnl, unrealized_pnl, engine.paper.fees_paid], ["ts", "equity", "cash", "realized_pnl", "unrealized_pnl", "fees_paid"])
 
-        if cfg.telegram_send_risk_alerts and reason in {"emergency_stop", "reduce_only_requested", "daily_loss", "max_drawdown", "max_position_notional", "neutral_blocked_in_trend"} and reason != last_risk_reason_sent:
-            tg.send(
-                "\n".join(
-                    [
-                        "🚨 Risk Block Triggered",
-                        f"Reason: {reason}",
-                        "Action: Entry orders canceled / reduce-only requested" if reason in {"reduce_only_requested", "max_position_notional"} else "Action: Trading paused",
-                        f"Position Notional: ${position_notional:,.2f}",
-                        f"Equity: ${equity:,.2f}",
-                    ]
-                )
-            )
-            last_risk_reason_sent = reason
-        elif not reason:
-            last_risk_reason_sent = ""
-        if fills and cfg.telegram_send_fills:
-            last_fill = fills[-1]
-            tg.send(
-                "\n".join(
-                    [
-                        "✅ Paper Fill",
-                        f"Fills: {len(fills)}",
-                        f"Side: {str(last_fill['side']).upper()}",
-                        f"Size: {last_fill['size']:.6f} {cfg.default_symbol}",
-                        f"Price: ${last_fill['price']:,.2f}",
-                        f"Notional: ${last_fill['price'] * last_fill['size']:,.2f}",
-                        f"Realized PnL: ${engine.paper.realized_pnl:,.2f}",
-                        f"Position: {engine.paper.position_size:.6f} {cfg.default_symbol}",
-                        f"Equity: ${equity:,.2f}",
-                    ]
-                )
-            )
-            if not first_fill_sent:
-                first_fill_sent = True
+        status_payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": cfg.default_symbol,
+            "price": latest_close,
+            "regime": status.get("regime", "unknown"),
+            "mode": mode,
+            "order_size": status.get("order_size", 0.0),
+            "order_notional": status.get("order_notional", 0.0),
+            "position_size": engine.paper.position_size,
+            "position_notional": position_notional,
+            "cash": engine.paper.cash,
+            "realized_pnl": engine.paper.realized_pnl,
+            "unrealized_pnl": unrealized_pnl,
+            "fees_paid": engine.paper.fees_paid,
+            "equity": equity,
+            "daily_pnl_pct": daily_pnl_pct,
+            "risk_state": risk_state,
+            "pause_reason": reason,
+        }
+        _write_status(status_payload)
 
         now_ts = time.time()
         if cfg.telegram_send_periodic_status and (now_ts - last_telegram_report_ts) >= cfg.telegram_report_interval_seconds:
-            last_fill_text = "none"
-            if fills:
-                lf = fills[-1]
-                last_fill_text = f"{str(lf['side']).lower()} {lf['size']:.6f} @ ${lf['price']:,.2f}"
-            tg.send_status_report(
-                {
-                    "status": status.get("status", "unknown"),
-                    "network": cfg.hl_network,
-                    "mode_name": "PAPER" if cfg.paper_mode else "LIVE",
-                    "symbol": cfg.default_symbol,
-                    "regime": status.get("regime", "n/a"),
-                    "grid_mode": mode,
-                    "fill_model": cfg.fill_model,
-                    "equity": equity,
-                    "cash": engine.paper.cash,
-                    "realized_pnl": engine.paper.realized_pnl,
-                    "unrealized_pnl": unrealized_pnl,
-                    "fees_paid": engine.paper.fees_paid,
-                    "daily_pnl_pct": daily_pnl_pct,
-                    "position_size": engine.paper.position_size,
-                    "position_notional": position_notional,
-                    "avg_entry": engine.paper.avg_entry,
-                    "mark_price": latest_close,
-                    "open_orders": len(engine.open_orders),
-                    "last_regrid": "yes" if status.get("orders", {}).get("placed", 0) else "no",
-                    "order_size": status.get("order_size"),
-                    "order_notional": status.get("order_notional"),
-                    "grid_levels": cfg.grid_levels,
-                    "grid_spacing_pct": cfg.grid_spacing_pct,
-                    "max_position": cfg.max_position_notional_usd,
-                    "drawdown": getattr(risk, "drawdown", 0.0) if risk else 0.0,
-                    "daily_loss_limit_pct": cfg.daily_loss_limit_pct,
-                    "risk_state": risk_state,
-                    "risk_reason": reason or "none",
-                    "fills_count": len(fills),
-                    "last_fill": last_fill_text,
-                    "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                }
-            )
+            tg.send_status_report({**status_payload, "status": status.get("status", "unknown"), "network": cfg.hl_network, "mode_name": "PAPER" if cfg.paper_mode else "LIVE", "grid_mode": mode, "fill_model": cfg.fill_model, "risk_reason": reason or "none", "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")})
             last_telegram_report_ts = now_ts
 
-        logger.info(
-            "tick symbol=%s price=%.6f regime=%s mode=%s order_size=%.8f order_notional=%.6f position_size=%.8f position_notional=%.6f cash=%.6f realized_pnl=%.6f unrealized_pnl=%.6f fees_paid=%.6f equity=%.6f daily_pnl_pct=%.6f risk_state=%s pause_reason=%s",
-            cfg.default_symbol, latest_close, status.get("regime"), status.get("mode"), status.get("order_size", 0.0), status.get("order_notional", 0.0),
-            engine.paper.position_size, position_notional, engine.paper.cash, engine.paper.realized_pnl, unrealized_pnl, engine.paper.fees_paid, equity, daily_pnl_pct,
-            getattr(status.get("risk"), "reason", ""), status.get("reason", ""),
-        )
+        engine.paper.current_day = current_day.isoformat()
+        engine.paper.daily_start_equity = daily_start_equity
+        engine.save_state()
         time.sleep(cfg.tick_seconds)
 
 

@@ -13,14 +13,16 @@ class TelegramHandler:
         self.token = token
         self.chat_id = chat_id
 
-    def send(self, text: str) -> None:
+    def send(self, text: str) -> bool:
         if not self.token or not self.chat_id:
-            return
+            return False
         payload = text[:3900]
         try:
-            requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage", json={"chat_id": self.chat_id, "text": payload}, timeout=10)
+            resp = requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage", json={"chat_id": self.chat_id, "text": payload}, timeout=10)
+            return resp.ok
         except Exception as exc:
             logger.warning("Telegram send failed: %s", exc)
+            return False
 
     def format_status_report(self, report: dict) -> str:
         def money(v: float | None) -> str:
@@ -80,8 +82,8 @@ class TelegramHandler:
         ]
         return "\n".join(lines)[:3900]
 
-    def send_status_report(self, report: dict) -> None:
-        self.send(self.format_status_report(report))
+    def send_status_report(self, report: dict) -> bool:
+        return self.send(self.format_status_report(report))
 
     def command_handlers(self) -> list[str]:
         return ["/status", "/pause", "/resume", "/risk", "/positions", "/orders"]
