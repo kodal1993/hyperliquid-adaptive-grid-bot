@@ -46,6 +46,8 @@ def run() -> None:
 
     last_telegram_report_ts = 0.0
     last_risk_reason_sent = ""
+    last_pause_reason = ""
+    last_risk_state_value = ""
     startup_report_sent = False
     first_fill_sent = False
     stuck_since_ts: float | None = None
@@ -84,8 +86,6 @@ def run() -> None:
         fills = engine.on_candle(candles.iloc[-1].to_dict())
         unrealized_pnl, equity, position_notional = _paper_metrics(cfg, engine, client, latest_close)
 
-        for f in fills:
-            append_csv("logs/trades.csv", [time.time(), f["symbol"], f["side"], f["price"], f["size"]], ["ts", "symbol", "side", "price", "size"])
         append_csv("logs/equity_curve.csv", [time.time(), equity, engine.paper.cash, engine.paper.realized_pnl, unrealized_pnl, engine.paper.fees_paid], ["ts", "equity", "cash", "realized_pnl", "unrealized_pnl", "fees_paid"])
         engine.paper.current_day = current_day.isoformat()
         engine.paper.daily_start_equity = daily_start_equity
@@ -110,6 +110,28 @@ def run() -> None:
         risk_state = "OK" if status.get("status") == "running" else "BLOCKED"
         mode = status.get("mode", "reduce_only" if reason == "reduce_only_requested" else "neutral")
 
+        if cfg.telegram_send_risk_alerts and risk_state != last_risk_state_value:
+            tg.send("🛡 Risk state changed: " + f"{last_risk_state_value or 'INIT'} -> {risk_state}\nReason: {reason or 'none'}")
+            last_risk_state_value = risk_state
+        if cfg.telegram_send_risk_alerts and reason != last_pause_reason:
+            tg.send(f"⏸ Pause reason changed: {last_pause_reason or 'none'} -> {reason or 'none'}")
+            if reason == "max_position_notional":
+                tg.send(f"🚨 Max position notional reached: ${position_notional:,.2f} / ${cfg.max_position_notional_usd:,.2f}")
+            if last_pause_reason and not reason:
+                tg.send("✅ Exposure returned to normal / trading unpaused")
+            last_pause_reason = reason
+
+        if cfg.telegram_send_risk_alerts and risk_state != last_risk_state_value:
+            tg.send(f"🛡 Risk state changed: {last_risk_state_value or 'INIT'} -> {risk_state}\nReason: {reason or 'none'}")
+            last_risk_state_value = risk_state
+        if cfg.telegram_send_risk_alerts and reason != last_pause_reason:
+            tg.send(f"⏸ Pause reason changed: {last_pause_reason or 'none'} -> {reason or 'none'}")
+            if reason == "max_position_notional":
+                tg.send(f"🚨 Max position notional reached: ${position_notional:,.2f} / ${cfg.max_position_notional_usd:,.2f}")
+            if last_pause_reason and not reason:
+                tg.send("✅ Exposure returned to normal / trading unpaused")
+            last_pause_reason = reason
+
         if cfg.telegram_send_risk_alerts and reason in {"emergency_stop", "reduce_only_requested", "daily_loss", "max_drawdown", "max_position_notional", "neutral_blocked_in_trend"} and reason != last_risk_reason_sent:
             tg.send(
                 "\n".join(
@@ -125,7 +147,6 @@ def run() -> None:
             last_risk_reason_sent = reason
         elif not reason:
             last_risk_reason_sent = ""
-
         if fills and cfg.telegram_send_fills:
             last_fill = fills[-1]
             tg.send(
