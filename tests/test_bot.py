@@ -7,7 +7,7 @@ from src.grid_manager import GridManager
 from src.regime_detector import RegimeDetector
 from src.risk_manager import RiskManager
 from src.types import MarketRegime, GridMode
-from src.execution_engine import ExecutionEngine
+from src.execution_engine import ExecutionEngine, would_increase_exposure
 from src.strategy_orchestrator import StrategyOrchestrator
 
 
@@ -290,3 +290,34 @@ def test_neutral_grid_blocked_when_directional_exposure_high(tmp_path):
     status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=70.0)
     assert status["status"] == "running"
     assert status["allow_sells"] is False
+
+
+def test_would_increase_exposure_helper():
+    assert would_increase_exposure(-0.005, "sell") is True
+    assert would_increase_exposure(-0.005, "buy") is False
+    assert would_increase_exposure(0.005, "buy") is True
+    assert would_increase_exposure(0.005, "sell") is False
+    assert would_increase_exposure(0.0, "buy") is True
+    assert would_increase_exposure(0.0, "sell") is True
+
+
+def test_exposure_gating_cases(tmp_path):
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "risk_cases.json"), max_position_notional_usd=500, soft_exposure_cap_pct=0.6, hard_exposure_cap_pct=0.8, absolute_exposure_cap_pct=1.0)
+
+    eng.paper.position_size = -0.005
+    d,_ = eng._risk_decision({"symbol":"BTC","side":"sell","price":90000.0,"size":0.0006}, 90000.0, "OK", "", "range", "neutral")
+    assert d == "block"
+    d,_ = eng._risk_decision({"symbol":"BTC","side":"buy","price":90000.0,"size":0.0006}, 90000.0, "OK", "", "range", "neutral")
+    assert d == "allow"
+
+    eng.paper.position_size = 0.005
+    d,_ = eng._risk_decision({"symbol":"BTC","side":"buy","price":90000.0,"size":0.0006}, 90000.0, "OK", "", "range", "neutral")
+    assert d == "block"
+    d,_ = eng._risk_decision({"symbol":"BTC","side":"sell","price":90000.0,"size":0.0006}, 90000.0, "OK", "", "range", "neutral")
+    assert d == "allow"
+
+    eng.paper.position_size = 0.0
+    d,_ = eng._risk_decision({"symbol":"BTC","side":"buy","price":90000.0,"size":0.0001}, 90000.0, "OK", "", "range", "neutral")
+    assert d == "allow"
+    d,_ = eng._risk_decision({"symbol":"BTC","side":"sell","price":90000.0,"size":0.0001}, 90000.0, "OK", "", "range", "neutral")
+    assert d == "allow"
