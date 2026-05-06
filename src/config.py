@@ -57,6 +57,9 @@ class BotConfig:
     log_level: str
     paper_start_balance_usd: float
     fill_model: str
+    soft_exposure_cap_pct: float
+    hard_exposure_cap_pct: float
+    absolute_exposure_cap_pct: float
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -122,4 +125,7 @@ class BotConfig:
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             paper_start_balance_usd=float(os.getenv("PAPER_START_BALANCE_USD", "500")),
             fill_model=os.getenv("FILL_MODEL", "conservative").lower(),
+            soft_exposure_cap_pct=float(os.getenv("SOFT_EXPOSURE_CAP_PCT", "0.6")),
+            hard_exposure_cap_pct=float(os.getenv("HARD_EXPOSURE_CAP_PCT", "0.8")),
+            absolute_exposure_cap_pct=float(os.getenv("ABSOLUTE_EXPOSURE_CAP_PCT", "1.0")),
         )

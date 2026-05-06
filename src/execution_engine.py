@@ -24,9 +24,20 @@ class PaperState:
 
 logger = logging.getLogger(__name__)
 
+def would_increase_exposure(position_size: float, side: str) -> bool:
+    side = side.lower()
+    if position_size < 0 and side == "sell":
+        return True
+    if position_size < 0 and side == "buy":
+        return False
+    if position_size > 0 and side == "buy":
+        return True
+    if position_size > 0 and side == "sell":
+        return False
+    return True
 
 class ExecutionEngine:
-    def __init__(self, client: HyperliquidClient, state_file: str, paper_mode: bool = True, enable_live_trading: bool = False, fee_rate: float = 0.0004, start_balance: float = 500.0, fill_model: str = "optimistic") -> None:
+    def __init__(self, client: HyperliquidClient, state_file: str, paper_mode: bool = True, enable_live_trading: bool = False, fee_rate: float = 0.0004, start_balance: float = 500.0, fill_model: str = "optimistic", max_position_notional_usd: float = 500.0, soft_exposure_cap_pct: float = 0.6, hard_exposure_cap_pct: float = 0.8, absolute_exposure_cap_pct: float = 1.0) -> None:
         self.client = client
         self.paper_mode = paper_mode
         self.enable_live_trading = enable_live_trading
@@ -38,6 +49,11 @@ class ExecutionEngine:
         self.trade_log: list[dict] = []
         self.trade_ledger_csv = Path("logs/trades.csv")
         self.trade_ledger_jsonl = Path("logs/trades.jsonl")
+        self.risk_decisions_csv = Path("logs/risk_decisions.csv")
+        self.max_position_notional_usd = max_position_notional_usd
+        self.soft_exposure_cap_pct = soft_exposure_cap_pct
+        self.hard_exposure_cap_pct = hard_exposure_cap_pct
+        self.absolute_exposure_cap_pct = absolute_exposure_cap_pct
 
     def _load_state(self, start_balance: float) -> PaperState:
         if self.state_file.exists():
@@ -85,12 +101,18 @@ class ExecutionEngine:
 
     def on_candle(self, candle: dict, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "") -> list[dict]:
         high, low = float(candle["high"]), float(candle["low"])
-        fills = self._pick_fills(candle, high, low)
-        for fill in fills:
+        mark_price = float(candle.get("close", candle.get("open", high)))
+        candidate_fills = self._pick_fills(candle, high, low)
+        executed_fills: list[dict] = []
+        for fill in candidate_fills:
+            decision, block_reason = self._risk_decision(fill, mark_price, risk_state, pause_reason, regime, mode)
+            if decision == "block":
+                continue
             self._apply_fill(fill, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason)
+            executed_fills.append(fill)
             self.open_orders.remove(fill)
         self.save_state()
-        return fills
+        return executed_fills
 
     def _pick_fills(self, candle: dict, high: float, low: float) -> list[dict]:
         touched = [o for o in self.open_orders if low <= o["price"] <= high]
@@ -163,6 +185,46 @@ class ExecutionEngine:
         }
         self.trade_log.append(entry)
         self._append_trade_ledger(entry)
+
+    def _risk_decision(self, fill: dict, mark_price: float, risk_state: str, pause_reason: str, regime: str, mode: str) -> tuple[str, str]:
+        side = str(fill["side"]).lower()
+        price, qty = float(fill["price"]), float(fill["size"])
+        order_notional = abs(price * qty)
+        position_size_before = self.paper.position_size
+        position_notional_before = abs(position_size_before * mark_price)
+        would_inc = would_increase_exposure(position_size_before, side)
+        max_n = max(self.max_position_notional_usd, 1e-9)
+        exposure_ratio = position_notional_before / max_n
+
+        decision = "allow"
+        block_reason = ""
+        if would_inc:
+            if exposure_ratio >= self.absolute_exposure_cap_pct:
+                decision, block_reason = "block", "absolute_exposure_cap"
+            elif exposure_ratio >= self.hard_exposure_cap_pct:
+                decision, block_reason = "block", "hard_exposure_cap"
+            elif exposure_ratio >= self.soft_exposure_cap_pct:
+                decision, block_reason = "block", "soft_exposure_cap"
+            elif (position_notional_before + order_notional) > self.max_position_notional_usd:
+                decision, block_reason = "block", "max_position_notional"
+
+        if would_inc and (risk_state == "BLOCKED" or pause_reason in {"one_direction_exposure", "max_position_notional"}):
+            decision, block_reason = "block", pause_reason or "risk_state_blocked"
+
+        payload = {"symbol": fill.get("symbol", ""), "side": side, "price": price, "qty": qty, "order_notional": order_notional, "position_size_before": position_size_before, "position_notional_before": position_notional_before, "max_position_notional_usd": self.max_position_notional_usd, "exposure_ratio": exposure_ratio, "would_increase_exposure": would_inc, "risk_state_before": risk_state, "pause_reason_before": pause_reason, "decision": decision, "block_reason": block_reason, "regime": regime, "mode": mode}
+        self._append_risk_decision(payload)
+        logger.info("risk_decision symbol=%s side=%s price=%s qty=%s order_notional=%s position_notional_before=%s max_position_notional_usd=%s exposure_ratio=%.3f would_increase_exposure=%s risk_state_before=%s pause_reason_before=%s decision=%s block_reason=%s", payload["symbol"], side, price, qty, order_notional, position_notional_before, self.max_position_notional_usd, exposure_ratio, would_inc, risk_state, pause_reason or "none", decision, block_reason or "none")
+        return decision, block_reason
+
+    def _append_risk_decision(self, entry: dict) -> None:
+        self.risk_decisions_csv.parent.mkdir(parents=True, exist_ok=True)
+        fields = ["timestamp", "symbol", "side", "price", "qty", "order_notional", "position_size_before", "position_notional_before", "max_position_notional_usd", "exposure_ratio", "would_increase_exposure", "risk_state_before", "pause_reason_before", "decision", "block_reason", "regime", "mode"]
+        write_header = not self.risk_decisions_csv.exists()
+        row = {"timestamp": datetime.now(timezone.utc).isoformat(), **entry}
+        with self.risk_decisions_csv.open("a", encoding="utf-8") as f:
+            if write_header:
+                f.write(",".join(fields) + "\n")
+            f.write(",".join(str(row.get(k, "")) for k in fields) + "\n")
 
     def unrealized_pnl(self, mark_price: float) -> float:
         if self.paper.position_size == 0:
