@@ -102,26 +102,74 @@ class ExecutionEngine:
     def on_candle(self, candle: dict, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "") -> list[dict]:
         high, low = float(candle["high"]), float(candle["low"])
         mark_price = float(candle.get("close", candle.get("open", high)))
-        candidate_fills = self._pick_fills(candle, high, low)
+        candidate_fills, fill_meta = self._pick_fills(candle, high, low, mark_price)
+        if not candidate_fills:
+            logger.info(
+                "fill_model_result model=%s touched=%s selected=%s reason=%s position_before=%s position_notional_before=%s",
+                self.fill_model,
+                fill_meta["touched_count"],
+                fill_meta["selected_count"],
+                fill_meta["reason"],
+                self.paper.position_size,
+                abs(self.paper.position_size * mark_price),
+            )
         executed_fills: list[dict] = []
         for fill in candidate_fills:
+            position_before = self.paper.position_size
+            position_notional_before = abs(position_before * mark_price)
+            logger.info(
+                "candidate_fill side=%s price=%s qty=%s position_before=%s position_notional_before=%s",
+                fill["side"],
+                fill["price"],
+                fill["size"],
+                position_before,
+                position_notional_before,
+            )
             decision, block_reason = self._risk_decision(fill, mark_price, risk_state, pause_reason, regime, mode)
+            logger.info(
+                "risk_decision_result decision=%s block_reason=%s side=%s price=%s qty=%s",
+                decision,
+                block_reason or "none",
+                fill["side"],
+                fill["price"],
+                fill["size"],
+            )
             if decision == "block":
+                logger.info("order_skipped reason=risk_block side=%s price=%s qty=%s", fill["side"], fill["price"], fill["size"])
                 continue
+            logger.info("order_submitted mode=paper side=%s price=%s qty=%s", fill["side"], fill["price"], fill["size"])
             self._apply_fill(fill, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason)
+            logger.info(
+                "fill_executed side=%s price=%s qty=%s position_before=%s position_after=%s",
+                fill["side"],
+                fill["price"],
+                fill["size"],
+                position_before,
+                self.paper.position_size,
+            )
             executed_fills.append(fill)
             self.open_orders.remove(fill)
         self.save_state()
         return executed_fills
 
-    def _pick_fills(self, candle: dict, high: float, low: float) -> list[dict]:
+    def _pick_fills(self, candle: dict, high: float, low: float, mark_price: float) -> tuple[list[dict], dict]:
         touched = [o for o in self.open_orders if low <= o["price"] <= high]
+        meta = {"touched_count": len(touched), "selected_count": 0, "reason": "none"}
+        if not touched:
+            meta["reason"] = "no_orders_touched_in_candle_range"
+            return [], meta
         if self.fill_model == "optimistic":
-            return touched
+            meta["selected_count"] = len(touched)
+            meta["reason"] = "optimistic_fill_all_touched"
+            return touched, meta
         if self.fill_model == "conservative":
             buys = sorted([o for o in touched if o["side"] == "buy"], key=lambda x: x["price"], reverse=True)
             sells = sorted([o for o in touched if o["side"] == "sell"], key=lambda x: x["price"])
-            return ([buys[0]] if buys else []) + ([sells[0]] if sells else [])
+            selected = ([buys[0]] if buys else []) + ([sells[0]] if sells else [])
+            selected = self._maybe_apply_emergency_reduce_fill(selected, touched, mark_price)
+            meta["selected_count"] = len(selected)
+            meta["reason"] = "conservative_best_per_side_with_emergency_reduce_override"
+            return selected, meta
         open_p = float(candle.get("open", candle["close"]))
         close_p = float(candle["close"])
         path = [open_p, high, low, close_p] if close_p >= open_p else [open_p, low, high, close_p]
@@ -132,7 +180,33 @@ class ExecutionEngine:
                 if lo <= order["price"] <= hi:
                     result.append(order)
                     break
-        return result
+        result = self._maybe_apply_emergency_reduce_fill(result, touched, mark_price)
+        meta["selected_count"] = len(result)
+        meta["reason"] = "path_fill_with_emergency_reduce_override"
+        return result, meta
+
+    def _maybe_apply_emergency_reduce_fill(self, selected: list[dict], touched: list[dict], mark_price: float) -> list[dict]:
+        if not self.paper_mode:
+            return selected
+        max_n = max(self.max_position_notional_usd, 1e-9)
+        position_notional = abs(self.paper.position_size * mark_price)
+        if position_notional <= 0.8 * max_n:
+            return selected
+        emergency_selected = list(selected)
+        for order in touched:
+            if order in emergency_selected:
+                continue
+            if not would_increase_exposure(self.paper.position_size, str(order["side"]).lower()):
+                emergency_selected.append(order)
+        if len(emergency_selected) > len(selected):
+            logger.info(
+                "emergency_reduce_override enabled=true paper_mode=%s position_notional=%s threshold=%s added_exposure_reducing_orders=%s",
+                self.paper_mode,
+                position_notional,
+                0.8 * max_n,
+                len(emergency_selected) - len(selected),
+            )
+        return emergency_selected
 
     def _apply_fill(self, fill: dict, reason: str = "grid_fill", regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "") -> None:
         price, size = float(fill["price"]), float(fill["size"])
