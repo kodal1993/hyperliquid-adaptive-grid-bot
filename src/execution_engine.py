@@ -193,12 +193,15 @@ class ExecutionEngine:
         position_size_before = self.paper.position_size
         position_notional_before = abs(position_size_before * mark_price)
         would_inc = would_increase_exposure(position_size_before, side)
+        exposure_reducing_override = not would_inc
         max_n = max(self.max_position_notional_usd, 1e-9)
         exposure_ratio = position_notional_before / max_n
 
         decision = "allow"
         block_reason = ""
-        if would_inc:
+        if not would_inc:
+            decision, block_reason = "allow", ""
+        else:
             if exposure_ratio >= self.absolute_exposure_cap_pct:
                 decision, block_reason = "block", "absolute_exposure_cap"
             elif exposure_ratio >= self.hard_exposure_cap_pct:
@@ -211,14 +214,14 @@ class ExecutionEngine:
         if would_inc and (risk_state == "BLOCKED" or pause_reason in {"one_direction_exposure", "max_position_notional"}):
             decision, block_reason = "block", pause_reason or "risk_state_blocked"
 
-        payload = {"symbol": fill.get("symbol", ""), "side": side, "price": price, "qty": qty, "order_notional": order_notional, "position_size_before": position_size_before, "position_notional_before": position_notional_before, "max_position_notional_usd": self.max_position_notional_usd, "exposure_ratio": exposure_ratio, "would_increase_exposure": would_inc, "risk_state_before": risk_state, "pause_reason_before": pause_reason, "decision": decision, "block_reason": block_reason, "regime": regime, "mode": mode}
+        payload = {"symbol": fill.get("symbol", ""), "side": side, "price": price, "qty": qty, "order_notional": order_notional, "position_size_before": position_size_before, "position_notional_before": position_notional_before, "max_position_notional_usd": self.max_position_notional_usd, "exposure_ratio": exposure_ratio, "would_increase_exposure": would_inc, "exposure_reducing_override": exposure_reducing_override, "risk_state_before": risk_state, "pause_reason_before": pause_reason, "decision": decision, "block_reason": block_reason, "regime": regime, "mode": mode}
         self._append_risk_decision(payload)
-        logger.info("risk_decision symbol=%s side=%s price=%s qty=%s order_notional=%s position_notional_before=%s max_position_notional_usd=%s exposure_ratio=%.3f would_increase_exposure=%s risk_state_before=%s pause_reason_before=%s decision=%s block_reason=%s", payload["symbol"], side, price, qty, order_notional, position_notional_before, self.max_position_notional_usd, exposure_ratio, would_inc, risk_state, pause_reason or "none", decision, block_reason or "none")
+        logger.info("risk_decision symbol=%s side=%s price=%s qty=%s order_notional=%s position_notional_before=%s max_position_notional_usd=%s exposure_ratio=%.3f would_increase_exposure=%s exposure_reducing_override=%s risk_state_before=%s pause_reason_before=%s decision=%s block_reason=%s", payload["symbol"], side, price, qty, order_notional, position_notional_before, self.max_position_notional_usd, exposure_ratio, would_inc, exposure_reducing_override, risk_state, pause_reason or "none", decision, block_reason or "none")
         return decision, block_reason
 
     def _append_risk_decision(self, entry: dict) -> None:
         self.risk_decisions_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["timestamp", "symbol", "side", "price", "qty", "order_notional", "position_size_before", "position_notional_before", "max_position_notional_usd", "exposure_ratio", "would_increase_exposure", "risk_state_before", "pause_reason_before", "decision", "block_reason", "regime", "mode"]
+        fields = ["timestamp", "symbol", "side", "price", "qty", "order_notional", "position_size_before", "position_notional_before", "max_position_notional_usd", "exposure_ratio", "would_increase_exposure", "exposure_reducing_override", "risk_state_before", "pause_reason_before", "decision", "block_reason", "regime", "mode"]
         write_header = not self.risk_decisions_csv.exists()
         row = {"timestamp": datetime.now(timezone.utc).isoformat(), **entry}
         with self.risk_decisions_csv.open("a", encoding="utf-8") as f:

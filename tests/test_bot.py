@@ -38,6 +38,21 @@ def test_risk_blocking(tmp_path):
     assert not snap.can_trade
 
 
+def test_risk_allows_exposure_reducing_trade_even_when_directional_cap_exceeded():
+    rm = RiskManager(0.1, 0.05)
+    snap = rm.evaluate(
+        equity=1000,
+        daily_pnl_pct=0,
+        one_direction_exposure_pct=0.9,
+        max_one_direction_exposure_pct=0.6,
+        attempted_side="buy",
+        would_increase_exposure=False,
+    )
+    assert snap.can_trade
+    assert snap.decision == "allow"
+    assert snap.exposure_reducing_override is True
+
+
 def test_paper_fill_simulation(tmp_path):
     eng = ExecutionEngine(DummyClient(), str(tmp_path / "state.json"), True, False)
     eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 100, "size": 1}]
