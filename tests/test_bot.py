@@ -138,6 +138,31 @@ def test_conservative_fill_model_wide_candle(tmp_path):
     assert {f["price"] for f in fills} == {95, 105}
 
 
+def test_emergency_reduce_override_executes_all_exposure_reducing_touched_orders_in_paper_mode(tmp_path):
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "s6.json"), fill_model="conservative", max_position_notional_usd=500.0)
+    eng.paper.position_size = 5.0
+    eng.paper.avg_entry = 100.0
+    eng.open_orders = [
+        {"symbol": "BTC", "side": "sell", "price": 101, "size": 1},  # exposure reducing
+        {"symbol": "BTC", "side": "sell", "price": 102, "size": 1},  # exposure reducing
+        {"symbol": "BTC", "side": "buy", "price": 99, "size": 1},   # exposure increasing
+    ]
+    fills = eng.on_candle({"open": 100, "high": 103, "low": 98, "close": 100})
+    assert {f["price"] for f in fills} == {101, 102}
+
+
+def test_emergency_reduce_override_does_not_apply_to_exposure_increasing_orders(tmp_path):
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "s7.json"), fill_model="conservative", max_position_notional_usd=500.0)
+    eng.paper.position_size = 5.0
+    eng.paper.avg_entry = 100.0
+    eng.open_orders = [
+        {"symbol": "BTC", "side": "buy", "price": 99, "size": 1},
+        {"symbol": "BTC", "side": "buy", "price": 98, "size": 1},
+    ]
+    fills = eng.on_candle({"open": 100, "high": 101, "low": 97, "close": 100})
+    assert len(fills) == 0
+
+
 def test_daily_state_persistence(tmp_path):
     state_file = str(tmp_path / "persist.json")
     eng = ExecutionEngine(DummyClient(), state_file)
