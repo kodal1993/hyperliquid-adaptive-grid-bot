@@ -85,7 +85,7 @@ class StrategyOrchestrator:
             liquidation_distance_pct=liquidation_distance_pct, min_liquidation_distance_pct=self.config.liquidation_distance_min_pct,
             attempted_side=attempted_side, would_increase_exposure=would_increase_exposure,
         )
-        logger.info("risk_check risk_state=%s pause_reason=%s current_position_notional=%.2f max_position_notional_usd=%.2f attempted_side=%s would_increase_exposure=%s decision=%s", risk_state.reason or "ok", "" if risk_state.can_trade else risk_state.reason, position_notional, self.config.max_position_notional_usd, attempted_side, would_increase_exposure, risk_state.decision)
+        logger.info("risk_check risk_state=%s pause_reason=%s current_position_notional=%.2f max_position_notional_usd=%.2f attempted_side=%s would_increase_exposure=%s exposure_reducing_override=%s decision=%s", risk_state.reason or "ok", "" if risk_state.can_trade else risk_state.reason, position_notional, self.config.max_position_notional_usd, attempted_side, would_increase_exposure, risk_state.exposure_reducing_override, risk_state.decision)
         if position_notional > self.config.max_position_notional_usd:
             canceled = self.execution_engine.cancel_all_orders(symbol)
             flattened = False
