@@ -60,6 +60,7 @@ class BotConfig:
     soft_exposure_cap_pct: float
     hard_exposure_cap_pct: float
     absolute_exposure_cap_pct: float
+    allow_position_flip: bool
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -128,4 +129,5 @@ class BotConfig:
             soft_exposure_cap_pct=float(os.getenv("SOFT_EXPOSURE_CAP_PCT", "0.6")),
             hard_exposure_cap_pct=float(os.getenv("HARD_EXPOSURE_CAP_PCT", "0.8")),
             absolute_exposure_cap_pct=float(os.getenv("ABSOLUTE_EXPOSURE_CAP_PCT", "1.0")),
+            allow_position_flip=os.getenv("ALLOW_POSITION_FLIP", "false").lower() == "true",
         )

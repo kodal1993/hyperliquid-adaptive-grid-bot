@@ -36,6 +36,24 @@ def _write_status(payload: dict) -> None:
     STATUS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _derive_risk_state(strategy_status: str, reason: str) -> str:
+    hard_block_reasons = {
+        "emergency_stop",
+        "max_position_notional",
+        "max_drawdown",
+        "daily_loss_limit",
+        "daily_loss",
+        "liquidation_risk",
+        "liq_distance",
+        "one_direction_exposure",
+    }
+    if strategy_status == "running":
+        return "OK"
+    if reason in hard_block_reasons:
+        return "BLOCKED"
+    return "STRATEGY_PAUSED"
+
+
 def run() -> None:
     cfg = BotConfig.from_env()
     setup_logging(cfg.log_level)
@@ -45,7 +63,7 @@ def run() -> None:
 
     client = HyperliquidClient(cfg.private_key, cfg.account_address, cfg.hl_network)
     client.connect()
-    engine = ExecutionEngine(client=client, state_file=cfg.state_file, paper_mode=cfg.paper_mode, enable_live_trading=cfg.enable_live_trading, start_balance=cfg.paper_start_balance_usd, fill_model=cfg.fill_model, max_position_notional_usd=cfg.max_position_notional_usd, soft_exposure_cap_pct=cfg.soft_exposure_cap_pct, hard_exposure_cap_pct=cfg.hard_exposure_cap_pct, absolute_exposure_cap_pct=cfg.absolute_exposure_cap_pct)
+    engine = ExecutionEngine(client=client, state_file=cfg.state_file, paper_mode=cfg.paper_mode, enable_live_trading=cfg.enable_live_trading, start_balance=cfg.paper_start_balance_usd, fill_model=cfg.fill_model, max_position_notional_usd=cfg.max_position_notional_usd, soft_exposure_cap_pct=cfg.soft_exposure_cap_pct, hard_exposure_cap_pct=cfg.hard_exposure_cap_pct, absolute_exposure_cap_pct=cfg.absolute_exposure_cap_pct, allow_position_flip=cfg.allow_position_flip)
     orchestrator = StrategyOrchestrator(config=cfg, execution_engine=engine)
     tg = TelegramHandler(cfg.telegram_bot_token, cfg.telegram_chat_id)
     current_day = datetime.now(timezone.utc).date()
@@ -81,10 +99,11 @@ def run() -> None:
         status = orchestrator.on_tick(candles, equity=equity, daily_pnl_pct=daily_pnl_pct, symbol=cfg.default_symbol, position_notional=position_notional)
         risk = status.get("risk")
         reason = status.get("reason") or (getattr(risk, "reason", "") if risk else "")
-        risk_state = "OK" if status.get("status") == "running" else "BLOCKED"
+        strategy_status = status.get("status", "unknown")
+        risk_state = _derive_risk_state(strategy_status, reason)
         mode = status.get("mode", "reduce_only" if reason == "reduce_only_requested" else "neutral")
 
-        fills = engine.on_candle(candles.iloc[-1].to_dict(), regime=status.get("regime", "unknown"), mode=mode, risk_state=risk_state, pause_reason=reason)
+        fills = engine.on_candle(candles.iloc[-1].to_dict(), regime=status.get("regime", "unknown"), mode=mode, risk_state=risk_state, pause_reason=reason, strategy_status=strategy_status)
         trade_events = engine.consume_trade_log()
         unrealized_pnl, equity, position_notional = _paper_metrics(cfg, engine, client, latest_close)
 
@@ -134,6 +153,7 @@ def run() -> None:
             "equity": equity,
             "daily_pnl_pct": daily_pnl_pct,
             "risk_state": risk_state,
+            "strategy_status": strategy_status,
             "pause_reason": reason,
         }
         _write_status(status_payload)

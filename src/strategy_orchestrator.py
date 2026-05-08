@@ -31,12 +31,14 @@ class StrategyOrchestrator:
             if self.config.allow_long_biased:
                 mode = GridMode.LONG_BIASED
             else:
-                return {"status": "paused", "regime": regime.value, "reason": "neutral_blocked_in_trend"}
+                canceled = self.execution_engine.cancel_all_orders(symbol)
+                return {"status": "paused", "regime": regime.value, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled}
         elif regime == MarketRegime.TREND_DOWN:
             if self.config.allow_short_biased:
                 mode = GridMode.SHORT_BIASED
             else:
-                return {"status": "paused", "regime": regime.value, "reason": "neutral_blocked_in_trend"}
+                canceled = self.execution_engine.cancel_all_orders(symbol)
+                return {"status": "paused", "regime": regime.value, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled}
 
         vol = candles["close"].pct_change().std()
         order_size = self._calculate_order_size(price)

@@ -333,12 +333,48 @@ def test_neutral_grid_blocked_when_directional_exposure_high(tmp_path):
 
 
 def test_would_increase_exposure_helper():
-    assert would_increase_exposure(-0.005, "sell") is True
-    assert would_increase_exposure(-0.005, "buy") is False
-    assert would_increase_exposure(0.005, "buy") is True
-    assert would_increase_exposure(0.005, "sell") is False
-    assert would_increase_exposure(0.0, "buy") is True
-    assert would_increase_exposure(0.0, "sell") is True
+    assert would_increase_exposure(-0.005, "sell", 0.001) is True
+    assert would_increase_exposure(-0.005, "buy", 0.001) is False
+    assert would_increase_exposure(0.005, "buy", 0.001) is True
+    assert would_increase_exposure(0.005, "sell", 0.001) is False
+    assert would_increase_exposure(0.0, "buy", 0.001) is True
+    assert would_increase_exposure(0.0, "sell", 0.001) is True
+
+
+def test_risk_decision_long_reducing_vs_flipping(tmp_path):
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "risk_flip_long.json"), max_position_notional_usd=500)
+    eng.paper.position_size = 0.39
+    decision, reason = eng._risk_decision({"symbol": "BTC", "side": "sell", "price": 100.0, "size": 0.20}, 100.0, "OK", "", "RANGE", "neutral")
+    assert decision == "allow"
+    assert reason == ""
+    decision, reason = eng._risk_decision({"symbol": "BTC", "side": "sell", "price": 100.0, "size": 0.50}, 100.0, "OK", "", "RANGE", "neutral")
+    assert decision == "block"
+    assert reason == "position_flip_blocked"
+
+
+def test_risk_decision_short_reducing_vs_flipping(tmp_path):
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "risk_flip_short.json"), max_position_notional_usd=500)
+    eng.paper.position_size = -0.39
+    decision, reason = eng._risk_decision({"symbol": "BTC", "side": "buy", "price": 100.0, "size": 0.20}, 100.0, "OK", "", "RANGE", "neutral")
+    assert decision == "allow"
+    assert reason == ""
+    decision, reason = eng._risk_decision({"symbol": "BTC", "side": "buy", "price": 100.0, "size": 0.50}, 100.0, "OK", "", "RANGE", "neutral")
+    assert decision == "block"
+    assert reason == "position_flip_blocked"
+
+
+def test_neutral_blocked_in_trend_is_not_hard_risk_block():
+    from src.main import _derive_risk_state
+    assert _derive_risk_state("paused", "neutral_blocked_in_trend") == "STRATEGY_PAUSED"
+    assert _derive_risk_state("paused", "emergency_stop") == "BLOCKED"
+
+
+def test_exposure_reducing_allowed_even_with_blocked_risk_state(tmp_path):
+    eng = ExecutionEngine(DummyClient(), str(tmp_path / "risk_reduce_allowed.json"), max_position_notional_usd=500)
+    eng.paper.position_size = 0.39
+    decision, reason = eng._risk_decision({"symbol": "BTC", "side": "sell", "price": 100.0, "size": 0.20}, 100.0, "BLOCKED", "max_position_notional", "RANGE", "neutral")
+    assert decision == "allow"
+    assert reason == ""
 
 
 def test_exposure_gating_cases(tmp_path):
