@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections import Counter
+import csv
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +20,8 @@ from .utils import append_csv, setup_logging
 
 logger = logging.getLogger(__name__)
 STATUS_FILE = Path("state/status.json")
+TRADES_CSV = Path("logs/trades.csv")
+RISK_DECISIONS_CSV = Path("logs/risk_decisions.csv")
 
 
 def to_df(candles: list[dict]) -> pd.DataFrame:
@@ -52,6 +56,50 @@ def _derive_risk_state(strategy_status: str, reason: str) -> str:
     if reason in hard_block_reasons:
         return "BLOCKED"
     return "STRATEGY_PAUSED"
+
+
+def _safe_float(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_last_row(csv_path: Path) -> dict:
+    if not csv_path.exists():
+        return {}
+    last: dict = {}
+    with csv_path.open(encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            last = row
+    return last
+
+
+def _risk_block_stats_30m(now_ts: float) -> tuple[int, dict[str, int], str]:
+    if not RISK_DECISIONS_CSV.exists():
+        return 0, {}, ""
+    window_start = now_ts - 30 * 60
+    reason_counts: Counter[str] = Counter()
+    last_block_reason = ""
+    blocked_count = 0
+    with RISK_DECISIONS_CSV.open(encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("decision") != "block":
+                continue
+            ts_raw = row.get("timestamp", "")
+            try:
+                dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            ts = dt.timestamp()
+            if ts < window_start:
+                continue
+            blocked_count += 1
+            reason = row.get("block_reason") or "unknown"
+            reason_counts[reason] += 1
+            if ts >= window_start:
+                last_block_reason = reason
+    return blocked_count, dict(reason_counts), last_block_reason
 
 
 def run() -> None:
@@ -156,6 +204,31 @@ def run() -> None:
             "strategy_status": strategy_status,
             "pause_reason": reason,
         }
+
+        last_trade = _read_last_row(TRADES_CSV)
+        blocked_30m, blocked_by_reason, last_block_reason = _risk_block_stats_30m(now_ts=time.time())
+        position_side = "FLAT"
+        if engine.paper.position_size > 0:
+            position_side = "LONG"
+        elif engine.paper.position_size < 0:
+            position_side = "SHORT"
+        status_payload.update(
+            {
+                "position_side": position_side,
+                "mark_price": latest_close,
+                "last_trade_price": _safe_float(last_trade.get("price")),
+                "last_trade_qty": _safe_float(last_trade.get("qty")),
+                "last_trade_notional": _safe_float(last_trade.get("notional")),
+                "last_trade_fee": _safe_float(last_trade.get("fee")),
+                "last_trade_realized_pnl": _safe_float(last_trade.get("realized_pnl_delta")),
+                "last_trade_reason": last_trade.get("reason", ""),
+                "last_trade_side": last_trade.get("side", ""),
+                "blocked_risk_decisions_30m": blocked_30m,
+                "blocked_risk_decisions_by_reason": blocked_by_reason,
+                "last_block_reason": last_block_reason,
+                "allowed_to_trade": risk_state == "OK",
+            }
+        )
         _write_status(status_payload)
 
         now_ts = time.time()
