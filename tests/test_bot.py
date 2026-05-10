@@ -15,6 +15,17 @@ class DummyClient:
     pass
 
 
+def make_test_engine(tmp_path, state_name: str, **kwargs):
+    return ExecutionEngine(
+        DummyClient(),
+        str(tmp_path / state_name),
+        trade_ledger_csv=str(tmp_path / "trades.csv"),
+        trade_ledger_jsonl=str(tmp_path / "trades.jsonl"),
+        risk_decisions_csv=str(tmp_path / "risk_decisions.csv"),
+        **kwargs,
+    )
+
+
 def test_config_profile_override(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text("ENV_PROFILE=paper\nGRID_LEVELS=2\n")
@@ -54,7 +65,7 @@ def test_risk_allows_exposure_reducing_trade_even_when_directional_cap_exceeded(
 
 
 def test_paper_fill_simulation(tmp_path):
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "state.json"), True, False)
+    eng = make_test_engine(tmp_path, "state.json", paper_mode=True, enable_live_trading=False)
     eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 100, "size": 1}]
     fills = eng.on_candle({"high": 101, "low": 99, "close": 100})
     assert len(fills) == 1
@@ -66,20 +77,20 @@ def test_regime_detector_basic():
     assert regime in {MarketRegime.TREND_UP, MarketRegime.HIGH_VOL, MarketRegime.RANGE}
 
 
-def test_order_size_notional_based():
+def test_order_size_notional_based(tmp_path):
     cfg = BotConfig.from_env()
     cfg.max_notional_per_trade_usd = 50
     cfg.min_order_size = 0.0
     cfg.max_order_size = 10.0
     cfg.min_notional_usd = 1.0
-    orch = StrategyOrchestrator(cfg, ExecutionEngine(DummyClient(), "/tmp/state.json", True, False))
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "state.json", paper_mode=True, enable_live_trading=False))
     size = orch._calculate_order_size(60000)
     assert abs(size - 0.0008333333) < 1e-6
     assert size * 60000 <= 50.0
 
 
-def test_paper_equity_includes_unrealized():
-    eng = ExecutionEngine(DummyClient(), "/tmp/state2.json", True, False, start_balance=500)
+def test_paper_equity_includes_unrealized(tmp_path):
+    eng = make_test_engine(tmp_path, "state2.json", paper_mode=True, enable_live_trading=False, start_balance=500)
     eng.paper.position_size = 1.0
     eng.paper.avg_entry = 100.0
     assert eng.unrealized_pnl(110.0) == 10.0
@@ -87,7 +98,7 @@ def test_paper_equity_includes_unrealized():
 
 
 def test_apply_fill_partial_close(tmp_path):
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "s.json"))
+    eng = make_test_engine(tmp_path, "s.json")
     eng.paper.position_size = 2.0
     eng.paper.avg_entry = 100.0
     eng._apply_fill({"side": "sell", "price": 110.0, "size": 1.0})
@@ -97,7 +108,7 @@ def test_apply_fill_partial_close(tmp_path):
 
 
 def test_apply_fill_full_close_resets_avg(tmp_path):
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "s2.json"))
+    eng = make_test_engine(tmp_path, "s2.json")
     eng.paper.position_size = 1.0
     eng.paper.avg_entry = 100.0
     eng._apply_fill({"side": "sell", "price": 105.0, "size": 1.0})
@@ -106,7 +117,7 @@ def test_apply_fill_full_close_resets_avg(tmp_path):
 
 
 def test_apply_fill_long_to_short_flip(tmp_path):
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "s3.json"))
+    eng = make_test_engine(tmp_path, "s3.json")
     eng.paper.position_size = 1.0
     eng.paper.avg_entry = 100.0
     eng._apply_fill({"side": "sell", "price": 110.0, "size": 2.0})
@@ -116,7 +127,7 @@ def test_apply_fill_long_to_short_flip(tmp_path):
 
 
 def test_apply_fill_short_to_long_flip(tmp_path):
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "s4.json"))
+    eng = make_test_engine(tmp_path, "s4.json")
     eng.paper.position_size = -1.0
     eng.paper.avg_entry = 100.0
     eng._apply_fill({"side": "buy", "price": 90.0, "size": 2.0})
@@ -126,7 +137,7 @@ def test_apply_fill_short_to_long_flip(tmp_path):
 
 
 def test_conservative_fill_model_wide_candle(tmp_path):
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "s5.json"), fill_model="conservative")
+    eng = make_test_engine(tmp_path, "s5.json", fill_model="conservative")
     eng.open_orders = [
         {"symbol": "BTC", "side": "buy", "price": 95, "size": 1},
         {"symbol": "BTC", "side": "buy", "price": 90, "size": 1},
@@ -139,7 +150,7 @@ def test_conservative_fill_model_wide_candle(tmp_path):
 
 
 def test_emergency_reduce_override_executes_all_exposure_reducing_touched_orders_in_paper_mode(tmp_path):
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "s6.json"), fill_model="conservative", max_position_notional_usd=500.0)
+    eng = make_test_engine(tmp_path, "s6.json", fill_model="conservative", max_position_notional_usd=500.0)
     eng.paper.position_size = 5.0
     eng.paper.avg_entry = 100.0
     eng.open_orders = [
@@ -152,7 +163,7 @@ def test_emergency_reduce_override_executes_all_exposure_reducing_touched_orders
 
 
 def test_emergency_reduce_override_does_not_apply_to_exposure_increasing_orders(tmp_path):
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "s7.json"), fill_model="conservative", max_position_notional_usd=500.0)
+    eng = make_test_engine(tmp_path, "s7.json", fill_model="conservative", max_position_notional_usd=500.0)
     eng.paper.position_size = 5.0
     eng.paper.avg_entry = 100.0
     eng.open_orders = [
@@ -165,11 +176,11 @@ def test_emergency_reduce_override_does_not_apply_to_exposure_increasing_orders(
 
 def test_daily_state_persistence(tmp_path):
     state_file = str(tmp_path / "persist.json")
-    eng = ExecutionEngine(DummyClient(), state_file)
+    eng = ExecutionEngine(DummyClient(), state_file, trade_ledger_csv=str(tmp_path / "trades.csv"), trade_ledger_jsonl=str(tmp_path / "trades.jsonl"), risk_decisions_csv=str(tmp_path / "risk_decisions.csv"))
     eng.paper.current_day = "2026-04-29"
     eng.paper.daily_start_equity = 777.0
     eng.save_state()
-    eng2 = ExecutionEngine(DummyClient(), state_file)
+    eng2 = ExecutionEngine(DummyClient(), state_file, trade_ledger_csv=str(tmp_path / "trades.csv"), trade_ledger_jsonl=str(tmp_path / "trades.jsonl"), risk_decisions_csv=str(tmp_path / "risk_decisions.csv"))
     assert eng2.paper.current_day == "2026-04-29"
     assert eng2.paper.daily_start_equity == 777.0
 
@@ -188,7 +199,7 @@ def test_reduce_only_places_directional_orders_on_max_position_notional(tmp_path
     cfg.max_position_notional_usd = 10
     cfg.max_drawdown_pct = 0.9
     cfg.daily_loss_limit_pct = 0.9
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "state_reduce_only.json"), True, False)
+    eng = make_test_engine(tmp_path, "state_reduce_only.json", paper_mode=True, enable_live_trading=False)
     eng.paper.position_size = -2.0
     eng.open_orders = [{"symbol": "BTC", "side": "sell", "price": 101.0, "size": 1.0}]
     orch = StrategyOrchestrator(cfg, eng)
@@ -270,7 +281,7 @@ def test_paper_metrics_reflect_post_fill_state(tmp_path):
         paper_mode = True
         paper_start_balance_usd = 500.0
 
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "post_fill_state.json"), True, False, start_balance=500.0)
+    eng = make_test_engine(tmp_path, "post_fill_state.json", paper_mode=True, enable_live_trading=False, start_balance=500.0)
     eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 100.0, "size": 1.0}]
     latest_close = 100.0
 
@@ -291,7 +302,7 @@ def test_paper_metrics_reflect_post_fill_state(tmp_path):
 def test_short_position_cannot_place_more_sell_expansion_orders(tmp_path):
     cfg = BotConfig.from_env()
     cfg.max_position_notional_usd = 100
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "state_short_guard.json"), True, False)
+    eng = make_test_engine(tmp_path, "state_short_guard.json", paper_mode=True, enable_live_trading=False)
     eng.paper.position_size = -1.0
     orch = StrategyOrchestrator(cfg, eng)
     candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [101 for _ in range(80)], "low": [99 for _ in range(80)]})
@@ -303,7 +314,7 @@ def test_short_position_cannot_place_more_sell_expansion_orders(tmp_path):
 def test_long_position_cannot_place_more_buy_expansion_orders(tmp_path):
     cfg = BotConfig.from_env()
     cfg.max_position_notional_usd = 100
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "state_long_guard.json"), True, False)
+    eng = make_test_engine(tmp_path, "state_long_guard.json", paper_mode=True, enable_live_trading=False)
     eng.paper.position_size = 1.0
     orch = StrategyOrchestrator(cfg, eng)
     candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [101 for _ in range(80)], "low": [99 for _ in range(80)]})
@@ -323,7 +334,7 @@ def test_neutral_grid_blocked_when_directional_exposure_high(tmp_path):
     cfg = BotConfig.from_env()
     cfg.max_position_notional_usd = 100
     cfg.max_directional_exposure_pct = 0.65
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "state_dir_guard.json"), True, False)
+    eng = make_test_engine(tmp_path, "state_dir_guard.json", paper_mode=True, enable_live_trading=False)
     eng.paper.position_size = -0.7  # $70 short at $100, above 65 threshold
     orch = StrategyOrchestrator(cfg, eng)
     candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [101 for _ in range(80)], "low": [99 for _ in range(80)]})
@@ -342,7 +353,7 @@ def test_would_increase_exposure_helper():
 
 
 def test_risk_decision_long_reducing_vs_flipping(tmp_path):
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "risk_flip_long.json"), max_position_notional_usd=500)
+    eng = make_test_engine(tmp_path, "risk_flip_long.json", max_position_notional_usd=500)
     eng.paper.position_size = 0.39
     decision, reason = eng._risk_decision({"symbol": "BTC", "side": "sell", "price": 100.0, "size": 0.20}, 100.0, "OK", "", "RANGE", "neutral")
     assert decision == "allow"
@@ -353,7 +364,7 @@ def test_risk_decision_long_reducing_vs_flipping(tmp_path):
 
 
 def test_risk_decision_short_reducing_vs_flipping(tmp_path):
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "risk_flip_short.json"), max_position_notional_usd=500)
+    eng = make_test_engine(tmp_path, "risk_flip_short.json", max_position_notional_usd=500)
     eng.paper.position_size = -0.39
     decision, reason = eng._risk_decision({"symbol": "BTC", "side": "buy", "price": 100.0, "size": 0.20}, 100.0, "OK", "", "RANGE", "neutral")
     assert decision == "allow"
@@ -370,7 +381,7 @@ def test_neutral_blocked_in_trend_is_not_hard_risk_block():
 
 
 def test_exposure_reducing_allowed_even_with_blocked_risk_state(tmp_path):
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "risk_reduce_allowed.json"), max_position_notional_usd=500)
+    eng = make_test_engine(tmp_path, "risk_reduce_allowed.json", max_position_notional_usd=500)
     eng.paper.position_size = 0.39
     decision, reason = eng._risk_decision({"symbol": "BTC", "side": "sell", "price": 100.0, "size": 0.20}, 100.0, "BLOCKED", "max_position_notional", "RANGE", "neutral")
     assert decision == "allow"
@@ -378,7 +389,7 @@ def test_exposure_reducing_allowed_even_with_blocked_risk_state(tmp_path):
 
 
 def test_exposure_gating_cases(tmp_path):
-    eng = ExecutionEngine(DummyClient(), str(tmp_path / "risk_cases.json"), max_position_notional_usd=500, soft_exposure_cap_pct=0.6, hard_exposure_cap_pct=0.8, absolute_exposure_cap_pct=1.0)
+    eng = make_test_engine(tmp_path, "risk_cases.json", max_position_notional_usd=500, soft_exposure_cap_pct=0.6, hard_exposure_cap_pct=0.8, absolute_exposure_cap_pct=1.0)
 
     eng.paper.position_size = -0.005
     d,_ = eng._risk_decision({"symbol":"BTC","side":"sell","price":90000.0,"size":0.0006}, 90000.0, "OK", "", "range", "neutral")
