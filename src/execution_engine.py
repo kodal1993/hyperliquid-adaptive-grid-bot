@@ -51,7 +51,7 @@ def would_increase_exposure(position_size: float, side: str, qty: float) -> bool
     return classify_exposure_action(position_size, side, qty) == "increasing"
 
 class ExecutionEngine:
-    def __init__(self, client: HyperliquidClient, state_file: str, paper_mode: bool = True, enable_live_trading: bool = False, fee_rate: float = 0.0004, start_balance: float = 500.0, fill_model: str = "optimistic", max_position_notional_usd: float = 500.0, soft_exposure_cap_pct: float = 0.6, hard_exposure_cap_pct: float = 0.8, absolute_exposure_cap_pct: float = 1.0, allow_position_flip: bool = False) -> None:
+    def __init__(self, client: HyperliquidClient, state_file: str, paper_mode: bool = True, enable_live_trading: bool = False, fee_rate: float = 0.0004, start_balance: float = 500.0, fill_model: str = "optimistic", max_position_notional_usd: float = 500.0, soft_exposure_cap_pct: float = 0.6, hard_exposure_cap_pct: float = 0.8, absolute_exposure_cap_pct: float = 1.0, allow_position_flip: bool = False, trade_ledger_csv: str | None = None, trade_ledger_jsonl: str | None = None, risk_decisions_csv: str | None = None) -> None:
         self.client = client
         self.paper_mode = paper_mode
         self.enable_live_trading = enable_live_trading
@@ -61,9 +61,9 @@ class ExecutionEngine:
         self.fill_model = fill_model
         self.paper = self._load_state(start_balance)
         self.trade_log: list[dict] = []
-        self.trade_ledger_csv = Path("logs/trades.csv")
-        self.trade_ledger_jsonl = Path("logs/trades.jsonl")
-        self.risk_decisions_csv = Path("logs/risk_decisions.csv")
+        self.trade_ledger_csv = Path(trade_ledger_csv) if trade_ledger_csv else Path("logs/trades.csv")
+        self.trade_ledger_jsonl = Path(trade_ledger_jsonl) if trade_ledger_jsonl else Path("logs/trades.jsonl")
+        self.risk_decisions_csv = Path(risk_decisions_csv) if risk_decisions_csv else Path("logs/risk_decisions.csv")
         self.max_position_notional_usd = max_position_notional_usd
         self.soft_exposure_cap_pct = soft_exposure_cap_pct
         self.hard_exposure_cap_pct = hard_exposure_cap_pct

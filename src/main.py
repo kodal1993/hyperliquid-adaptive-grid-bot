@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 STATUS_FILE = Path("state/status.json")
 TRADES_CSV = Path("logs/trades.csv")
 RISK_DECISIONS_CSV = Path("logs/risk_decisions.csv")
+LAST_100_REAL_TRADES_CSV = Path("logs/last_100_real_trades.csv")
 
 
 def to_df(candles: list[dict]) -> pd.DataFrame:
@@ -73,6 +74,46 @@ def _read_last_row(csv_path: Path) -> dict:
         for row in csv.DictReader(f):
             last = row
     return last
+
+
+def _is_valid_trade_row(row: dict, expected_symbol: str) -> bool:
+    symbol = str(row.get("symbol", "")).upper().strip()
+    if not symbol or symbol != expected_symbol.upper():
+        return False
+    price = _safe_float(row.get("price"))
+    qty = _safe_float(row.get("qty"))
+    if price is None or qty is None or qty <= 0:
+        return False
+    if symbol == "BTC" and price < 1000:
+        return False
+    return True
+
+
+def _read_last_valid_trade(csv_path: Path, expected_symbol: str) -> dict:
+    if not csv_path.exists():
+        return {}
+    last: dict = {}
+    with csv_path.open(encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if _is_valid_trade_row(row, expected_symbol):
+                last = row
+    return last
+
+
+def _write_last_100_real_trades(csv_path: Path, out_path: Path, expected_symbol: str) -> None:
+    if not csv_path.exists():
+        return
+    rows: list[dict] = []
+    with csv_path.open(encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if _is_valid_trade_row(row, expected_symbol):
+                rows.append(row)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fields = list(rows[0].keys()) if rows else ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_size", "position_notional", "regime", "mode", "risk_state", "pause_reason", "reason"]
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows[-100:])
 
 
 def _risk_block_stats_30m(now_ts: float) -> tuple[int, dict[str, int], str]:
@@ -205,7 +246,8 @@ def run() -> None:
             "pause_reason": reason,
         }
 
-        last_trade = _read_last_row(TRADES_CSV)
+        last_trade = _read_last_valid_trade(TRADES_CSV, cfg.default_symbol)
+        _write_last_100_real_trades(TRADES_CSV, LAST_100_REAL_TRADES_CSV, cfg.default_symbol)
         blocked_30m, blocked_by_reason, last_block_reason = _risk_block_stats_30m(now_ts=time.time())
         position_side = "FLAT"
         if engine.paper.position_size > 0:
