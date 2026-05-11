@@ -45,6 +45,7 @@ class TelegramHandler:
             human = "A bot risk miatt nem épít új pozíciót."
         elif report.get("position_side") in {"LONG", "SHORT"}:
             human = f"A bot aktív és pozícióban van, jelenleg {str(report.get('position_side')).lower()} exposure-t tart."
+        no_recent_trade_line = "Nincs új BUY/SELL fill az elmúlt 30 percben." if trades_30m == 0 else None
         lines = [
             "📊 Hyperliquid paper bot félórás jelentés",
             "",
@@ -78,7 +79,9 @@ class TelegramHandler:
             f"Grid spacing: {pct(report.get('grid_spacing_pct'))}, levels: {report.get('grid_levels', 'n/a')}",
             "",
             "Utolsó 30 perc:",
-            f"Trades: {trades_30m} (BUY {report.get('buy_count_30m', 0)} / SELL {report.get('sell_count_30m', 0)})",
+            f"BUY count: {report.get('buy_count_30m', 0)}",
+            f"SELL count: {report.get('sell_count_30m', 0)}",
+            no_recent_trade_line if no_recent_trade_line else f"Trades: {trades_30m}",
             f"Volume: {money(report.get('volume_usd_30m'))}, Fees: {money(report.get('fees_30m'))}",
             f"Realized PnL delta: {money(report.get('realized_pnl_delta_30m'))}",
             f"Blocked risk decisions: {blocked_30m}, reasons: {report.get('blocked_risk_decisions_by_reason', {})}",
@@ -93,7 +96,51 @@ class TelegramHandler:
             human,
             f"Updated: {ts}",
         ]
-        return "\n".join(lines)[:3900]
+        return "\n".join(line for line in lines if line is not None)[:3900]
+
+    def format_fill_alert(self, trade: dict, *, mode_name: str) -> str:
+        side = str(trade.get("side", "")).upper()
+        title = "🟢 BUY EXECUTED" if side == "BUY" else "🔴 SELL EXECUTED"
+        symbol = trade.get("symbol", "n/a")
+        price = float(trade.get("price", 0.0))
+        qty = float(trade.get("qty", 0.0))
+        notional = float(trade.get("notional", 0.0))
+        fee = float(trade.get("fee", 0.0))
+        realized_delta = float(trade.get("realized_pnl_delta", 0.0))
+        realized_total = float(trade.get("realized_pnl_total", 0.0))
+        position_size = float(trade.get("position_size", trade.get("position_after", 0.0)))
+        position_notional = float(trade.get("position_notional", 0.0))
+        equity = float(trade.get("equity", 0.0))
+        position_side = "FLAT"
+        if position_size > 0:
+            position_side = "LONG"
+        elif position_size < 0:
+            position_side = "SHORT"
+        return "\n".join([
+            title,
+            "",
+            f"Symbol: {symbol}",
+            f"Mode: {mode_name}",
+            f"Price: {price:.2f} USD",
+            f"Qty: {qty:.8f} {symbol}",
+            f"Notional: {notional:.2f} USD",
+            f"Fee: {fee:.4f} USD",
+            "",
+            f"Position after: {position_side}",
+            f"Position size: {position_size:.8f} {symbol}",
+            f"Position notional: {position_notional:.2f} USD",
+            "",
+            f"Realized PnL delta: {realized_delta:+.4f} USD",
+            f"Realized PnL total: {realized_total:+.4f} USD",
+            f"Equity: {equity:.2f} USD",
+            "",
+            f"Regime: {trade.get('regime', 'unknown')}",
+            f"Strategy mode: {trade.get('mode', 'unknown')}",
+            f"Risk: {trade.get('risk_state', 'unknown')}",
+            f"Pause: {trade.get('pause_reason') or 'none'}",
+            f"Reason: {trade.get('reason') or 'none'}",
+            f"Time: {str(trade.get('timestamp', '')).replace('T', ' ').replace('+00:00', ' UTC')}",
+        ])[:3900]
 
     def send_status_report(self, report: dict) -> bool:
         return self.send(self.format_status_report(report))
