@@ -224,20 +224,27 @@ def test_telegram_report_formatter_core_fields():
         "regime": "RANGE",
         "risk_reason": "none",
     })
-    assert "Status: RUNNING" in msg
+    assert "Hyperliquid paper bot félórás jelentés" in msg
     assert "Symbol: BTC" in msg
     assert "Equity: $500.00" in msg
     assert "Realized PnL: $5.00" in msg
-    assert "Regime: RANGE" in msg
-    assert "Reason: none" in msg
+    assert "RANGE /" in msg
 
 
 def test_telegram_report_formatter_missing_values():
     tg = TelegramHandler("", "")
     msg = tg.format_status_report({})
-    assert "Status: N/A" in msg
+    assert "Hyperliquid paper bot félórás jelentés" in msg
     assert "Equity: n/a" in msg
     assert "Reason: none" in msg
+
+
+def test_last_valid_trade_ignores_invalid_btc_prices(tmp_path):
+    from src.main import _read_last_valid_trade
+    p = tmp_path / "trades.csv"
+    p.write_text("timestamp,symbol,side,price,qty,notional\n2026-05-08T12:00:00+00:00,BTC,buy,110,0.1,11\n2026-05-08T12:05:00+00:00,BTC,buy,80564.96,0.001,80.56\n", encoding="utf-8")
+    row = _read_last_valid_trade(p, "BTC")
+    assert float(row["price"]) == 80564.96
 
 
 def test_telegram_interval_logic():

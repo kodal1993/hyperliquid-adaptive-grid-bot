@@ -143,6 +143,33 @@ def _risk_block_stats_30m(now_ts: float) -> tuple[int, dict[str, int], str]:
     return blocked_count, dict(reason_counts), last_block_reason
 
 
+def _trade_stats_30m(now_ts: float, expected_symbol: str) -> dict:
+    stats = {"trades_count": 0, "buy_count": 0, "sell_count": 0, "volume_usd": 0.0, "fees": 0.0, "realized_pnl_delta": 0.0, "last_trade_ts": "", "candidate_fills_count": 0, "no_orders_touched_count": 0}
+    if TRADES_CSV.exists():
+        window_start = now_ts - 30 * 60
+        with TRADES_CSV.open(encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if not _is_valid_trade_row(row, expected_symbol):
+                    continue
+                try:
+                    dt = datetime.fromisoformat(str(row.get("timestamp", "")).replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if dt.timestamp() < window_start:
+                    continue
+                stats["trades_count"] += 1
+                side = str(row.get("side", "")).lower()
+                if side == "buy":
+                    stats["buy_count"] += 1
+                elif side == "sell":
+                    stats["sell_count"] += 1
+                stats["volume_usd"] += _safe_float(row.get("notional")) or 0.0
+                stats["fees"] += _safe_float(row.get("fee")) or 0.0
+                stats["realized_pnl_delta"] += _safe_float(row.get("realized_pnl_delta")) or 0.0
+                stats["last_trade_ts"] = row.get("timestamp", "")
+    return stats
+
+
 def run() -> None:
     cfg = BotConfig.from_env()
     setup_logging(cfg.log_level)
@@ -249,6 +276,7 @@ def run() -> None:
         last_trade = _read_last_valid_trade(TRADES_CSV, cfg.default_symbol)
         _write_last_100_real_trades(TRADES_CSV, LAST_100_REAL_TRADES_CSV, cfg.default_symbol)
         blocked_30m, blocked_by_reason, last_block_reason = _risk_block_stats_30m(now_ts=time.time())
+        trade_stats_30m = _trade_stats_30m(now_ts=time.time(), expected_symbol=cfg.default_symbol)
         position_side = "FLAT"
         if engine.paper.position_size > 0:
             position_side = "LONG"
@@ -269,6 +297,35 @@ def run() -> None:
                 "blocked_risk_decisions_by_reason": blocked_by_reason,
                 "last_block_reason": last_block_reason,
                 "allowed_to_trade": risk_state == "OK",
+                "total_pnl": engine.paper.realized_pnl + unrealized_pnl,
+                "total_pnl_pct": ((engine.paper.realized_pnl + unrealized_pnl) / cfg.paper_start_balance_usd) if cfg.paper_start_balance_usd > 0 else None,
+                "daily_pnl": equity - daily_start_equity,
+                "daily_pnl_pct": daily_pnl_pct,
+                "unrealized_pnl_pct": ((unrealized_pnl / abs(engine.paper.avg_entry * engine.paper.position_size)) if abs(engine.paper.avg_entry * engine.paper.position_size) > 1e-9 else 0.0),
+                "exposure_pct": (position_notional / equity) if equity > 1e-9 else 0.0,
+                "avg_entry": engine.paper.avg_entry,
+                "trades_30m": trade_stats_30m["trades_count"],
+                "buy_count_30m": trade_stats_30m["buy_count"],
+                "sell_count_30m": trade_stats_30m["sell_count"],
+                "volume_usd_30m": trade_stats_30m["volume_usd"],
+                "fees_30m": trade_stats_30m["fees"],
+                "realized_pnl_delta_30m": trade_stats_30m["realized_pnl_delta"],
+            }
+        )
+        mark_price = latest_close
+        buys = sorted([o for o in engine.open_orders if str(o.get("symbol", "")).upper() == cfg.default_symbol.upper() and str(o.get("side", "")).lower() == "buy"], key=lambda x: float(x.get("price", 0.0)), reverse=True)
+        sells = sorted([o for o in engine.open_orders if str(o.get("symbol", "")).upper() == cfg.default_symbol.upper() and str(o.get("side", "")).lower() == "sell"], key=lambda x: float(x.get("price", 0.0)))
+        nearest_buy = float(buys[0]["price"]) if buys else None
+        nearest_sell = float(sells[0]["price"]) if sells else None
+        status_payload.update(
+            {
+                "nearest_buy_price": nearest_buy,
+                "nearest_sell_price": nearest_sell,
+                "distance_to_buy_pct": ((mark_price - nearest_buy) / mark_price) if nearest_buy else None,
+                "distance_to_sell_pct": ((nearest_sell - mark_price) / mark_price) if nearest_sell else None,
+                "active_buy_orders": len(buys),
+                "active_sell_orders": len(sells),
+                "open_orders": len(engine.open_orders),
             }
         )
         _write_status(status_payload)
