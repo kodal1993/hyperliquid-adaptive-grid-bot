@@ -239,6 +239,44 @@ def test_telegram_report_formatter_missing_values():
     assert "Reason: none" in msg
 
 
+def test_telegram_report_zero_trade_window_message():
+    tg = TelegramHandler("", "")
+    msg = tg.format_status_report({"trades_30m": 0, "buy_count_30m": 0, "sell_count_30m": 0})
+    assert "BUY count: 0" in msg
+    assert "SELL count: 0" in msg
+    assert "Nincs új BUY/SELL fill az elmúlt 30 percben." in msg
+
+
+def test_telegram_fill_alert_buy_and_sell_formats():
+    tg = TelegramHandler("", "")
+    base_trade = {
+        "timestamp": "2026-05-08T12:23:00+00:00",
+        "symbol": "BTC",
+        "price": 80564.96,
+        "qty": 0.00061875,
+        "notional": 49.85,
+        "fee": 0.0199,
+        "realized_pnl_delta": 0.0750,
+        "realized_pnl_total": 23.1943,
+        "position_size": 0.00048742,
+        "position_notional": 39.27,
+        "equity": 521.89,
+        "regime": "RANGE",
+        "mode": "neutral",
+        "risk_state": "OK",
+        "pause_reason": "",
+        "reason": "grid_fill",
+    }
+    buy_msg = tg.format_fill_alert({**base_trade, "side": "buy"}, mode_name="PAPER")
+    sell_msg = tg.format_fill_alert({**base_trade, "side": "sell", "position_size": -0.0001}, mode_name="LIVE")
+    assert buy_msg.startswith("🟢 BUY EXECUTED")
+    assert "Mode: PAPER" in buy_msg
+    assert "Side" not in buy_msg
+    assert sell_msg.startswith("🔴 SELL EXECUTED")
+    assert "Mode: LIVE" in sell_msg
+    assert "Position after: SHORT" in sell_msg
+
+
 def test_last_valid_trade_ignores_invalid_btc_prices(tmp_path):
     from src.main import _read_last_valid_trade
     p = tmp_path / "trades.csv"

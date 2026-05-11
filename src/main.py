@@ -226,24 +226,11 @@ def run() -> None:
         for tr in trade_events:
             logger.info("trade_event side=%s symbol=%s price=%.6f qty=%.8f", tr["side"], tr["symbol"], tr["price"], tr["qty"])
             if cfg.telegram_send_fills:
-                tg.send("\n".join([
-                    "✅ Trade / Fill",
-                    f"side: {tr['side']}",
-                    f"symbol: {tr['symbol']}",
-                    f"price: {tr['price']:.6f}",
-                    f"qty: {tr['qty']:.8f}",
-                    f"notional: {tr['notional']:.4f}",
-                    f"fee: {tr['fee']:.6f}",
-                    f"realized_pnl_delta: {tr['realized_pnl_delta']:.6f}",
-                    f"position_before: {tr['position_before']:.8f}",
-                    f"position_after: {tr['position_after']:.8f}",
-                    f"cash_after: {tr['cash']:.6f}",
-                    f"equity: {tr['equity']:.6f}",
-                    f"regime: {tr['regime']}",
-                    f"mode: {tr['mode']}",
-                    f"risk_state: {tr['risk_state']}",
-                    f"pause_reason: {tr['pause_reason'] or 'none'}",
-                ]))
+                msg = tg.format_fill_alert(tr, mode_name="PAPER" if cfg.paper_mode else "LIVE")
+                if tg.send(msg):
+                    logger.info("telegram_fill_alert_sent side=%s", str(tr.get("side", "")).upper())
+                else:
+                    logger.warning("telegram_fill_alert_failed error=send_returned_false side=%s", str(tr.get("side", "")).upper())
 
         if cfg.telegram_send_risk_alerts and (risk_state != last_risk_state_value or reason != last_pause_reason):
             tg.send(f"🛡 Risk update\nrisk_state: {last_risk_state_value or 'INIT'} -> {risk_state}\npause_reason: {last_pause_reason or 'none'} -> {reason or 'none'}")
