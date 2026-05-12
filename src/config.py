@@ -61,6 +61,10 @@ class BotConfig:
     hard_exposure_cap_pct: float
     absolute_exposure_cap_pct: float
     allow_position_flip: bool
+    stale_position_max_hours: float
+    min_residual_notional_usd: float
+    no_fill_cycles_before_recenter: int
+    grid_stale_max_hours: float
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -129,5 +133,9 @@ class BotConfig:
             soft_exposure_cap_pct=float(os.getenv("SOFT_EXPOSURE_CAP_PCT", "0.6")),
             hard_exposure_cap_pct=float(os.getenv("HARD_EXPOSURE_CAP_PCT", "0.8")),
             absolute_exposure_cap_pct=float(os.getenv("ABSOLUTE_EXPOSURE_CAP_PCT", "1.0")),
-            allow_position_flip=os.getenv("ALLOW_POSITION_FLIP", "false").lower() == "true",
+            allow_position_flip=os.getenv("ENABLE_POSITION_FLIP", os.getenv("ALLOW_POSITION_FLIP", "false")).lower() == "true",
+            stale_position_max_hours=float(os.getenv("STALE_POSITION_MAX_HOURS", "12")),
+            min_residual_notional_usd=float(os.getenv("MIN_RESIDUAL_NOTIONAL_USD", "10")),
+            no_fill_cycles_before_recenter=int(os.getenv("NO_FILL_CYCLES_BEFORE_RECENTER", "360")),
+            grid_stale_max_hours=float(os.getenv("GRID_STALE_MAX_HOURS", "2")),
         )

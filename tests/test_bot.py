@@ -211,6 +211,56 @@ def test_reduce_only_places_directional_orders_on_max_position_notional(tmp_path
     assert status["reduce_only_placed"] > 0
     assert all(o["side"] == "buy" for o in eng.open_orders)
 
+
+def test_close_only_resize_long_flip_disabled(tmp_path):
+    eng = make_test_engine(tmp_path, "flip1.json", paper_mode=True, allow_position_flip=False)
+    eng.paper.position_size = 39.0 / 80000.0
+    eng.paper.avg_entry = 80000.0
+    eng.open_orders = [{"symbol": "BTC", "side": "sell", "price": 80000.0, "size": 50.0 / 80000.0}]
+    fills = eng.on_candle({"open": 80000, "high": 81000, "low": 79000, "close": 80000})
+    assert len(fills) == 1
+    assert abs(fills[0]["size"] - (39.0 / 80000.0)) < 1e-12
+    assert eng.paper.position_size == 0.0
+
+
+def test_close_only_resize_short_flip_disabled(tmp_path):
+    eng = make_test_engine(tmp_path, "flip2.json", paper_mode=True, allow_position_flip=False)
+    eng.paper.position_size = -(39.0 / 80000.0)
+    eng.paper.avg_entry = 80000.0
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 80000.0, "size": 50.0 / 80000.0}]
+    fills = eng.on_candle({"open": 80000, "high": 81000, "low": 79000, "close": 80000})
+    assert len(fills) == 1
+    assert abs(fills[0]["size"] - (39.0 / 80000.0)) < 1e-12
+    assert eng.paper.position_size == 0.0
+
+
+def test_flip_enabled_can_flip_when_caps_allow(tmp_path):
+    eng = make_test_engine(tmp_path, "flip3.json", paper_mode=True, allow_position_flip=True)
+    eng.paper.position_size = 39.0 / 80000.0
+    eng.paper.avg_entry = 80000.0
+    eng.open_orders = [{"symbol": "BTC", "side": "sell", "price": 80000.0, "size": 50.0 / 80000.0}]
+    fills = eng.on_candle({"open": 80000, "high": 81000, "low": 79000, "close": 80000})
+    assert len(fills) == 1
+    assert eng.paper.position_size < 0
+
+
+def test_grid_recenter_triggered_by_no_fill_cycles(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.no_fill_cycles_before_recenter = 1
+    eng = make_test_engine(tmp_path, "recenter.json", paper_mode=True)
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [101 for _ in range(80)], "low": [99 for _ in range(80)]})
+    orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+    eng.no_fill_cycles = 2
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+    assert status["status"] == "running"
+
+
+def test_telegram_report_includes_last_trade_age_warning():
+    tg = TelegramHandler("", "")
+    msg = tg.format_status_report({"last_real_trade_age_hours": 2.5})
+    assert "WARNING" in msg
+
 from src.telegram_handler import TelegramHandler
 
 

@@ -38,6 +38,9 @@ class TelegramHandler:
         regime = report.get("regime", "unknown")
         mode = report.get("mode", report.get("grid_mode", "unknown"))
         blocked_30m = report.get("blocked_risk_decisions_30m", 0)
+        last_real_trade_age_hours = report.get("last_real_trade_age_hours")
+        no_fill_cycles = report.get("no_fill_cycles", 0)
+        top_block_reason = report.get("last_block_reason") or "none"
         trades_30m = report.get("trades_30m", 0)
         wait_reason = "ár nem érte el a következő grid szintet" if trades_30m == 0 else "volt grid aktivitás"
         human = "A bot aktív, de várakozik, mert az ár nem érte el a grid szinteket."
@@ -85,12 +88,18 @@ class TelegramHandler:
             f"Volume: {money(report.get('volume_usd_30m'))}, Fees: {money(report.get('fees_30m'))}",
             f"Realized PnL delta: {money(report.get('realized_pnl_delta_30m'))}",
             f"Blocked risk decisions: {blocked_30m}, reasons: {report.get('blocked_risk_decisions_by_reason', {})}",
+            f"Top block reason: {top_block_reason}",
+            f"No fill cycles: {no_fill_cycles}",
             "",
             "Utolsó trade:",
             f"{(report.get('last_trade_side') or 'none').upper()} @ {report.get('last_trade_price') if report.get('last_trade_price') is not None else 'n/a'}",
             f"Qty: {num(report.get('last_trade_qty'), 8)} {report.get('symbol', '')}, Notional: {money(report.get('last_trade_notional'))}",
             f"Fee: {money(report.get('last_trade_fee'))}, PnL delta: {money(report.get('last_trade_realized_pnl'))}",
             f"Reason: {report.get('last_trade_reason') or 'none'}",
+            f"Last real trade ts: {report.get('last_real_trade_ts') or 'n/a'}",
+            f"Last real trade age: {num(last_real_trade_age_hours, 2)} h",
+            f"Next intended order: {(report.get('next_order_side') or 'n/a').upper()} @ {money(report.get('next_order_price'))}",
+            ("⚠️ WARNING: no real trade for more than 2 hours." if isinstance(last_real_trade_age_hours, (int, float)) and last_real_trade_age_hours > 2 else None),
             "",
             "Döntés:",
             human,

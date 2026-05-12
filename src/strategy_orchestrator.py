@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 import pandas as pd
 from .config import BotConfig
 from .execution_engine import ExecutionEngine
@@ -108,7 +109,14 @@ class StrategyOrchestrator:
                 return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled, "reduce_only_placed": reduce_only_placed, "flattened": flattened}
             return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": False}
 
-        plan: GridPlan = self.grid_manager.build_grid(price, self.config.grid_levels, self.config.grid_spacing_pct, float(vol), regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=allow_buys, allow_sells=allow_sells)
+        no_fill_cycles = self.execution_engine.no_fill_cycles
+        last_trade_age_hours = 0.0
+        if self.execution_engine.last_real_trade_ts is not None:
+            last_trade_age_hours = (datetime.now(timezone.utc) - self.execution_engine.last_real_trade_ts).total_seconds() / 3600
+        force_recenter = no_fill_cycles >= self.config.no_fill_cycles_before_recenter or last_trade_age_hours >= self.config.grid_stale_max_hours
+        if force_recenter:
+            logger.info("grid_recenter_triggered old_center=%s new_center=%s last_trade_age=%.3f no_fill_cycles=%s", self.grid_manager.last_mid, price, last_trade_age_hours, no_fill_cycles)
+        plan: GridPlan = self.grid_manager.build_grid(price, self.config.grid_levels, self.config.grid_spacing_pct, float(vol), regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=allow_buys, allow_sells=allow_sells, force_recenter=force_recenter)
         result = self.execution_engine.cancel_replace_grid(symbol, plan)
         return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells}
 

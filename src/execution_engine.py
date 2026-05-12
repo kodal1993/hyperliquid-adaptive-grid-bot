@@ -69,6 +69,8 @@ class ExecutionEngine:
         self.hard_exposure_cap_pct = hard_exposure_cap_pct
         self.absolute_exposure_cap_pct = absolute_exposure_cap_pct
         self.allow_position_flip = allow_position_flip
+        self.no_fill_cycles = 0
+        self.last_real_trade_ts: datetime | None = None
 
     def _load_state(self, start_balance: float) -> PaperState:
         if self.state_file.exists():
@@ -119,6 +121,7 @@ class ExecutionEngine:
         mark_price = float(candle.get("close", candle.get("open", high)))
         candidate_fills, fill_meta = self._pick_fills(candle, high, low, mark_price)
         if not candidate_fills:
+            self.no_fill_cycles += 1
             logger.info(
                 "fill_model_result model=%s touched=%s selected=%s reason=%s position_before=%s position_notional_before=%s",
                 self.fill_model,
@@ -129,7 +132,10 @@ class ExecutionEngine:
                 abs(self.paper.position_size * mark_price),
             )
         executed_fills: list[dict] = []
-        for fill in candidate_fills:
+        for original_fill in candidate_fills:
+            fill = self._resize_close_only_fill(original_fill, mark_price)
+            if fill is None:
+                continue
             position_before = self.paper.position_size
             position_notional_before = abs(position_before * mark_price)
             logger.info(
@@ -163,9 +169,33 @@ class ExecutionEngine:
                 self.paper.position_size,
             )
             executed_fills.append(fill)
-            self.open_orders.remove(fill)
+            self.open_orders.remove(original_fill)
+        if executed_fills:
+            self.no_fill_cycles = 0
+            self.last_real_trade_ts = datetime.now(timezone.utc)
         self.save_state()
         return executed_fills
+
+    def _resize_close_only_fill(self, fill: dict, mark_price: float) -> dict | None:
+        side = str(fill["side"]).lower()
+        qty = float(fill["size"])
+        action = classify_exposure_action(self.paper.position_size, side, qty)
+        if action != "flipping" or self.allow_position_flip:
+            return fill
+        close_qty = abs(self.paper.position_size)
+        if close_qty <= 1e-12:
+            return None
+        resized = dict(fill)
+        resized["size"] = min(qty, close_qty)
+        logger.info(
+            "close_only_resize_applied side=%s original_qty=%s resized_qty=%s position_before=%s position_notional_before=%s reason=flip_disabled_close_only",
+            side,
+            qty,
+            resized["size"],
+            self.paper.position_size,
+            abs(self.paper.position_size * mark_price),
+        )
+        return resized
 
     def _pick_fills(self, candle: dict, high: float, low: float, mark_price: float) -> tuple[list[dict], dict]:
         touched = [o for o in self.open_orders if low <= o["price"] <= high]
@@ -291,8 +321,12 @@ class ExecutionEngine:
         block_reason = ""
         estimated_position_notional_after = abs((position_size_before + _signed_order_size(side, qty)) * mark_price)
 
+        allow_reason = ""
+        risk_state_before = risk_state
         if exposure_action in {"reducing", "flat"}:
             decision, block_reason = "allow", ""
+            if risk_state == "BLOCKED":
+                allow_reason = "exposure_reducing_override"
         elif exposure_action == "flipping":
             decision, block_reason = ("allow", "") if self.allow_position_flip else ("block", "position_flip_blocked")
         else:
@@ -308,14 +342,14 @@ class ExecutionEngine:
         if exposure_action == "increasing" and (risk_state == "BLOCKED" or pause_reason in {"one_direction_exposure", "max_position_notional", "emergency_stop", "max_drawdown", "daily_loss_limit", "daily_loss", "liquidation_risk", "liq_distance"}):
             decision, block_reason = "block", pause_reason or "risk_state_blocked"
 
-        payload = {"symbol": fill.get("symbol", ""), "side": side, "price": price, "qty": qty, "order_notional": order_notional, "position_size_before": position_size_before, "position_notional_before": position_notional_before, "estimated_position_notional_after": estimated_position_notional_after, "max_position_notional_usd": self.max_position_notional_usd, "exposure_ratio": exposure_ratio, "would_increase_exposure": would_inc, "exposure_action": exposure_action, "exposure_reducing_override": exposure_reducing_override, "risk_state": risk_state, "strategy_status": strategy_status, "pause_reason": pause_reason, "decision": decision, "block_reason": block_reason, "regime": regime, "mode": mode}
+        payload = {"symbol": fill.get("symbol", ""), "side": side, "price": price, "qty": qty, "order_notional": order_notional, "position_size_before": position_size_before, "position_notional_before": position_notional_before, "estimated_position_notional_after": estimated_position_notional_after, "max_position_notional_usd": self.max_position_notional_usd, "exposure_ratio": exposure_ratio, "would_increase_exposure": would_inc, "exposure_action": exposure_action, "exposure_reducing_override": exposure_reducing_override, "risk_state": risk_state, "risk_state_before": risk_state_before, "strategy_status": strategy_status, "pause_reason": pause_reason, "decision": decision, "allow_reason": allow_reason, "block_reason": block_reason, "regime": regime, "mode": mode}
         self._append_risk_decision(payload)
-        logger.info("risk_decision symbol=%s side=%s price=%s qty=%s order_notional=%s position_notional_before=%s max_position_notional_usd=%s exposure_ratio=%.3f would_increase_exposure=%s exposure_reducing_override=%s risk_state=%s strategy_status=%s pause_reason=%s decision=%s block_reason=%s", payload["symbol"], side, price, qty, order_notional, position_notional_before, self.max_position_notional_usd, exposure_ratio, would_inc, exposure_reducing_override, risk_state, payload["strategy_status"], pause_reason or "none", decision, block_reason or "none")
+        logger.info("risk_decision symbol=%s side=%s price=%s qty=%s order_notional=%s position_notional_before=%s max_position_notional_usd=%s exposure_ratio=%.3f would_increase_exposure=%s exposure_reducing_override=%s risk_state_before=%s risk_state=%s strategy_status=%s pause_reason=%s decision=%s allow_reason=%s block_reason=%s", payload["symbol"], side, price, qty, order_notional, position_notional_before, self.max_position_notional_usd, exposure_ratio, would_inc, exposure_reducing_override, risk_state_before, risk_state, payload["strategy_status"], pause_reason or "none", decision, allow_reason or "none", block_reason or "none")
         return decision, block_reason
 
     def _append_risk_decision(self, entry: dict) -> None:
         self.risk_decisions_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["timestamp", "symbol", "side", "price", "qty", "order_notional", "position_size_before", "position_notional_before", "estimated_position_notional_after", "max_position_notional_usd", "exposure_ratio", "would_increase_exposure", "exposure_action", "exposure_reducing_override", "risk_state", "strategy_status", "pause_reason", "decision", "block_reason", "regime", "mode"]
+        fields = ["timestamp", "symbol", "side", "price", "qty", "order_notional", "position_size_before", "position_notional_before", "estimated_position_notional_after", "max_position_notional_usd", "exposure_ratio", "would_increase_exposure", "exposure_action", "exposure_reducing_override", "risk_state_before", "risk_state", "strategy_status", "pause_reason", "decision", "allow_reason", "block_reason", "regime", "mode"]
         write_header = not self.risk_decisions_csv.exists()
         row = {"timestamp": datetime.now(timezone.utc).isoformat(), **entry}
         with self.risk_decisions_csv.open("a", encoding="utf-8") as f:
