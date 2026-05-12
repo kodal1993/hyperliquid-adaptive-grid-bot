@@ -18,9 +18,9 @@ class GridManager:
         self.last_mid: float | None = None
         self.last_regime: MarketRegime | None = None
 
-    def build_grid(self, mid_price: float, levels: int, base_spacing_pct: float, volatility: float, regime: MarketRegime, order_size: float, regrid_threshold_pct: float, min_grid_profit_over_fees_pct: float, mode: GridMode, allow_buys: bool = True, allow_sells: bool = True) -> GridPlan:
+    def build_grid(self, mid_price: float, levels: int, base_spacing_pct: float, volatility: float, regime: MarketRegime, order_size: float, regrid_threshold_pct: float, min_grid_profit_over_fees_pct: float, mode: GridMode, allow_buys: bool = True, allow_sells: bool = True, force_recenter: bool = False) -> GridPlan:
         spacing = base_spacing_pct * (1 + volatility)
-        should_regrid = self.last_mid is None or self.last_regime != regime or abs(mid_price - self.last_mid) / self.last_mid >= regrid_threshold_pct
+        should_regrid = force_recenter or self.last_mid is None or self.last_regime != regime or abs(mid_price - self.last_mid) / self.last_mid >= regrid_threshold_pct
         if spacing <= min_grid_profit_over_fees_pct:
             should_regrid = False
 

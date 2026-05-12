@@ -170,6 +170,15 @@ def _trade_stats_30m(now_ts: float, expected_symbol: str) -> dict:
     return stats
 
 
+def _parse_iso_utc(ts_raw: str) -> datetime | None:
+    if not ts_raw:
+        return None
+    try:
+        return datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def run() -> None:
     cfg = BotConfig.from_env()
     setup_logging(cfg.log_level)
@@ -231,6 +240,15 @@ def run() -> None:
                     logger.info("telegram_fill_alert_sent side=%s", str(tr.get("side", "")).upper())
                 else:
                     logger.warning("telegram_fill_alert_failed error=send_returned_false side=%s", str(tr.get("side", "")).upper())
+        last_trade_dt = engine.last_real_trade_ts
+        if last_trade_dt and abs(engine.paper.position_size) > 1e-12:
+            age_hours = (datetime.now(timezone.utc) - last_trade_dt).total_seconds() / 3600
+            if age_hours > cfg.stale_position_max_hours and position_notional > cfg.min_residual_notional_usd:
+                close_side = "sell" if engine.paper.position_size > 0 else "buy"
+                close_qty = abs(engine.paper.position_size)
+                logger.warning("stale_position_cleanup_triggered side=%s close_qty=%s position_notional_before=%.4f reason=stale_position age_hours=%.3f", close_side, close_qty, position_notional, age_hours)
+                engine._apply_fill({"symbol": cfg.default_symbol, "side": close_side, "price": latest_close, "size": close_qty}, reason="stale_position_cleanup", regime=status.get("regime", "unknown"), mode=mode, risk_state="OK", pause_reason="")
+                trade_events.extend(engine.consume_trade_log())
 
         if cfg.telegram_send_risk_alerts and (risk_state != last_risk_state_value or reason != last_pause_reason):
             tg.send(f"🛡 Risk update\nrisk_state: {last_risk_state_value or 'INIT'} -> {risk_state}\npause_reason: {last_pause_reason or 'none'} -> {reason or 'none'}")
@@ -297,8 +315,18 @@ def run() -> None:
                 "volume_usd_30m": trade_stats_30m["volume_usd"],
                 "fees_30m": trade_stats_30m["fees"],
                 "realized_pnl_delta_30m": trade_stats_30m["realized_pnl_delta"],
+                "no_fill_cycles": engine.no_fill_cycles,
             }
         )
+        last_trade_ts = status_payload.get("last_trade_ts") or trade_stats_30m.get("last_trade_ts") or (engine.last_real_trade_ts.isoformat() if engine.last_real_trade_ts else "")
+        last_trade_dt = _parse_iso_utc(str(last_trade_ts))
+        last_trade_age_hours = ((datetime.now(timezone.utc) - last_trade_dt).total_seconds() / 3600) if last_trade_dt else None
+        next_order = None
+        if buys:
+            next_order = {"side": "buy", "price": float(buys[0]["price"])}
+        if sells and (next_order is None or abs(float(sells[0]["price"]) - mark_price) < abs(next_order["price"] - mark_price)):
+            next_order = {"side": "sell", "price": float(sells[0]["price"])}
+        status_payload.update({"last_real_trade_ts": last_trade_ts, "last_real_trade_age_hours": last_trade_age_hours, "next_order_side": next_order["side"] if next_order else None, "next_order_price": next_order["price"] if next_order else None})
         mark_price = latest_close
         buys = sorted([o for o in engine.open_orders if str(o.get("symbol", "")).upper() == cfg.default_symbol.upper() and str(o.get("side", "")).lower() == "buy"], key=lambda x: float(x.get("price", 0.0)), reverse=True)
         sells = sorted([o for o in engine.open_orders if str(o.get("symbol", "")).upper() == cfg.default_symbol.upper() and str(o.get("side", "")).lower() == "sell"], key=lambda x: float(x.get("price", 0.0)))
