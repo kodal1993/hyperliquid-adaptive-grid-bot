@@ -284,11 +284,15 @@ def test_write_fatal_error_creates_log_and_crashed_status(tmp_path, monkeypatch)
 
 def test_single_instance_lock_blocks_second_acquire(tmp_path, monkeypatch):
     from src import main
+
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HYPERLIQUID_BOT_LOCK_FILE", str(tmp_path / "bot.lock"))
     h1 = main._acquire_single_instance_lock()
     assert h1 is not None
     h2 = main._acquire_single_instance_lock()
     assert h2 is None
+
+    h1.close()
 
 from src.telegram_handler import TelegramHandler
 

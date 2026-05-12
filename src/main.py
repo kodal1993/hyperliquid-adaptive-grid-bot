@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import traceback
 from collections import Counter
@@ -23,7 +24,7 @@ from .utils import append_csv, setup_logging
 logger = logging.getLogger(__name__)
 STATUS_FILE = Path("data/status.json")
 FATAL_LOG_FILE = Path("logs/fatal_error.log")
-LOCK_FILE = Path("/tmp/hyperliquid_adaptive_grid_bot.lock")
+DEFAULT_LOCK_FILE = Path("/tmp/hyperliquid_adaptive_grid_bot.lock")
 TRADES_CSV = Path("logs/trades.csv")
 RISK_DECISIONS_CSV = Path("logs/risk_decisions.csv")
 LAST_100_REAL_TRADES_CSV = Path("logs/last_100_real_trades.csv")
@@ -53,12 +54,13 @@ def _write_fatal_error(exc: BaseException) -> None:
 
 
 def _acquire_single_instance_lock() -> object | None:
-    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    handle = LOCK_FILE.open("w", encoding="utf-8")
+    lock_file = Path(os.getenv("HYPERLIQUID_BOT_LOCK_FILE", str(DEFAULT_LOCK_FILE)))
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_file.open("w", encoding="utf-8")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        logger.error("single_instance_lock_already_held lock_file=%s", LOCK_FILE)
+        logger.error("single_instance_lock_already_held lock_file=%s", lock_file)
         handle.close()
         return None
     handle.write(str(time.time()))
