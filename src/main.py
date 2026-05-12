@@ -204,6 +204,33 @@ def _parse_iso_utc(ts_raw: str) -> datetime | None:
         return None
 
 
+def _resolve_last_real_trade_ts(expected_symbol: str, fallback: str = "") -> str:
+    candidates = [
+        LAST_100_REAL_TRADES_CSV,
+        Path("logs/real_trades.csv"),
+        TRADES_CSV,
+    ]
+    for csv_path in candidates:
+        last_trade = _read_last_valid_trade(csv_path, expected_symbol)
+        ts = str(last_trade.get("timestamp", "")).strip()
+        if _parse_iso_utc(ts):
+            return ts
+    return fallback
+
+
+def _send_startup_telegram(cfg: BotConfig, tg: TelegramHandler) -> str:
+    telegram_status = "disabled"
+    if not cfg.telegram_send_startup:
+        return telegram_status
+    logger.info("telegram_startup_send_attempted")
+    ok = tg.send("\n".join(["🚀 Hyperliquid Grid Bot Started", f"Mode: {'PAPER' if cfg.paper_mode else 'LIVE'}", f"Network: {cfg.hl_network}", f"Symbol: {cfg.default_symbol}", f"Fill Model: {cfg.fill_model}", f"Live Trading: {'ENABLED' if cfg.enable_live_trading else 'DISABLED'}", f"Profile: {cfg.env_profile}"]))
+    if ok:
+        logger.info("telegram_startup_send_ok")
+        return "startup_ok"
+    logger.warning("telegram_startup_send_failed exception_type=%s http_status=%s token_present=%s chat_id_present=%s", tg.last_error.get("exception_type", ""), tg.last_error.get("http_status", ""), bool(cfg.telegram_bot_token), bool(cfg.telegram_chat_id))
+    return "startup_failed"
+
+
 def run() -> None:
     cfg = BotConfig.from_env()
     setup_logging(cfg.log_level)
@@ -225,16 +252,7 @@ def run() -> None:
     last_pause_reason = ""
     last_risk_state_value = ""
 
-    telegram_status = "disabled"
-    if cfg.telegram_send_startup:
-        logger.info("telegram_startup_send_attempted")
-        ok = tg.send("\n".join(["🚀 Hyperliquid Grid Bot Started", f"Mode: {'PAPER' if cfg.paper_mode else 'LIVE'}", f"Network: {cfg.hl_network}", f"Symbol: {cfg.default_symbol}", f"Fill Model: {cfg.fill_model}", f"Live Trading: {'ENABLED' if cfg.enable_live_trading else 'DISABLED'}", f"Profile: {cfg.env_profile}"]))
-        if ok:
-            logger.info("telegram_startup_send_ok")
-            telegram_status = "startup_ok"
-        else:
-            telegram_status = "startup_failed"
-            logger.warning("telegram_startup_send_failed exception_type=%s http_status=%s token_present=%s chat_id_present=%s", tg.last_error.get("exception_type", ""), tg.last_error.get("http_status", ""), bool(cfg.telegram_bot_token), bool(cfg.telegram_chat_id))
+    telegram_status = _send_startup_telegram(cfg, tg)
 
     while True:
         buys: list[dict] = []
@@ -352,7 +370,7 @@ def run() -> None:
                 "no_fill_cycles": engine.no_fill_cycles,
             }
         )
-        last_trade_ts = status_payload.get("last_trade_ts") or trade_stats_30m.get("last_trade_ts") or (engine.last_real_trade_ts.isoformat() if engine.last_real_trade_ts else "")
+        last_trade_ts = _resolve_last_real_trade_ts(cfg.default_symbol, fallback=(engine.last_real_trade_ts.isoformat() if engine.last_real_trade_ts else ""))
         last_trade_dt = _parse_iso_utc(str(last_trade_ts))
         last_trade_age_hours = ((datetime.now(timezone.utc) - last_trade_dt).total_seconds() / 3600) if last_trade_dt else None
         mark_price = latest_close

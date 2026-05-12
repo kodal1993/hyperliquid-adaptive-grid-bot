@@ -68,7 +68,8 @@ class BotConfig:
 
     @classmethod
     def from_env(cls) -> "BotConfig":
-        default_loaded = load_dotenv(override=False)
+        default_env_path = Path.cwd() / ".env"
+        default_loaded = load_dotenv(dotenv_path=default_env_path, override=True)
         env_profile = os.getenv("ENV_PROFILE", "paper")
         profile_path = Path("config") / f"{env_profile}.env"
         profile_loaded = False
