@@ -532,3 +532,65 @@ def test_exposure_gating_cases(tmp_path):
     assert d == "allow"
     d,_ = eng._risk_decision({"symbol":"BTC","side":"sell","price":90000.0,"size":0.0001}, 90000.0, "OK", "", "range", "neutral")
     assert d == "allow"
+
+
+def test_main_config_loads_dotenv_telegram_values(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("TELEGRAM_BOT_TOKEN=abc123\nTELEGRAM_CHAT_ID=999\n")
+    cfg = BotConfig.from_env()
+    assert cfg.telegram_bot_token == "abc123"
+    assert cfg.telegram_chat_id == "999"
+
+
+def test_telegram_handler_gets_validated_config_values_from_dotenv(tmp_path, monkeypatch):
+    from src.telegram_handler import TelegramHandler
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("TELEGRAM_BOT_TOKEN=test_token\nTELEGRAM_CHAT_ID=test_chat\n")
+    cfg = BotConfig.from_env()
+    tg = TelegramHandler(cfg.telegram_bot_token, cfg.telegram_chat_id)
+    assert tg.token == "test_token"
+    assert tg.chat_id == "test_chat"
+
+
+def test_last_real_trade_ts_resolves_from_real_trade_csv(tmp_path, monkeypatch):
+    from src.main import _resolve_last_real_trade_ts
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "real_trades.csv").write_text(
+        "timestamp,symbol,side,price,qty,notional\n"
+        "2026-05-10T11:00:00+00:00,BTC,buy,101000,0.001,101\n",
+        encoding="utf-8",
+    )
+    ts = _resolve_last_real_trade_ts("BTC")
+    assert ts == "2026-05-10T11:00:00+00:00"
+
+
+def test_send_startup_telegram_respects_disabled_flag():
+    from src.main import _send_startup_telegram
+
+    class Cfg:
+        telegram_send_startup = False
+        paper_mode = True
+        hl_network = "testnet"
+        default_symbol = "BTC"
+        fill_model = "conservative"
+        enable_live_trading = False
+        env_profile = "paper"
+        telegram_bot_token = "x"
+        telegram_chat_id = "y"
+
+    class DummyTg:
+        def __init__(self):
+            self.sent = False
+            self.last_error = {}
+
+        def send(self, text: str) -> bool:
+            self.sent = True
+            return True
+
+    tg = DummyTg()
+    status = _send_startup_telegram(Cfg(), tg)
+    assert status == "disabled"
+    assert tg.sent is False
