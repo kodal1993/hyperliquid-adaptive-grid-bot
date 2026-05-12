@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import time
+import traceback
 from collections import Counter
 import csv
 from datetime import datetime, timezone
 from pathlib import Path
+import fcntl
 
 import pandas as pd
 
@@ -19,7 +21,9 @@ from .telegram_handler import TelegramHandler
 from .utils import append_csv, setup_logging
 
 logger = logging.getLogger(__name__)
-STATUS_FILE = Path("state/status.json")
+STATUS_FILE = Path("data/status.json")
+FATAL_LOG_FILE = Path("logs/fatal_error.log")
+LOCK_FILE = Path("/tmp/hyperliquid_adaptive_grid_bot.lock")
 TRADES_CSV = Path("logs/trades.csv")
 RISK_DECISIONS_CSV = Path("logs/risk_decisions.csv")
 LAST_100_REAL_TRADES_CSV = Path("logs/last_100_real_trades.csv")
@@ -39,6 +43,27 @@ def _paper_metrics(cfg: BotConfig, engine: ExecutionEngine, client: HyperliquidC
 def _write_status(payload: dict) -> None:
     STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATUS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _write_fatal_error(exc: BaseException) -> None:
+    ts = datetime.now(timezone.utc).isoformat()
+    FATAL_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    FATAL_LOG_FILE.write_text(f"[{ts}] {traceback.format_exc()}", encoding="utf-8")
+    _write_status({"status": "crashed", "timestamp": ts, "last_error": f"{type(exc).__name__}: {exc}"})
+
+
+def _acquire_single_instance_lock() -> object | None:
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handle = LOCK_FILE.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        logger.error("single_instance_lock_already_held lock_file=%s", LOCK_FILE)
+        handle.close()
+        return None
+    handle.write(str(time.time()))
+    handle.flush()
+    return handle
 
 
 def _derive_risk_state(strategy_status: str, reason: str) -> str:
@@ -200,15 +225,20 @@ def run() -> None:
     last_pause_reason = ""
     last_risk_state_value = ""
 
+    telegram_status = "disabled"
     if cfg.telegram_send_startup:
         logger.info("telegram_startup_send_attempted")
         ok = tg.send("\n".join(["🚀 Hyperliquid Grid Bot Started", f"Mode: {'PAPER' if cfg.paper_mode else 'LIVE'}", f"Network: {cfg.hl_network}", f"Symbol: {cfg.default_symbol}", f"Fill Model: {cfg.fill_model}", f"Live Trading: {'ENABLED' if cfg.enable_live_trading else 'DISABLED'}", f"Profile: {cfg.env_profile}"]))
         if ok:
             logger.info("telegram_startup_send_ok")
+            telegram_status = "startup_ok"
         else:
-            logger.warning("telegram_startup_send_failed")
+            telegram_status = "startup_failed"
+            logger.warning("telegram_startup_send_failed exception_type=%s http_status=%s token_present=%s chat_id_present=%s", tg.last_error.get("exception_type", ""), tg.last_error.get("http_status", ""), bool(cfg.telegram_bot_token), bool(cfg.telegram_chat_id))
 
     while True:
+        buys: list[dict] = []
+        sells: list[dict] = []
         candles = to_df(client.get_candles(cfg.default_symbol, lookback=200))
         latest_close = float(candles["close"].iloc[-1])
         unrealized_pnl, equity, position_notional = _paper_metrics(cfg, engine, client, latest_close)
@@ -258,7 +288,9 @@ def run() -> None:
         append_csv("logs/equity_curve.csv", [time.time(), equity, engine.paper.cash, engine.paper.realized_pnl, unrealized_pnl, engine.paper.fees_paid], ["ts", "equity", "cash", "realized_pnl", "unrealized_pnl", "fees_paid"])
 
         status_payload = {
+            "status": strategy_status,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "paper_mode": cfg.paper_mode,
             "symbol": cfg.default_symbol,
             "price": latest_close,
             "regime": status.get("regime", "unknown"),
@@ -276,6 +308,8 @@ def run() -> None:
             "risk_state": risk_state,
             "strategy_status": strategy_status,
             "pause_reason": reason,
+            "last_error": "",
+            "telegram_status": telegram_status,
         }
 
         last_trade = _read_last_valid_trade(TRADES_CSV, cfg.default_symbol)
@@ -321,15 +355,17 @@ def run() -> None:
         last_trade_ts = status_payload.get("last_trade_ts") or trade_stats_30m.get("last_trade_ts") or (engine.last_real_trade_ts.isoformat() if engine.last_real_trade_ts else "")
         last_trade_dt = _parse_iso_utc(str(last_trade_ts))
         last_trade_age_hours = ((datetime.now(timezone.utc) - last_trade_dt).total_seconds() / 3600) if last_trade_dt else None
+        mark_price = latest_close
+        buys = sorted([o for o in engine.open_orders if str(o.get("symbol", "")).upper() == cfg.default_symbol.upper() and str(o.get("side", "")).lower() == "buy"], key=lambda x: float(x.get("price", 0.0)), reverse=True)
+        sells = sorted([o for o in engine.open_orders if str(o.get("symbol", "")).upper() == cfg.default_symbol.upper() and str(o.get("side", "")).lower() == "sell"], key=lambda x: float(x.get("price", 0.0)))
+        if not buys and not sells:
+            logger.info("no_grid_orders_generated")
         next_order = None
         if buys:
             next_order = {"side": "buy", "price": float(buys[0]["price"])}
         if sells and (next_order is None or abs(float(sells[0]["price"]) - mark_price) < abs(next_order["price"] - mark_price)):
             next_order = {"side": "sell", "price": float(sells[0]["price"])}
         status_payload.update({"last_real_trade_ts": last_trade_ts, "last_real_trade_age_hours": last_trade_age_hours, "next_order_side": next_order["side"] if next_order else None, "next_order_price": next_order["price"] if next_order else None})
-        mark_price = latest_close
-        buys = sorted([o for o in engine.open_orders if str(o.get("symbol", "")).upper() == cfg.default_symbol.upper() and str(o.get("side", "")).lower() == "buy"], key=lambda x: float(x.get("price", 0.0)), reverse=True)
-        sells = sorted([o for o in engine.open_orders if str(o.get("symbol", "")).upper() == cfg.default_symbol.upper() and str(o.get("side", "")).lower() == "sell"], key=lambda x: float(x.get("price", 0.0)))
         nearest_buy = float(buys[0]["price"]) if buys else None
         nearest_sell = float(sells[0]["price"]) if sells else None
         status_payload.update(
@@ -357,4 +393,15 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    run()
+    lock_handle = _acquire_single_instance_lock()
+    if lock_handle is None:
+        raise SystemExit(0)
+    try:
+        run()
+    except Exception as exc:
+        logger.exception("fatal_exception_in_main")
+        _write_fatal_error(exc)
+        raise
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()

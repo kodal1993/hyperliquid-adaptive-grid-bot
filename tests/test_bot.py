@@ -261,6 +261,35 @@ def test_telegram_report_includes_last_trade_age_warning():
     msg = tg.format_status_report({"last_real_trade_age_hours": 2.5})
     assert "WARNING" in msg
 
+
+def test_write_status_creates_data_status_json(tmp_path, monkeypatch):
+    from src import main
+    monkeypatch.chdir(tmp_path)
+    main._write_status({"status": "running", "timestamp": "2026-01-01T00:00:00+00:00"})
+    assert (tmp_path / "data" / "status.json").exists()
+
+
+def test_write_fatal_error_creates_log_and_crashed_status(tmp_path, monkeypatch):
+    from src import main
+    monkeypatch.chdir(tmp_path)
+    try:
+        raise RuntimeError("boom")
+    except RuntimeError as exc:
+        main._write_fatal_error(exc)
+    fatal = (tmp_path / "logs" / "fatal_error.log").read_text(encoding="utf-8")
+    status = (tmp_path / "data" / "status.json").read_text(encoding="utf-8")
+    assert "RuntimeError" in fatal
+    assert "\"status\": \"crashed\"" in status
+
+
+def test_single_instance_lock_blocks_second_acquire(tmp_path, monkeypatch):
+    from src import main
+    monkeypatch.chdir(tmp_path)
+    h1 = main._acquire_single_instance_lock()
+    assert h1 is not None
+    h2 = main._acquire_single_instance_lock()
+    assert h2 is None
+
 from src.telegram_handler import TelegramHandler
 
 
