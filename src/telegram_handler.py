@@ -12,15 +12,19 @@ class TelegramHandler:
     def __init__(self, token: str, chat_id: str) -> None:
         self.token = token
         self.chat_id = chat_id
+        self.last_error: dict = {}
 
     def send(self, text: str) -> bool:
         if not self.token or not self.chat_id:
+            self.last_error = {"exception_type": "MissingCredentials", "http_status": None}
             return False
         payload = text[:3900]
         try:
             resp = requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage", json={"chat_id": self.chat_id, "text": payload}, timeout=10)
+            self.last_error = {"exception_type": "", "http_status": resp.status_code}
             return resp.ok
         except Exception as exc:
+            self.last_error = {"exception_type": type(exc).__name__, "http_status": getattr(getattr(exc, "response", None), "status_code", None)}
             logger.warning("Telegram send failed: %s", exc)
             return False
 
