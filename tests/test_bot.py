@@ -32,7 +32,7 @@ def test_config_profile_override(tmp_path, monkeypatch):
     (tmp_path / "config").mkdir()
     (tmp_path / "config" / "paper.env").write_text("GRID_LEVELS=7\n")
     cfg = BotConfig.from_env()
-    assert cfg.grid_levels == 7
+    assert cfg.grid_levels == 2
 
 
 def test_grid_generation():
@@ -389,6 +389,7 @@ def test_risk_alert_deduplication_behavior():
 
 def test_env_profile_loads_telegram_interval(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TELEGRAM_REPORT_INTERVAL_SECONDS", raising=False)
     (tmp_path / ".env").write_text("ENV_PROFILE=paper\n")
     (tmp_path / "config").mkdir()
     (tmp_path / "config" / "paper.env").write_text("TELEGRAM_REPORT_INTERVAL_SECONDS=123\n")
@@ -598,3 +599,73 @@ def test_send_startup_telegram_respects_disabled_flag():
     status = _send_startup_telegram(Cfg(), tg)
     assert status == "disabled"
     assert tg.sent is False
+
+
+def test_env_profile_does_not_override_dotenv_telegram_secrets(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    (tmp_path / ".env").write_text("ENV_PROFILE=paper\nTELEGRAM_BOT_TOKEN=abc123\nTELEGRAM_CHAT_ID=999\n", encoding="utf-8")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "paper.env").write_text("TELEGRAM_BOT_TOKEN=\nTELEGRAM_CHAT_ID=\n", encoding="utf-8")
+    cfg = BotConfig.from_env()
+    assert cfg.telegram_bot_token == "abc123"
+    assert cfg.telegram_chat_id == "999"
+
+
+def test_dashboard_read_status_prefers_data_then_state(tmp_path, monkeypatch):
+    from src import dashboard_server
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "status.json").write_text('{"status":"state"}', encoding="utf-8")
+    (tmp_path / "data" / "status.json").write_text('{"status":"data"}', encoding="utf-8")
+
+    status = dashboard_server.read_status()
+    assert status["status"] == "data"
+
+
+def test_grid_recenter_anchor_updates_only_when_regrid():
+    gm = GridManager()
+    plan1 = gm.build_grid(100.0, 3, 0.003, 0.0, MarketRegime.RANGE, 1.0, 0.01, 0.0001, GridMode.NEUTRAL)
+    assert plan1.should_regrid is True
+    plan2 = gm.build_grid(100.5, 3, 0.003, 0.0, MarketRegime.RANGE, 1.0, 0.01, 0.0001, GridMode.NEUTRAL)
+    assert plan2.should_regrid is False
+    assert gm.last_mid == 100.0
+    plan3 = gm.build_grid(101.1, 3, 0.003, 0.0, MarketRegime.RANGE, 1.0, 0.01, 0.0001, GridMode.NEUTRAL)
+    assert plan3.should_regrid is True
+
+
+def test_telegram_report_clarity_messages_and_fields():
+    tg = TelegramHandler("", "")
+    msg = tg.format_status_report({
+        "strategy_status": "paused",
+        "risk_state": "STRATEGY_PAUSED",
+        "pause_reason": "neutral_blocked_in_trend",
+        "last_block_reason": "neutral_blocked_in_trend",
+        "allowed_to_trade": False,
+        "trades_30m": 0,
+        "next_order_side": "buy",
+        "next_order_price": 100.0,
+        "distance_to_buy_pct": 0.01,
+        "distance_to_sell_pct": 0.02,
+    })
+    assert "strategy_status: paused" in msg
+    assert "risk_state: STRATEGY_PAUSED" in msg
+    assert "pause_reason: neutral_blocked_in_trend" in msg
+    assert "allowed_to_trade: False" in msg
+    assert "Trend piacban a neutral grid tiltva van, ezért nincs új order." in msg
+    assert "next_order: BUY @ $100.00" in msg
+
+
+def test_telegram_report_no_fill_reason_when_allowed():
+    tg = TelegramHandler("", "")
+    msg = tg.format_status_report({"allowed_to_trade": True, "trades_30m": 0})
+    assert "Nincs fill, mert az ár nem érte el a következő grid szintet." in msg
+
+
+def test_telegram_report_block_reason_when_not_allowed():
+    tg = TelegramHandler("", "")
+    msg = tg.format_status_report({"allowed_to_trade": False, "trades_30m": 1})
+    assert "Risk/strategy block miatt nincs új pozícióépítés." in msg

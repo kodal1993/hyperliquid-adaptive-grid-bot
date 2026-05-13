@@ -32,6 +32,7 @@ class GridManager:
             if allow_sells and mode in (GridMode.NEUTRAL, GridMode.SHORT_BIASED):
                 short_levels.append(GridLevel(price=mid_price * (1 + spacing * i), side="sell", size=order_size))
 
-        self.last_mid = mid_price
-        self.last_regime = regime
+        if should_regrid:
+            self.last_mid = mid_price
+            self.last_regime = regime
         return GridPlan(regime=regime, mode=mode, long_levels=long_levels, short_levels=short_levels, should_regrid=should_regrid)

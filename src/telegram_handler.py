@@ -46,10 +46,20 @@ class TelegramHandler:
         no_fill_cycles = report.get("no_fill_cycles", 0)
         top_block_reason = report.get("last_block_reason") or "none"
         trades_30m = report.get("trades_30m", 0)
-        wait_reason = "ár nem érte el a következő grid szintet" if trades_30m == 0 else "volt grid aktivitás"
+        allowed_to_trade = bool(report.get("allowed_to_trade", False))
+        pause_reason = report.get("pause_reason") or "none"
+        strategy_status = report.get("strategy_status", "unknown")
+        risk_state = report.get("risk_state", "unknown")
+        next_order_side = (report.get("next_order_side") or "n/a").upper()
+        next_order_price = money(report.get("next_order_price"))
+
         human = "A bot aktív, de várakozik, mert az ár nem érte el a grid szinteket."
-        if not report.get("allowed_to_trade", False):
-            human = "A bot risk miatt nem épít új pozíciót."
+        if pause_reason == "neutral_blocked_in_trend":
+            human = "Trend piacban a neutral grid tiltva van, ezért nincs új order."
+        elif not allowed_to_trade:
+            human = "Risk/strategy block miatt nincs új pozícióépítés."
+        elif trades_30m == 0 and allowed_to_trade:
+            human = "Nincs fill, mert az ár nem érte el a következő grid szintet."
         elif report.get("position_side") in {"LONG", "SHORT"}:
             human = f"A bot aktív és pozícióban van, jelenleg {str(report.get('position_side')).lower()} exposure-t tart."
         no_recent_trade_line = "Nincs új BUY/SELL fill az elmúlt 30 percben." if trades_30m == 0 else None
@@ -58,8 +68,14 @@ class TelegramHandler:
             "",
             "Állapot:",
             f"Bot aktív, {regime} / {mode} módban vár.",
-            f"{'Nincs risk block' if blocked_30m == 0 else f'Risk block: {blocked_30m} db'}; pause: {report.get('pause_reason') or 'nincs'}.",
-            f"Az elmúlt 30 percben {'nem volt trade' if trades_30m == 0 else f'{trades_30m} trade volt'}, mert {wait_reason}.",
+            f"strategy_status: {strategy_status}",
+            f"risk_state: {risk_state}",
+            f"pause_reason: {pause_reason}",
+            f"last_block_reason: {top_block_reason}",
+            f"allowed_to_trade: {allowed_to_trade}",
+            f"next_order: {next_order_side} @ {next_order_price}",
+            f"Nearest BUY distance: {pct(report.get('distance_to_buy_pct'))}",
+            f"Nearest SELL distance: {pct(report.get('distance_to_sell_pct'))}",
             "",
             "Account:",
             f"Equity: {money(report.get('equity'))}",
