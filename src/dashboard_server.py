@@ -6,14 +6,15 @@ import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-STATUS = Path('state/status.json')
+STATUS_PATHS = [Path('data/status.json'), Path('state/status.json')]
 TRADES_CSV = Path('logs/trades.csv')
 TRADES_JSONL = Path('logs/trades.jsonl')
 
 
 def read_status() -> dict:
-    if STATUS.exists():
-        return json.loads(STATUS.read_text(encoding='utf-8'))
+    for status_path in STATUS_PATHS:
+        if status_path.exists():
+            return json.loads(status_path.read_text(encoding='utf-8'))
     return {}
 
 
