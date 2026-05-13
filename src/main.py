@@ -143,10 +143,10 @@ def _write_last_100_real_trades(csv_path: Path, out_path: Path, expected_symbol:
         writer.writerows(rows[-100:])
 
 
-def _risk_block_stats_30m(now_ts: float) -> tuple[int, dict[str, int], str]:
+def _risk_block_stats_window(now_ts: float, window_seconds: int = 3600) -> tuple[int, dict[str, int], str]:
     if not RISK_DECISIONS_CSV.exists():
         return 0, {}, ""
-    window_start = now_ts - 30 * 60
+    window_start = now_ts - window_seconds
     reason_counts: Counter[str] = Counter()
     last_block_reason = ""
     blocked_count = 0
@@ -170,10 +170,10 @@ def _risk_block_stats_30m(now_ts: float) -> tuple[int, dict[str, int], str]:
     return blocked_count, dict(reason_counts), last_block_reason
 
 
-def _trade_stats_30m(now_ts: float, expected_symbol: str) -> dict:
+def _trade_stats_window(now_ts: float, expected_symbol: str, window_seconds: int = 3600) -> dict:
     stats = {"trades_count": 0, "buy_count": 0, "sell_count": 0, "volume_usd": 0.0, "fees": 0.0, "realized_pnl_delta": 0.0, "last_trade_ts": "", "candidate_fills_count": 0, "no_orders_touched_count": 0}
     if TRADES_CSV.exists():
-        window_start = now_ts - 30 * 60
+        window_start = now_ts - window_seconds
         with TRADES_CSV.open(encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 if not _is_valid_trade_row(row, expected_symbol):
@@ -225,7 +225,7 @@ def _send_startup_telegram(cfg: BotConfig, tg: TelegramHandler) -> str:
     if not cfg.telegram_send_startup:
         return telegram_status
     logger.info("telegram_startup_send_attempted")
-    ok = tg.send("\n".join(["🚀 Hyperliquid Grid Bot Started", f"Mode: {'PAPER' if cfg.paper_mode else 'LIVE'}", f"Network: {cfg.hl_network}", f"Symbol: {cfg.default_symbol}", f"Fill Model: {cfg.fill_model}", f"Live Trading: {'ENABLED' if cfg.enable_live_trading else 'DISABLED'}", f"Profile: {cfg.env_profile}"]))
+    ok = tg.send("\n".join(["🚀 Bot started", f"Mode: {'PAPER' if cfg.paper_mode else 'LIVE'}", f"Network: {cfg.hl_network}", f"Symbol: {cfg.default_symbol}", f"Profile: {cfg.env_profile}", f"Fill model: {cfg.fill_model}", f"Report interval: {cfg.telegram_report_interval_seconds}s"]))
     if ok:
         logger.info("telegram_startup_send_ok")
         return "startup_ok"
@@ -253,6 +253,8 @@ def run() -> None:
     last_telegram_report_ts = 0.0
     last_pause_reason = ""
     last_risk_state_value = ""
+    last_hard_risk_alert_ts: dict[str, float] = {}
+    last_recovery_alert_ts = 0.0
 
     telegram_status = _send_startup_telegram(cfg, tg)
 
@@ -300,10 +302,18 @@ def run() -> None:
                 engine._apply_fill({"symbol": cfg.default_symbol, "side": close_side, "price": latest_close, "size": close_qty}, reason="stale_position_cleanup", regime=status.get("regime", "unknown"), mode=mode, risk_state="OK", pause_reason="")
                 trade_events.extend(engine.consume_trade_log())
 
-        if cfg.telegram_send_risk_alerts and (risk_state != last_risk_state_value or reason != last_pause_reason):
-            tg.send(f"🛡 Risk update\nrisk_state: {last_risk_state_value or 'INIT'} -> {risk_state}\npause_reason: {last_pause_reason or 'none'} -> {reason or 'none'}")
-            last_risk_state_value = risk_state
-            last_pause_reason = reason
+        hard_risk_reasons = {"emergency_stop", "max_drawdown", "daily_loss", "daily_loss_limit", "max_position_notional", "liquidation_risk", "liq_distance"}
+        now_ts = time.time()
+        if cfg.telegram_send_hard_risk_alerts and risk_state == "BLOCKED" and reason in hard_risk_reasons:
+            prev_ts = last_hard_risk_alert_ts.get(reason, 0.0)
+            if now_ts - prev_ts >= cfg.telegram_risk_alert_cooldown_seconds:
+                tg.send(f"🛡 HARD RISK BLOCK\nreason: {reason}\nrisk_state: {risk_state}\npause_reason: {reason or 'none'}")
+                last_hard_risk_alert_ts[reason] = now_ts
+        if last_risk_state_value == "BLOCKED" and risk_state == "OK" and (now_ts - last_recovery_alert_ts) >= cfg.telegram_risk_alert_cooldown_seconds:
+            tg.send("✅ Risk recovered: OK")
+            last_recovery_alert_ts = now_ts
+        last_risk_state_value = risk_state
+        last_pause_reason = reason
 
         append_csv("logs/equity_curve.csv", [time.time(), equity, engine.paper.cash, engine.paper.realized_pnl, unrealized_pnl, engine.paper.fees_paid], ["ts", "equity", "cash", "realized_pnl", "unrealized_pnl", "fees_paid"])
 
@@ -334,8 +344,8 @@ def run() -> None:
 
         last_trade = _read_last_valid_trade(TRADES_CSV, cfg.default_symbol)
         _write_last_100_real_trades(TRADES_CSV, LAST_100_REAL_TRADES_CSV, cfg.default_symbol)
-        blocked_30m, blocked_by_reason, last_block_reason = _risk_block_stats_30m(now_ts=time.time())
-        trade_stats_30m = _trade_stats_30m(now_ts=time.time(), expected_symbol=cfg.default_symbol)
+        blocked_1h, blocked_by_reason_1h, last_block_reason = _risk_block_stats_window(now_ts=time.time())
+        trade_stats_1h = _trade_stats_window(now_ts=time.time(), expected_symbol=cfg.default_symbol)
         position_side = "FLAT"
         if engine.paper.position_size > 0:
             position_side = "LONG"
@@ -352,8 +362,10 @@ def run() -> None:
                 "last_trade_realized_pnl": _safe_float(last_trade.get("realized_pnl_delta")),
                 "last_trade_reason": last_trade.get("reason", ""),
                 "last_trade_side": last_trade.get("side", ""),
-                "blocked_risk_decisions_30m": blocked_30m,
-                "blocked_risk_decisions_by_reason": blocked_by_reason,
+                "blocked_risk_decisions_1h": blocked_1h,
+                "blocked_risk_decisions_by_reason_1h": blocked_by_reason_1h,
+                "blocked_risk_decisions_30m": blocked_1h,
+                "blocked_risk_decisions_by_reason": blocked_by_reason_1h,
                 "last_block_reason": last_block_reason,
                 "allowed_to_trade": risk_state == "OK",
                 "total_pnl": engine.paper.realized_pnl + unrealized_pnl,
@@ -363,12 +375,18 @@ def run() -> None:
                 "unrealized_pnl_pct": ((unrealized_pnl / abs(engine.paper.avg_entry * engine.paper.position_size)) if abs(engine.paper.avg_entry * engine.paper.position_size) > 1e-9 else 0.0),
                 "exposure_pct": (position_notional / equity) if equity > 1e-9 else 0.0,
                 "avg_entry": engine.paper.avg_entry,
-                "trades_30m": trade_stats_30m["trades_count"],
-                "buy_count_30m": trade_stats_30m["buy_count"],
-                "sell_count_30m": trade_stats_30m["sell_count"],
-                "volume_usd_30m": trade_stats_30m["volume_usd"],
-                "fees_30m": trade_stats_30m["fees"],
-                "realized_pnl_delta_30m": trade_stats_30m["realized_pnl_delta"],
+                "trades_1h": trade_stats_1h["trades_count"],
+                "buy_count_1h": trade_stats_1h["buy_count"],
+                "sell_count_1h": trade_stats_1h["sell_count"],
+                "volume_usd_1h": trade_stats_1h["volume_usd"],
+                "fees_1h": trade_stats_1h["fees"],
+                "realized_pnl_delta_1h": trade_stats_1h["realized_pnl_delta"],
+                "trades_30m": trade_stats_1h["trades_count"],
+                "buy_count_30m": trade_stats_1h["buy_count"],
+                "sell_count_30m": trade_stats_1h["sell_count"],
+                "volume_usd_30m": trade_stats_1h["volume_usd"],
+                "fees_30m": trade_stats_1h["fees"],
+                "realized_pnl_delta_30m": trade_stats_1h["realized_pnl_delta"],
                 "no_fill_cycles": engine.no_fill_cycles,
             }
         )
@@ -400,6 +418,26 @@ def run() -> None:
             }
         )
         _write_status(status_payload)
+        if cfg.telegram_enable_commands:
+            for update in tg.fetch_commands():
+                text = str(update.get("message", {}).get("text", "")).strip()
+                if not text.startswith("/"):
+                    continue
+                if text.startswith("/help"):
+                    tg.send("/status - aktuális státusz\n/risk - risk állapot\n/trades - utolsó 5 trade\n/help - parancsok")
+                elif text.startswith("/status"):
+                    tg.send(tg.format_status_report({**status_payload, "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")}))
+                elif text.startswith("/risk"):
+                    tg.send(f"risk_state: {status_payload.get('risk_state')}\npause_reason: {status_payload.get('pause_reason') or 'none'}\nlast_block_reason: {status_payload.get('last_block_reason') or 'none'}\nblocked_risk_decisions_1h: {status_payload.get('blocked_risk_decisions_1h', 0)}\nallowed_to_trade: {status_payload.get('allowed_to_trade')}")
+                elif text.startswith("/trades"):
+                    lines = ["Utolsó 5 trade:"]
+                    rows = []
+                    if TRADES_CSV.exists():
+                        with TRADES_CSV.open(encoding="utf-8") as f:
+                            rows = [r for r in csv.DictReader(f)][-5:]
+                    for r in rows:
+                        lines.append(f"{r.get('timestamp','')} | {r.get('side','').upper()} {r.get('qty','')} @ {r.get('price','')} | pnlΔ {r.get('realized_pnl_delta','0')}")
+                    tg.send("\n".join(lines))
 
         now_ts = time.time()
         if cfg.telegram_send_periodic_status and (now_ts - last_telegram_report_ts) >= cfg.telegram_report_interval_seconds:

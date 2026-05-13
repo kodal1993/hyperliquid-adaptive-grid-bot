@@ -337,7 +337,7 @@ def test_telegram_report_formatter_core_fields():
         "regime": "RANGE",
         "risk_reason": "none",
     })
-    assert "Hyperliquid paper bot félórás jelentés" in msg
+    assert "Hyperliquid bot órás státusz" in msg
     assert "Symbol: BTC" in msg
     assert "Equity: $500.00" in msg
     assert "Realized PnL: $5.00" in msg
@@ -347,17 +347,17 @@ def test_telegram_report_formatter_core_fields():
 def test_telegram_report_formatter_missing_values():
     tg = TelegramHandler("", "")
     msg = tg.format_status_report({})
-    assert "Hyperliquid paper bot félórás jelentés" in msg
+    assert "Hyperliquid bot órás státusz" in msg
     assert "Equity: n/a" in msg
     assert "Reason: none" in msg
 
 
 def test_telegram_report_zero_trade_window_message():
     tg = TelegramHandler("", "")
-    msg = tg.format_status_report({"trades_30m": 0, "buy_count_30m": 0, "sell_count_30m": 0})
+    msg = tg.format_status_report({"trades_1h": 0, "buy_count_1h": 0, "sell_count_1h": 0})
     assert "BUY count: 0" in msg
     assert "SELL count: 0" in msg
-    assert "Nincs új BUY/SELL fill az elmúlt 30 percben." in msg
+    assert "Nincs új BUY/SELL fill az elmúlt 1 órában." in msg
 
 
 def test_telegram_fill_alert_buy_and_sell_formats():
@@ -699,3 +699,33 @@ def test_telegram_report_block_reason_when_not_allowed():
     tg = TelegramHandler("", "")
     msg = tg.format_status_report({"allowed_to_trade": False, "trades_30m": 1})
     assert "Risk/strategy block miatt nincs új pozícióépítés." in msg
+
+
+def test_default_telegram_report_interval_is_3600(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_REPORT_INTERVAL_SECONDS", raising=False)
+    cfg = BotConfig.from_env()
+    assert cfg.telegram_report_interval_seconds == 3600
+
+
+def test_neutral_blocked_in_trend_not_hard_risk_reason():
+    from src.main import _derive_risk_state
+    assert _derive_risk_state("paused", "neutral_blocked_in_trend") == "STRATEGY_PAUSED"
+
+
+def test_format_status_report_uses_1h_fields():
+    tg = TelegramHandler("", "")
+    msg = tg.format_status_report({"trades_1h": 2, "buy_count_1h": 1, "sell_count_1h": 1, "realized_pnl_delta_1h": 3.0})
+    assert "Utolsó 1 óra:" in msg
+    assert "Trades: 2" in msg
+
+
+def test_status_and_trades_command_minimum_format():
+    status = {"risk_state": "OK", "pause_reason": "", "last_block_reason": "", "blocked_risk_decisions_1h": 0, "allowed_to_trade": True}
+    risk_text = f"risk_state: {status.get('risk_state')}\npause_reason: {status.get('pause_reason') or 'none'}\nlast_block_reason: {status.get('last_block_reason') or 'none'}\nblocked_risk_decisions_1h: {status.get('blocked_risk_decisions_1h', 0)}\nallowed_to_trade: {status.get('allowed_to_trade')}"
+    assert "risk_state: OK" in risk_text
+    trades = [
+        {"timestamp": "2026-01-01T00:00:00Z", "side": "buy", "qty": "1", "price": "100", "realized_pnl_delta": "0"},
+        {"timestamp": "2026-01-01T00:01:00Z", "side": "sell", "qty": "1", "price": "101", "realized_pnl_delta": "1"},
+    ]
+    lines = ["Utolsó 5 trade:"] + [f"{r.get('timestamp','')} | {r.get('side','').upper()} {r.get('qty','')} @ {r.get('price','')} | pnlΔ {r.get('realized_pnl_delta','0')}" for r in trades]
+    assert len(lines) == 3
