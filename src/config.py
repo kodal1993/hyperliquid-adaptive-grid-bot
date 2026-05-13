@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 logger = logging.getLogger(__name__)
 
@@ -69,13 +69,16 @@ class BotConfig:
     @classmethod
     def from_env(cls) -> "BotConfig":
         default_env_path = Path.cwd() / ".env"
-        env_profile = os.getenv("ENV_PROFILE", "paper")
+        default_env_profile = None
+        if default_env_path.exists():
+            default_env_profile = dotenv_values(default_env_path).get("ENV_PROFILE")
+
+        env_profile = os.getenv("ENV_PROFILE") or default_env_profile or "paper"
         profile_path = Path("config") / f"{env_profile}.env"
         profile_loaded = False
         if profile_path.exists():
             profile_loaded = load_dotenv(dotenv_path=profile_path, override=False)
 
-        default_env_path = Path.cwd() / ".env"
         default_loaded = load_dotenv(dotenv_path=default_env_path, override=True)
 
         logger.info(

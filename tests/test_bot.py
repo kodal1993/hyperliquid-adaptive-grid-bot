@@ -35,6 +35,36 @@ def test_config_profile_override(tmp_path, monkeypatch):
     assert cfg.grid_levels == 2
 
 
+
+
+def test_env_profile_loaded_from_dotenv_before_profile_resolution(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ENV_PROFILE", raising=False)
+    monkeypatch.delenv("GRID_LEVELS", raising=False)
+    (tmp_path / ".env").write_text("ENV_PROFILE=conservative\n")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "conservative.env").write_text("GRID_LEVELS=4\n")
+
+    cfg = BotConfig.from_env()
+
+    assert cfg.env_profile == "conservative"
+    assert cfg.grid_levels == 4
+
+
+def test_os_env_profile_precedence_over_dotenv(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ENV_PROFILE", "paper")
+    monkeypatch.delenv("GRID_LEVELS", raising=False)
+    (tmp_path / ".env").write_text("ENV_PROFILE=conservative\n")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "paper.env").write_text("GRID_LEVELS=11\n")
+    (tmp_path / "config" / "conservative.env").write_text("GRID_LEVELS=4\n")
+
+    cfg = BotConfig.from_env()
+
+    assert cfg.env_profile == "paper"
+    assert cfg.grid_levels == 11
+
 def test_grid_generation():
     gm = GridManager()
     plan = gm.build_grid(100, 3, 0.01, 0.0, MarketRegime.RANGE, 1, 0.0, 0.0, GridMode.NEUTRAL)
