@@ -13,6 +13,7 @@ class TelegramHandler:
         self.token = token
         self.chat_id = chat_id
         self.last_error: dict = {}
+        self.last_update_id: int | None = None
 
     def send(self, text: str) -> bool:
         if not self.token or not self.chat_id:
@@ -41,11 +42,11 @@ class TelegramHandler:
         ts = report.get("updated") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         regime = report.get("regime", "unknown")
         mode = report.get("mode", report.get("grid_mode", "unknown"))
-        blocked_30m = report.get("blocked_risk_decisions_30m", 0)
+        blocked_1h = report.get("blocked_risk_decisions_1h", report.get("blocked_risk_decisions_30m", 0))
         last_real_trade_age_hours = report.get("last_real_trade_age_hours")
         no_fill_cycles = report.get("no_fill_cycles", 0)
         top_block_reason = report.get("last_block_reason") or "none"
-        trades_30m = report.get("trades_30m", 0)
+        trades_1h = report.get("trades_1h", report.get("trades_30m", 0))
         allowed_to_trade = bool(report.get("allowed_to_trade", False))
         pause_reason = report.get("pause_reason") or "none"
         strategy_status = report.get("strategy_status", "unknown")
@@ -58,13 +59,13 @@ class TelegramHandler:
             human = "Trend piacban a neutral grid tiltva van, ezért nincs új order."
         elif not allowed_to_trade:
             human = "Risk/strategy block miatt nincs új pozícióépítés."
-        elif trades_30m == 0 and allowed_to_trade:
+        elif trades_1h == 0 and allowed_to_trade:
             human = "Nincs fill, mert az ár nem érte el a következő grid szintet."
         elif report.get("position_side") in {"LONG", "SHORT"}:
             human = f"A bot aktív és pozícióban van, jelenleg {str(report.get('position_side')).lower()} exposure-t tart."
-        no_recent_trade_line = "Nincs új BUY/SELL fill az elmúlt 30 percben." if trades_30m == 0 else None
+        no_recent_trade_line = "Nincs új BUY/SELL fill az elmúlt 1 órában." if trades_1h == 0 else None
         lines = [
-            "📊 Hyperliquid paper bot félórás jelentés",
+            "📊 Hyperliquid bot órás státusz",
             "",
             "Állapot:",
             f"Bot aktív, {regime} / {mode} módban vár.",
@@ -101,13 +102,13 @@ class TelegramHandler:
             f"Active orders: BUY {report.get('active_buy_orders', 0)} / SELL {report.get('active_sell_orders', 0)}",
             f"Grid spacing: {pct(report.get('grid_spacing_pct'))}, levels: {report.get('grid_levels', 'n/a')}",
             "",
-            "Utolsó 30 perc:",
-            f"BUY count: {report.get('buy_count_30m', 0)}",
-            f"SELL count: {report.get('sell_count_30m', 0)}",
-            no_recent_trade_line if no_recent_trade_line else f"Trades: {trades_30m}",
-            f"Volume: {money(report.get('volume_usd_30m'))}, Fees: {money(report.get('fees_30m'))}",
-            f"Realized PnL delta: {money(report.get('realized_pnl_delta_30m'))}",
-            f"Blocked risk decisions: {blocked_30m}, reasons: {report.get('blocked_risk_decisions_by_reason', {})}",
+            "Utolsó 1 óra:",
+            f"BUY count: {report.get('buy_count_1h', report.get('buy_count_30m', 0))}",
+            f"SELL count: {report.get('sell_count_1h', report.get('sell_count_30m', 0))}",
+            no_recent_trade_line if no_recent_trade_line else f"Trades: {trades_1h}",
+            f"Volume: {money(report.get('volume_usd_1h', report.get('volume_usd_30m')))}, Fees: {money(report.get('fees_1h', report.get('fees_30m')))}",
+            f"Realized PnL delta: {money(report.get('realized_pnl_delta_1h', report.get('realized_pnl_delta_30m')))}",
+            f"Blocked risk decisions: {blocked_1h}, reasons: {report.get('blocked_risk_decisions_by_reason_1h', report.get('blocked_risk_decisions_by_reason', {}))}",
             f"Top block reason: {top_block_reason}",
             f"No fill cycles: {no_fill_cycles}",
             "",
@@ -174,5 +175,23 @@ class TelegramHandler:
     def send_status_report(self, report: dict) -> bool:
         return self.send(self.format_status_report(report))
 
-    def command_handlers(self) -> list[str]:
-        return ["/status", "/pause", "/resume", "/risk", "/positions", "/orders"]
+    def fetch_commands(self) -> list[dict]:
+        if not self.token:
+            return []
+        offset = self.last_update_id + 1 if self.last_update_id is not None else None
+        params = {"timeout": 0}
+        if offset is not None:
+            params["offset"] = offset
+        try:
+            resp = requests.get(f"https://api.telegram.org/bot{self.token}/getUpdates", params=params, timeout=10)
+            if not resp.ok:
+                return []
+            payload = resp.json()
+            updates = payload.get("result", [])
+            for upd in updates:
+                uid = upd.get("update_id")
+                if isinstance(uid, int):
+                    self.last_update_id = uid
+            return updates
+        except Exception:
+            return []
