@@ -111,6 +111,10 @@ sudo systemctl restart hyperliquid-grid-bot.service
 journalctl -u hyperliquid-grid-bot.service -f
 ```
 
+Status file:
+- Official runtime status file: `data/status.json`.
+- Legacy `state/status.json` is not an active data source; keep it only as archive/debug artifact if present.
+
 Dashboard:
 ```bash
 python -m src.dashboard_server --host 0.0.0.0 --port 8000

@@ -643,7 +643,7 @@ def test_env_profile_does_not_override_dotenv_telegram_secrets(tmp_path, monkeyp
     assert cfg.telegram_chat_id == "999"
 
 
-def test_dashboard_read_status_prefers_data_then_state(tmp_path, monkeypatch):
+def test_dashboard_read_status_uses_official_data_path_only(tmp_path, monkeypatch):
     from src import dashboard_server
 
     monkeypatch.chdir(tmp_path)
@@ -654,6 +654,10 @@ def test_dashboard_read_status_prefers_data_then_state(tmp_path, monkeypatch):
 
     status = dashboard_server.read_status()
     assert status["status"] == "data"
+
+    (tmp_path / "data" / "status.json").unlink()
+    status = dashboard_server.read_status()
+    assert status == {}
 
 
 def test_grid_recenter_anchor_updates_only_when_regrid():
