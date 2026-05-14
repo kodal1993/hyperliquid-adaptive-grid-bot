@@ -53,10 +53,13 @@ class TelegramHandler:
         risk_state = report.get("risk_state", "unknown")
         next_order_side = (report.get("next_order_side") or "n/a").upper()
         next_order_price = money(report.get("next_order_price"))
+        allowed_to_reduce = bool(report.get("allowed_to_reduce", False))
+        next_exit_side = (report.get("next_exit_side") or "n/a").upper()
+        next_exit_price = money(report.get("next_exit_price"))
 
         human = "A bot aktív, de várakozik, mert az ár nem érte el a grid szinteket."
-        if pause_reason == "neutral_blocked_in_trend":
-            human = "Trend piacban a neutral grid tiltva van, ezért nincs új order."
+        if pause_reason in {"neutral_blocked_in_trend", "neutral_entries_blocked_in_trend"}:
+            human = "Trend piacban az új neutral belépők tiltva vannak, de meglévő pozíció zárása engedélyezett."
         elif not allowed_to_trade:
             human = "Risk/strategy block miatt nincs új pozícióépítés."
         elif trades_1h == 0 and allowed_to_trade:
@@ -74,7 +77,14 @@ class TelegramHandler:
             f"pause_reason: {pause_reason}",
             f"last_block_reason: {top_block_reason}",
             f"allowed_to_trade: {allowed_to_trade}",
+            f"allowed_to_reduce: {allowed_to_reduce}",
             f"next_order: {next_order_side} @ {next_order_price}",
+            f"next_exit_order: {next_exit_side} @ {next_exit_price}",
+            f"Új belépés engedélyezve: {'igen' if allowed_to_trade else 'nem'}",
+            f"Pozíciózárás engedélyezve: {'igen' if allowed_to_reduce else 'nem'}",
+            f"Következő exit order: {next_exit_side} @ {next_exit_price}",
+            f"Miért nincs új grid order: {pause_reason if pause_reason != 'none' else 'n/a'}",
+            f"Mit vár a bot a folytatáshoz: {report.get('resume_condition') or 'trend/momentum változás vagy kockázati blokk feloldása'}",
             f"Nearest BUY distance: {pct(report.get('distance_to_buy_pct'))}",
             f"Nearest SELL distance: {pct(report.get('distance_to_sell_pct'))}",
             "",

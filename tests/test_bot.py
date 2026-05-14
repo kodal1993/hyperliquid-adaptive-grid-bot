@@ -292,6 +292,53 @@ def test_telegram_report_includes_last_trade_age_warning():
     assert "WARNING" in msg
 
 
+def test_trend_up_neutral_long_blocks_new_buy_but_allows_sell_exit(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.allow_long_biased = False
+    cfg.allow_short_biased = False
+    eng = make_test_engine(tmp_path, "trend_up_long.json", paper_mode=True, enable_live_trading=False)
+    eng.paper.position_size = 1.0
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 + i for i in range(80)], "high": [101 + i for i in range(80)], "low": [99 + i for i in range(80)]})
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=100.0)
+    assert status["status"] == "managing_position"
+    assert status["reason"] == "neutral_entries_blocked_in_trend"
+    assert status["allow_buys"] is False
+    assert status["allow_sells"] is True
+    assert status["allowed_to_trade"] is False
+    assert status["allowed_to_reduce"] is True
+
+
+def test_trend_down_neutral_short_blocks_new_sell_but_allows_buy_exit(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.allow_long_biased = False
+    cfg.allow_short_biased = False
+    eng = make_test_engine(tmp_path, "trend_down_short.json", paper_mode=True, enable_live_trading=False)
+    eng.paper.position_size = -1.0
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [200 - i for i in range(80)], "high": [201 - i for i in range(80)], "low": [199 - i for i in range(80)]})
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=100.0)
+    assert status["status"] == "managing_position"
+    assert status["reason"] == "neutral_entries_blocked_in_trend"
+    assert status["allow_sells"] is False
+    assert status["allow_buys"] is True
+    assert status["allowed_to_trade"] is False
+    assert status["allowed_to_reduce"] is True
+
+
+def test_trend_with_flat_position_blocks_neutral_grid_generation(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.allow_long_biased = False
+    cfg.allow_short_biased = False
+    eng = make_test_engine(tmp_path, "trend_flat.json", paper_mode=True, enable_live_trading=False)
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 + i for i in range(80)], "high": [101 + i for i in range(80)], "low": [99 + i for i in range(80)]})
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+    assert status["status"] == "paused"
+    assert status["reason"] == "neutral_blocked_in_trend"
+    assert len(eng.open_orders) == 0
+
+
 def test_write_status_creates_data_status_json(tmp_path, monkeypatch):
     from src import main
     monkeypatch.chdir(tmp_path)

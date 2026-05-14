@@ -28,18 +28,17 @@ class StrategyOrchestrator:
         pos_size = self.execution_engine.paper.position_size
 
         mode = GridMode.NEUTRAL
+        neutral_entries_blocked = False
         if regime == MarketRegime.TREND_UP:
             if self.config.allow_long_biased:
                 mode = GridMode.LONG_BIASED
             else:
-                canceled = self.execution_engine.cancel_all_orders(symbol)
-                return {"status": "paused", "regime": regime.value, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled}
+                neutral_entries_blocked = True
         elif regime == MarketRegime.TREND_DOWN:
             if self.config.allow_short_biased:
                 mode = GridMode.SHORT_BIASED
             else:
-                canceled = self.execution_engine.cancel_all_orders(symbol)
-                return {"status": "paused", "regime": regime.value, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled}
+                neutral_entries_blocked = True
 
         vol = candles["close"].pct_change().std()
         order_size = self._calculate_order_size(price)
@@ -70,6 +69,17 @@ class StrategyOrchestrator:
                 allow_sells = True
             elif pos_size < 0:
                 allow_buys = True
+
+        if neutral_entries_blocked:
+            if pos_size > 0:
+                allow_buys = False
+                allow_sells = True
+            elif pos_size < 0:
+                allow_sells = False
+                allow_buys = True
+            else:
+                allow_buys = False
+                allow_sells = False
 
         if regime == MarketRegime.TREND_UP and mode == GridMode.LONG_BIASED and not force_reduce_only:
             allow_sells = False
@@ -118,7 +128,12 @@ class StrategyOrchestrator:
             logger.info("grid_recenter_triggered old_center=%s new_center=%s last_trade_age=%.3f no_fill_cycles=%s", self.grid_manager.last_mid, price, last_trade_age_hours, no_fill_cycles)
         plan: GridPlan = self.grid_manager.build_grid(price, self.config.grid_levels, self.config.grid_spacing_pct, float(vol), regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=allow_buys, allow_sells=allow_sells, force_recenter=force_recenter)
         result = self.execution_engine.cancel_replace_grid(symbol, plan)
-        return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells}
+        if neutral_entries_blocked and abs(pos_size) > 1e-12:
+            return {"status": "managing_position", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": False, "allowed_to_reduce": True, "reason": "neutral_entries_blocked_in_trend", "position_management_action": "reduce_only_grid"}
+        if neutral_entries_blocked:
+            canceled = self.execution_engine.cancel_all_orders(symbol)
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none"}
+        return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": abs(pos_size) > 1e-12}
 
     def _calculate_order_size(self, price: float) -> float:
         raw_size = self.config.max_notional_per_trade_usd / max(price, 1e-9)
