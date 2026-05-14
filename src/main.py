@@ -367,7 +367,9 @@ def run() -> None:
                 "blocked_risk_decisions_30m": blocked_1h,
                 "blocked_risk_decisions_by_reason": blocked_by_reason_1h,
                 "last_block_reason": last_block_reason,
-                "allowed_to_trade": risk_state == "OK",
+                "allowed_to_trade": bool(status.get("allowed_to_trade", risk_state == "OK")),
+                "allowed_to_reduce": bool(status.get("allowed_to_reduce", abs(engine.paper.position_size) > 1e-12)),
+                "position_management_action": status.get("position_management_action", "none"),
                 "total_pnl": engine.paper.realized_pnl + unrealized_pnl,
                 "total_pnl_pct": ((engine.paper.realized_pnl + unrealized_pnl) / cfg.paper_start_balance_usd) if cfg.paper_start_balance_usd > 0 else None,
                 "daily_pnl": equity - daily_start_equity,
@@ -403,7 +405,16 @@ def run() -> None:
             next_order = {"side": "buy", "price": float(buys[0]["price"])}
         if sells and (next_order is None or abs(float(sells[0]["price"]) - mark_price) < abs(next_order["price"] - mark_price)):
             next_order = {"side": "sell", "price": float(sells[0]["price"])}
-        status_payload.update({"last_real_trade_ts": last_trade_ts, "last_real_trade_age_hours": last_trade_age_hours, "next_order_side": next_order["side"] if next_order else None, "next_order_price": next_order["price"] if next_order else None})
+        next_exit_side = None
+        next_exit_price = None
+        if engine.paper.position_size > 0 and sells:
+            next_exit_side = "sell"
+            next_exit_price = float(sells[0]["price"])
+        elif engine.paper.position_size < 0 and buys:
+            next_exit_side = "buy"
+            next_exit_price = float(buys[0]["price"])
+
+        status_payload.update({"last_real_trade_ts": last_trade_ts, "last_real_trade_age_hours": last_trade_age_hours, "next_order_side": next_order["side"] if next_order else None, "next_order_price": next_order["price"] if next_order else None, "next_exit_side": next_exit_side, "next_exit_price": next_exit_price, "take_profit_price": next_exit_price, "stop_price": None, "trailing_stop_price": None})
         nearest_buy = float(buys[0]["price"]) if buys else None
         nearest_sell = float(sells[0]["price"]) if sells else None
         status_payload.update(
