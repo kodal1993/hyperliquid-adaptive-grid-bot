@@ -26,12 +26,15 @@ class StrategyOrchestrator:
         regime = self.detector.detect(candles, trend_lookback_candles=self.config.trend_lookback_candles, trend_move_threshold_pct=self.config.trend_move_threshold_pct, ema_slope_threshold_pct=self.config.ema_slope_threshold_pct)
         price = float(candles["close"].iloc[-1])
         pos_size = self.execution_engine.paper.position_size
-        dust_threshold_usd = 1.0
-        is_dust_position = abs(position_notional) < dust_threshold_usd
-        effective_position_side = "LONG" if pos_size > 0 else ("SHORT" if pos_size < 0 else "FLAT")
-        if is_dust_position:
-            effective_position_side = "FLAT"
+        raw_position_notional = abs(position_notional)
+        dust_threshold_usd = max(float(self.config.dust_position_notional_usd), 0.0)
+        is_dust_position = 0 < raw_position_notional < dust_threshold_usd
+        effective_position_notional = 0.0 if is_dust_position else raw_position_notional
+        effective_position_size = 0.0 if is_dust_position else pos_size
+        effective_position_side = "LONG" if effective_position_size > 0 else ("SHORT" if effective_position_size < 0 else "FLAT")
         dust_context = {
+            "position_notional_raw": raw_position_notional,
+            "effective_position_notional": effective_position_notional,
             "effective_position_side": effective_position_side,
             "is_dust_position": is_dust_position,
             "dust_threshold_usd": dust_threshold_usd,
@@ -54,8 +57,8 @@ class StrategyOrchestrator:
         order_size = self._calculate_order_size(price)
         order_notional = order_size * price
 
-        long_exposure = max(pos_size, 0.0) * price
-        short_exposure = max(-pos_size, 0.0) * price
+        long_exposure = max(effective_position_size, 0.0) * price
+        short_exposure = max(-effective_position_size, 0.0) * price
         threshold = self.config.max_position_notional_usd * self.config.max_directional_exposure_pct
         allow_buys = long_exposure < threshold
         allow_sells = short_exposure < threshold
@@ -67,12 +70,12 @@ class StrategyOrchestrator:
 
         soft_cap = self.config.max_position_notional_usd * 0.6
         rebalance_cap = self.config.max_position_notional_usd * 0.8
-        if position_notional > soft_cap:
+        if effective_position_notional > soft_cap:
             if effective_position_side == "LONG":
                 allow_buys = False
             elif effective_position_side == "SHORT":
                 allow_sells = False
-        force_reduce_only = position_notional > rebalance_cap
+        force_reduce_only = effective_position_notional > rebalance_cap
 
         if force_reduce_only:
             if effective_position_side == "LONG":
@@ -96,20 +99,27 @@ class StrategyOrchestrator:
         if regime == MarketRegime.TREND_DOWN and mode == GridMode.SHORT_BIASED and not force_reduce_only:
             allow_buys = False
 
+        # Critical dust fix: if the remaining position is only dust, treat the bot as flat.
+        # In RANGE/neutral this must restore a two-sided grid instead of leaving only a
+        # reduce-only-looking SELL or BUY grid around a negligible residual position.
+        if is_dust_position and regime == MarketRegime.RANGE and mode == GridMode.NEUTRAL and not force_reduce_only:
+            allow_buys = True
+            allow_sells = True
+
         attempted_side = "both" if (allow_buys and allow_sells) else ("buy" if allow_buys else ("sell" if allow_sells else "none"))
         would_increase_exposure = (effective_position_side == "LONG" and attempted_side in {"buy", "both"}) or (effective_position_side == "SHORT" and attempted_side in {"sell", "both"})
 
         liquidation_distance_pct = 1.0 if self.config.paper_mode else 0.5
-        one_direction_exposure_pct = 0.0 if equity <= 0 else position_notional / equity
+        one_direction_exposure_pct = 0.0 if equity <= 0 else effective_position_notional / equity
         risk_state = self.risk.evaluate(
             equity=equity, daily_pnl_pct=daily_pnl_pct, emergency_stop=self.config.emergency_stop, stop_file=self.config.emergency_stop_file,
-            position_notional=position_notional, max_position_notional=self.config.max_position_notional_usd,
+            position_notional=effective_position_notional, max_position_notional=self.config.max_position_notional_usd,
             one_direction_exposure_pct=one_direction_exposure_pct, max_one_direction_exposure_pct=self.config.max_one_direction_exposure_pct,
             liquidation_distance_pct=liquidation_distance_pct, min_liquidation_distance_pct=self.config.liquidation_distance_min_pct,
             attempted_side=attempted_side, would_increase_exposure=would_increase_exposure,
         )
-        logger.info("risk_check risk_state=%s pause_reason=%s current_position_notional=%.2f max_position_notional_usd=%.2f attempted_side=%s would_increase_exposure=%s exposure_reducing_override=%s decision=%s", risk_state.reason or "ok", "" if risk_state.can_trade else risk_state.reason, position_notional, self.config.max_position_notional_usd, attempted_side, would_increase_exposure, risk_state.exposure_reducing_override, risk_state.decision)
-        if position_notional > self.config.max_position_notional_usd:
+        logger.info("risk_check risk_state=%s pause_reason=%s current_position_notional=%.2f effective_position_notional=%.2f is_dust_position=%s max_position_notional_usd=%.2f attempted_side=%s would_increase_exposure=%s exposure_reducing_override=%s decision=%s", risk_state.reason or "ok", "" if risk_state.can_trade else risk_state.reason, raw_position_notional, effective_position_notional, is_dust_position, self.config.max_position_notional_usd, attempted_side, would_increase_exposure, risk_state.exposure_reducing_override, risk_state.decision)
+        if effective_position_notional > self.config.max_position_notional_usd:
             canceled = self.execution_engine.cancel_all_orders(symbol)
             flattened = False
             if self.config.paper_mode and self.config.paper_auto_flatten_on_max_position:
@@ -138,7 +148,7 @@ class StrategyOrchestrator:
             logger.info("grid_recenter_triggered old_center=%s new_center=%s last_trade_age=%.3f no_fill_cycles=%s", self.grid_manager.last_mid, price, last_trade_age_hours, no_fill_cycles)
         plan: GridPlan = self.grid_manager.build_grid(price, self.config.grid_levels, self.config.grid_spacing_pct, float(vol), regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=allow_buys, allow_sells=allow_sells, force_recenter=force_recenter)
         result = self.execution_engine.cancel_replace_grid(symbol, plan)
-        if neutral_entries_blocked and abs(pos_size) > 1e-12:
+        if neutral_entries_blocked and abs(effective_position_size) > 1e-12:
             return {"status": "managing_position", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": False, "allowed_to_reduce": True, "reason": "neutral_entries_blocked_in_trend", "position_management_action": "reduce_only_grid", **dust_context}
         if neutral_entries_blocked:
             canceled = self.execution_engine.cancel_all_orders(symbol)
