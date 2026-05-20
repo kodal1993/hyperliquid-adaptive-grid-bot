@@ -66,6 +66,7 @@ class BotConfig:
     allow_position_flip: bool
     stale_position_max_hours: float
     min_residual_notional_usd: float
+    dust_position_notional_usd: float
     no_fill_cycles_before_recenter: int
     grid_stale_max_hours: float
 
@@ -148,6 +149,7 @@ class BotConfig:
             allow_position_flip=os.getenv("ENABLE_POSITION_FLIP", os.getenv("ALLOW_POSITION_FLIP", "false")).lower() == "true",
             stale_position_max_hours=float(os.getenv("STALE_POSITION_MAX_HOURS", "12")),
             min_residual_notional_usd=float(os.getenv("MIN_RESIDUAL_NOTIONAL_USD", "10")),
+            dust_position_notional_usd=float(os.getenv("DUST_POSITION_NOTIONAL_USD", "1")),
             no_fill_cycles_before_recenter=int(os.getenv("NO_FILL_CYCLES_BEFORE_RECENTER", "360")),
             grid_stale_max_hours=float(os.getenv("GRID_STALE_MAX_HOURS", "2")),
         )
