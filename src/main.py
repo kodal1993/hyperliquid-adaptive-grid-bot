@@ -351,9 +351,15 @@ def run() -> None:
             position_side = "LONG"
         elif engine.paper.position_size < 0:
             position_side = "SHORT"
+        effective_position_side = status.get("effective_position_side", position_side)
+        is_dust_position = bool(status.get("is_dust_position", False))
+        dust_threshold_usd = float(status.get("dust_threshold_usd", 1.0))
         status_payload.update(
             {
                 "position_side": position_side,
+                "effective_position_side": effective_position_side,
+                "is_dust_position": is_dust_position,
+                "dust_threshold_usd": dust_threshold_usd,
                 "mark_price": latest_close,
                 "last_trade_price": _safe_float(last_trade.get("price")),
                 "last_trade_qty": _safe_float(last_trade.get("qty")),
@@ -425,6 +431,7 @@ def run() -> None:
                 "distance_to_sell_pct": ((nearest_sell - mark_price) / mark_price) if nearest_sell else None,
                 "active_buy_orders": len(buys),
                 "active_sell_orders": len(sells),
+                "one_sided_grid_due_to_dust": bool(is_dust_position and ((len(buys) == 0) ^ (len(sells) == 0)) and (len(buys) + len(sells) > 0)),
                 "open_orders": len(engine.open_orders),
             }
         )

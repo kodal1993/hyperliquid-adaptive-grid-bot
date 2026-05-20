@@ -56,10 +56,11 @@ class TelegramHandler:
         allowed_to_reduce = bool(report.get("allowed_to_reduce", False))
         next_exit_side = (report.get("next_exit_side") or "n/a").upper()
         next_exit_price = money(report.get("next_exit_price"))
+        dust_one_sided_warning = bool(report.get("one_sided_grid_due_to_dust", False))
 
         human = "A bot aktív, de várakozik, mert az ár nem érte el a grid szinteket."
         if pause_reason in {"neutral_blocked_in_trend", "neutral_entries_blocked_in_trend"}:
-            human = "Trend piacban az új neutral belépők tiltva vannak, de meglévő pozíció zárása engedélyezett."
+            human = "Trend piacban a neutral grid tiltva van, ezért nincs új order."
         elif not allowed_to_trade:
             human = "Risk/strategy block miatt nincs új pozícióépítés."
         elif trades_1h == 0 and allowed_to_trade:
@@ -110,6 +111,7 @@ class TelegramHandler:
             f"Nearest BUY: {money(report.get('nearest_buy_price'))} | Distance: {pct(report.get('distance_to_buy_pct'))}",
             f"Nearest SELL: {money(report.get('nearest_sell_price'))} | Distance: {pct(report.get('distance_to_sell_pct'))}",
             f"Active orders: BUY {report.get('active_buy_orders', 0)} / SELL {report.get('active_sell_orders', 0)}",
+            ("⚠️ One-sided grid aktív dust pozíció miatt." if dust_one_sided_warning else None),
             f"Grid spacing: {pct(report.get('grid_spacing_pct'))}, levels: {report.get('grid_levels', 'n/a')}",
             "",
             "Utolsó 1 óra:",
