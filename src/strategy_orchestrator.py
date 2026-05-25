@@ -21,6 +21,7 @@ class StrategyOrchestrator:
         self.detector = RegimeDetector()
         self.risk = RiskManager(config.max_drawdown_pct, config.daily_loss_limit_pct)
         self.grid_manager = GridManager()
+        self.last_recenter_ts: datetime | None = None
 
     def on_tick(self, candles: pd.DataFrame, equity: float, daily_pnl_pct: float, symbol: str, position_notional: float = 0.0) -> dict:
         regime = self.detector.detect(candles, trend_lookback_candles=self.config.trend_lookback_candles, trend_move_threshold_pct=self.config.trend_move_threshold_pct, ema_slope_threshold_pct=self.config.ema_slope_threshold_pct)
@@ -143,17 +144,41 @@ class StrategyOrchestrator:
         last_trade_age_hours = 0.0
         if self.execution_engine.last_real_trade_ts is not None:
             last_trade_age_hours = (datetime.now(timezone.utc) - self.execution_engine.last_real_trade_ts).total_seconds() / 3600
-        force_recenter = no_fill_cycles >= self.config.no_fill_cycles_before_recenter or last_trade_age_hours >= self.config.grid_stale_max_hours
+
+        now = datetime.now(timezone.utc)
+        in_position = effective_position_side in {"LONG", "SHORT"}
+        recenter_cooldown_seconds = self.config.position_recenter_cooldown_seconds if in_position else self.config.recenter_cooldown_seconds
+        seconds_since_recenter = None
+        if self.last_recenter_ts is not None:
+            seconds_since_recenter = (now - self.last_recenter_ts).total_seconds()
+        recenter_blocked_by_cooldown = seconds_since_recenter is not None and seconds_since_recenter < recenter_cooldown_seconds
+        stale_recenter_requested = last_trade_age_hours >= self.config.grid_stale_max_hours
+        no_fill_recenter_requested = no_fill_cycles >= self.config.no_fill_cycles_before_recenter
+        recenter_requested = no_fill_recenter_requested or stale_recenter_requested
+        force_recenter = recenter_requested and not recenter_blocked_by_cooldown
         if force_recenter:
-            logger.info("grid_recenter_triggered old_center=%s new_center=%s last_trade_age=%.3f no_fill_cycles=%s", self.grid_manager.last_mid, price, last_trade_age_hours, no_fill_cycles)
+            self.last_recenter_ts = now
+            logger.info("grid_recenter_triggered old_center=%s new_center=%s last_trade_age=%.3f no_fill_cycles=%s cooldown_seconds=%s in_position=%s", self.grid_manager.last_mid, price, last_trade_age_hours, no_fill_cycles, recenter_cooldown_seconds, in_position)
+        elif recenter_requested and recenter_blocked_by_cooldown:
+            logger.info("grid_recenter_skipped_cooldown last_trade_age=%.3f no_fill_cycles=%s seconds_since_recenter=%.1f cooldown_seconds=%s in_position=%s", last_trade_age_hours, no_fill_cycles, seconds_since_recenter or 0.0, recenter_cooldown_seconds, in_position)
+        recenter_context = {
+            "last_recenter_ts": self.last_recenter_ts.isoformat() if self.last_recenter_ts else None,
+            "seconds_since_recenter": seconds_since_recenter,
+            "recenter_cooldown_seconds": recenter_cooldown_seconds,
+            "recenter_requested": recenter_requested,
+            "recenter_blocked_by_cooldown": recenter_blocked_by_cooldown,
+            "force_recenter": force_recenter,
+            "in_position_for_recenter": in_position,
+        }
+
         plan: GridPlan = self.grid_manager.build_grid(price, self.config.grid_levels, self.config.grid_spacing_pct, float(vol), regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=allow_buys, allow_sells=allow_sells, force_recenter=force_recenter)
         result = self.execution_engine.cancel_replace_grid(symbol, plan)
         if neutral_entries_blocked and abs(effective_position_size) > 1e-12:
-            return {"status": "managing_position", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": False, "allowed_to_reduce": True, "reason": "neutral_entries_blocked_in_trend", "position_management_action": "reduce_only_grid", **dust_context}
+            return {"status": "managing_position", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": False, "allowed_to_reduce": True, "reason": "neutral_entries_blocked_in_trend", "position_management_action": "reduce_only_grid", **dust_context, **recenter_context}
         if neutral_entries_blocked:
             canceled = self.execution_engine.cancel_all_orders(symbol)
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", **dust_context}
-        return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, **dust_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", **dust_context, **recenter_context}
+        return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, **dust_context, **recenter_context}
 
     def _calculate_order_size(self, price: float) -> float:
         raw_size = self.config.max_notional_per_trade_usd / max(price, 1e-9)
