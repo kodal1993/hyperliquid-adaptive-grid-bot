@@ -1,0 +1,17 @@
+[Unit]
+Description=Hyperliquid Adaptive Grid Bot - PAPER
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/hyperliquid-adaptive-grid-bot-paper
+Environment=ENV_PROFILE=paper
+Environment=HYPERLIQUID_BOT_LOCK_FILE=/tmp/hyperliquid_paper.lock
+ExecStart=/root/hyperliquid-adaptive-grid-bot-paper/.venv/bin/python -m src.main
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
