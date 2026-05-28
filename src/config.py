@@ -50,6 +50,7 @@ class BotConfig:
     state_file: str
     paper_mode: bool
     enable_live_trading: bool
+    live_execution_enabled: bool
     allow_long_biased: bool
     allow_short_biased: bool
     paper_auto_flatten_on_max_position: bool
@@ -135,6 +136,7 @@ class BotConfig:
             state_file=os.getenv("STATE_FILE", "state/bot_state.json"),
             paper_mode=os.getenv("PAPER_MODE", "true").lower() == "true",
             enable_live_trading=os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true",
+            live_execution_enabled=os.getenv("LIVE_EXECUTION_ENABLED", "false").lower() == "true",
             allow_long_biased=os.getenv("ALLOW_LONG_BIASED", "false").lower() == "true",
             allow_short_biased=os.getenv("ALLOW_SHORT_BIASED", "false").lower() == "true",
             paper_auto_flatten_on_max_position=os.getenv("PAPER_AUTO_FLATTEN_ON_MAX_POSITION", "false").lower() == "true",

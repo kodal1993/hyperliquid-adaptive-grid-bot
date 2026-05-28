@@ -50,7 +50,10 @@ def _write_fatal_error(exc: BaseException) -> None:
     ts = datetime.now(timezone.utc).isoformat()
     FATAL_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     FATAL_LOG_FILE.write_text(f"[{ts}] {traceback.format_exc()}", encoding="utf-8")
-    _write_status({"status": "crashed", "timestamp": ts, "last_error": f"{type(exc).__name__}: {exc}"})
+    error_detail = f"{type(exc).__name__}: {exc}"
+    error_text = str(exc)
+    error_code = error_text.split(":", 1)[0] if error_text.startswith("live_execution_") else error_detail
+    _write_status({"status": "crashed", "timestamp": ts, "last_error": error_code, "last_error_detail": error_detail})
 
 
 def _acquire_single_instance_lock() -> object | None:
@@ -220,6 +223,22 @@ def _resolve_last_real_trade_ts(expected_symbol: str, fallback: str = "") -> str
     return fallback
 
 
+def _send_startup_failure_telegram(cfg: BotConfig, tg: TelegramHandler, error_code: str, exc: BaseException) -> str:
+    message = "\n".join([
+        "🛑 HARD STARTUP FAILURE",
+        f"error: {error_code}",
+        f"detail: {exc}",
+        f"Mode: {'PAPER' if cfg.paper_mode else 'LIVE'}",
+        f"Network: {cfg.hl_network}",
+        f"Profile: {cfg.env_profile}",
+    ])
+    if tg.send(message):
+        logger.info("telegram_startup_failure_send_ok error_code=%s", error_code)
+        return "startup_failure_ok"
+    logger.warning("telegram_startup_failure_send_failed error_code=%s token_present=%s chat_id_present=%s", error_code, bool(cfg.telegram_bot_token), bool(cfg.telegram_chat_id))
+    return "startup_failure_failed"
+
+
 def _send_startup_telegram(cfg: BotConfig, tg: TelegramHandler) -> str:
     telegram_status = "disabled"
     if not cfg.telegram_send_startup:
@@ -236,15 +255,30 @@ def _send_startup_telegram(cfg: BotConfig, tg: TelegramHandler) -> str:
 def run() -> None:
     cfg = BotConfig.from_env()
     setup_logging(cfg.log_level)
-    logger.info("Startup profile=%s paper_mode=%s fill_model=%s", cfg.env_profile, cfg.paper_mode, cfg.fill_model)
-    logger.info("risk_settings max_position_notional_usd=%s soft_exposure_cap_pct=%s hard_exposure_cap_pct=%s absolute_exposure_cap_pct=%s paper_mode=%s enable_live_trading=%s", cfg.max_position_notional_usd, cfg.soft_exposure_cap_pct, cfg.hard_exposure_cap_pct, cfg.absolute_exposure_cap_pct, cfg.paper_mode, cfg.enable_live_trading)
-    run_startup_validation(cfg)
+    logger.info("Startup profile=%s paper_mode=%s fill_model=%s live_execution_enabled=%s", cfg.env_profile, cfg.paper_mode, cfg.fill_model, cfg.live_execution_enabled)
+    logger.info("risk_settings max_position_notional_usd=%s soft_exposure_cap_pct=%s hard_exposure_cap_pct=%s absolute_exposure_cap_pct=%s paper_mode=%s enable_live_trading=%s live_execution_enabled=%s", cfg.max_position_notional_usd, cfg.soft_exposure_cap_pct, cfg.hard_exposure_cap_pct, cfg.absolute_exposure_cap_pct, cfg.paper_mode, cfg.enable_live_trading, cfg.live_execution_enabled)
+    tg = TelegramHandler(cfg.telegram_bot_token, cfg.telegram_chat_id)
+    try:
+        run_startup_validation(cfg)
+    except RuntimeError as exc:
+        error_text = str(exc)
+        error_code = error_text.split(":", 1)[0] if error_text.startswith("live_execution_") else type(exc).__name__
+        _send_startup_failure_telegram(cfg, tg, error_code, exc)
+        _write_status({
+            "status": "startup_failed",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "paper_mode": cfg.paper_mode,
+            "enable_live_trading": cfg.enable_live_trading,
+            "live_execution_enabled": cfg.live_execution_enabled,
+            "last_error": error_code,
+            "last_error_detail": str(exc),
+        })
+        raise
 
     client = HyperliquidClient(cfg.private_key, cfg.account_address, cfg.hl_network)
     client.connect()
     engine = ExecutionEngine(client=client, state_file=cfg.state_file, paper_mode=cfg.paper_mode, enable_live_trading=cfg.enable_live_trading, start_balance=cfg.paper_start_balance_usd, fill_model=cfg.fill_model, max_position_notional_usd=cfg.max_position_notional_usd, soft_exposure_cap_pct=cfg.soft_exposure_cap_pct, hard_exposure_cap_pct=cfg.hard_exposure_cap_pct, absolute_exposure_cap_pct=cfg.absolute_exposure_cap_pct, allow_position_flip=cfg.allow_position_flip)
     orchestrator = StrategyOrchestrator(config=cfg, execution_engine=engine)
-    tg = TelegramHandler(cfg.telegram_bot_token, cfg.telegram_chat_id)
     current_day = datetime.now(timezone.utc).date()
     if engine.paper.current_day:
         current_day = datetime.fromisoformat(engine.paper.current_day).date()
@@ -293,7 +327,7 @@ def run() -> None:
                 else:
                     logger.warning("telegram_fill_alert_failed error=send_returned_false side=%s", str(tr.get("side", "")).upper())
         last_trade_dt = engine.last_real_trade_ts
-        if last_trade_dt and abs(engine.paper.position_size) > 1e-12:
+        if cfg.paper_mode and last_trade_dt and abs(engine.paper.position_size) > 1e-12:
             age_hours = (datetime.now(timezone.utc) - last_trade_dt).total_seconds() / 3600
             if age_hours > cfg.stale_position_max_hours and position_notional > cfg.min_residual_notional_usd:
                 close_side = "sell" if engine.paper.position_size > 0 else "buy"
