@@ -59,15 +59,40 @@ class HyperliquidClient:
             return max(1, int(interval[:-1]) * 24 * 60)
         return 1
 
-    def get_balance(self) -> dict[str, Any]:
+
+    def has_live_execution_support(self) -> bool:
+        """Return True only when authenticated order/cancel/fill execution is implemented.
+
+        The current client intentionally exposes read-only market/account helpers.
+        Startup safety gates use this to prevent paper-simulated fills from running
+        under a live trading configuration.
+        """
+        return False
+
+    def get_user_state(self) -> dict[str, Any]:
         if self.info is not None and self.account_address:
-            state = self.info.user_state(self.account_address)
-            return {"equity": float(state.get("marginSummary", {}).get("accountValue", 0.0))}
-        return {"equity": 0.0}
+            return self.info.user_state(self.account_address)
+        if self.account_address:
+            return self._post_info({"type": "clearinghouseState", "user": self.account_address})
+        return {}
+
+    def get_account_summary(self) -> dict[str, Any]:
+        state = self.get_user_state()
+        margin = state.get("marginSummary", {}) if isinstance(state, dict) else {}
+        withdrawable = state.get("withdrawable", 0.0) if isinstance(state, dict) else 0.0
+        positions = state.get("assetPositions", []) if isinstance(state, dict) else []
+        return {
+            "accountValue": float(margin.get("accountValue", 0.0) or 0.0),
+            "withdrawable": float(withdrawable or 0.0),
+            "assetPositions_count": len(positions or []),
+        }
+
+    def get_balance(self) -> dict[str, Any]:
+        return {"equity": self.get_account_summary().get("accountValue", 0.0)}
 
     def get_positions(self) -> list[dict[str, Any]]:
-        if self.info is not None and self.account_address:
-            state = self.info.user_state(self.account_address)
+        state = self.get_user_state()
+        if isinstance(state, dict):
             return state.get("assetPositions", [])
         return []
 

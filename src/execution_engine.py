@@ -72,6 +72,12 @@ class ExecutionEngine:
         self.no_fill_cycles = 0
         self.last_real_trade_ts: datetime | None = None
 
+    def _require_paper_execution(self, action: str) -> None:
+        if not self.paper_mode:
+            raise RuntimeError(
+                f"live_execution_not_implemented: {action} cannot use paper-simulated orders/fills when PAPER_MODE=false"
+            )
+
     def _load_state(self, start_balance: float) -> PaperState:
         if self.state_file.exists():
             return PaperState(**json.loads(self.state_file.read_text()))
@@ -82,17 +88,20 @@ class ExecutionEngine:
         self.state_file.write_text(json.dumps(asdict(self.paper), indent=2), encoding="utf-8")
 
     def cancel_replace_grid(self, symbol: str, plan: GridPlan) -> dict[str, int | str]:
+        self._require_paper_execution("cancel_replace_grid")
         if not plan.should_regrid:
             return {"canceled": 0, "placed": 0, "symbol": symbol}
         self.open_orders = [{"symbol": symbol, "side": o.side, "price": o.price, "size": o.size} for o in (plan.long_levels + plan.short_levels)]
         return {"canceled": 0, "placed": len(self.open_orders), "symbol": symbol}
 
     def cancel_all_orders(self, symbol: str) -> int:
+        self._require_paper_execution("cancel_all_orders")
         before = len(self.open_orders)
         self.open_orders = [o for o in self.open_orders if o.get("symbol") != symbol]
         return before - len(self.open_orders)
 
     def place_reduce_only_orders(self, symbol: str, position_size: float, mark_price: float, order_size: float, levels: int = 3) -> int:
+        self._require_paper_execution("place_reduce_only_orders")
         if abs(position_size) < 1e-12:
             return 0
         side = "buy" if position_size < 0 else "sell"
@@ -110,6 +119,7 @@ class ExecutionEngine:
         return placed
 
     def flatten_position(self, symbol: str, mark_price: float) -> bool:
+        self._require_paper_execution("flatten_position")
         if abs(self.paper.position_size) < 1e-12:
             return False
         side = "buy" if self.paper.position_size < 0 else "sell"
@@ -117,6 +127,7 @@ class ExecutionEngine:
         return True
 
     def on_candle(self, candle: dict, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", strategy_status: str = "running") -> list[dict]:
+        self._require_paper_execution("on_candle")
         high, low = float(candle["high"]), float(candle["low"])
         mark_price = float(candle.get("close", candle.get("open", high)))
         candidate_fills, fill_meta = self._pick_fills(candle, high, low, mark_price)
@@ -254,6 +265,7 @@ class ExecutionEngine:
         return emergency_selected
 
     def _apply_fill(self, fill: dict, reason: str = "grid_fill", regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "") -> None:
+        self._require_paper_execution("_apply_fill")
         price, size = float(fill["price"]), float(fill["size"])
         position_before = self.paper.position_size
         realized_before = self.paper.realized_pnl

@@ -1,6 +1,10 @@
 import os
+import subprocess
 import tempfile
+from pathlib import Path
+
 import pandas as pd
+import pytest
 
 from src.config import BotConfig
 from src.grid_manager import GridManager
@@ -9,6 +13,7 @@ from src.risk_manager import RiskManager
 from src.types import MarketRegime, GridMode
 from src.execution_engine import ExecutionEngine, would_increase_exposure
 from src.strategy_orchestrator import StrategyOrchestrator
+from src.startup_validation import validate_live_execution_gate
 
 
 class DummyClient:
@@ -780,3 +785,71 @@ def test_status_and_trades_command_minimum_format():
     ]
     lines = ["Utolsó 5 trade:"] + [f"{r.get('timestamp','')} | {r.get('side','').upper()} {r.get('qty','')} @ {r.get('price','')} | pnlΔ {r.get('realized_pnl_delta','0')}" for r in trades]
     assert len(lines) == 3
+
+
+def test_live_mode_fake_execution_is_forbidden(tmp_path):
+    eng = make_test_engine(tmp_path, "live_fake.json", paper_mode=False, enable_live_trading=True)
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 100, "size": 1}]
+
+    with pytest.raises(RuntimeError, match="live_execution_not_implemented"):
+        eng.on_candle({"high": 101, "low": 99, "close": 100})
+
+    assert eng.paper.position_size == 0.0
+
+
+def test_live_execution_disabled_gate_fails(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    cfg = BotConfig.from_env()
+    cfg.paper_mode = False
+    cfg.enable_live_trading = True
+    cfg.live_execution_enabled = False
+
+    with pytest.raises(RuntimeError, match="live_execution_disabled"):
+        validate_live_execution_gate(cfg)
+
+
+def test_live_execution_enabled_without_exchange_executor_fails(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    cfg = BotConfig.from_env()
+    cfg.paper_mode = False
+    cfg.enable_live_trading = True
+    cfg.live_execution_enabled = True
+
+    with pytest.raises(RuntimeError, match="live_execution_not_implemented"):
+        validate_live_execution_gate(cfg)
+
+
+def test_live_execution_gate_allows_paper_flow(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    cfg = BotConfig.from_env()
+    cfg.paper_mode = True
+    cfg.enable_live_trading = False
+    cfg.live_execution_enabled = False
+
+    validate_live_execution_gate(cfg)
+    eng = make_test_engine(tmp_path, "paper_flow.json", paper_mode=True, enable_live_trading=False)
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 100, "size": 1}]
+    fills = eng.on_candle({"high": 101, "low": 99, "close": 100})
+    assert len(fills) == 1
+
+
+def test_live_preflight_script_does_not_print_secrets():
+    secret_key = "super-secret-private-key"
+    secret_token = "123456:super-secret-token"
+    result = subprocess.run(
+        ["bash", "scripts/live_preflight_check.sh"],
+        cwd=Path(__file__).resolve().parents[1],
+        env={
+            **os.environ,
+            "ENV_PROFILE": "paper",
+            "HL_PRIVATE_KEY": secret_key,
+            "TELEGRAM_BOT_TOKEN": secret_token,
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    combined_output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert secret_key not in combined_output
+    assert secret_token not in combined_output
