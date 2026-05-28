@@ -50,7 +50,7 @@ def classify_exposure_action(position_size: float, side: str, qty: float) -> str
 def would_increase_exposure(position_size: float, side: str, qty: float) -> bool:
     return classify_exposure_action(position_size, side, qty) == "increasing"
 
-class ExecutionEngine:
+class PaperExecutionEngine:
     def __init__(self, client: HyperliquidClient, state_file: str, paper_mode: bool = True, enable_live_trading: bool = False, fee_rate: float = 0.0004, start_balance: float = 500.0, fill_model: str = "optimistic", max_position_notional_usd: float = 500.0, soft_exposure_cap_pct: float = 0.6, hard_exposure_cap_pct: float = 0.8, absolute_exposure_cap_pct: float = 1.0, allow_position_flip: bool = False, trade_ledger_csv: str | None = None, trade_ledger_jsonl: str | None = None, risk_decisions_csv: str | None = None) -> None:
         self.client = client
         self.paper_mode = paper_mode
@@ -392,3 +392,214 @@ class ExecutionEngine:
         out = list(self.trade_log)
         self.trade_log.clear()
         return out
+
+
+class LiveExecutionEngine(PaperExecutionEngine):
+    """Authenticated Hyperliquid execution engine.
+
+    Live mode never derives fills from candles. Orders are submitted to the
+    exchange and trade ledger entries are emitted only from Hyperliquid user
+    fills returned by the authenticated account API.
+    """
+
+    def _load_state(self, start_balance: float) -> PaperState:
+        # Live state stores exchange-fill de-duplication metadata, not simulated cash/PnL.
+        return PaperState(cash=start_balance, daily_start_equity=start_balance)
+
+    def __init__(
+        self,
+        client: HyperliquidClient,
+        state_file: str,
+        *,
+        max_notional_per_trade_usd: float = 10.0,
+        leverage: int = 1,
+        **kwargs,
+    ) -> None:
+        super().__init__(client=client, state_file=state_file, paper_mode=False, enable_live_trading=True, **kwargs)
+        self.max_notional_per_trade_usd = max_notional_per_trade_usd
+        self.leverage = leverage
+        self._seen_fill_ids: set[str] = set()
+        self._load_live_seen_fills()
+        self.client.require_live_execution_support()
+
+    def _require_paper_execution(self, action: str) -> None:
+        raise RuntimeError(f"live_execution_forbids_paper_simulation: {action} cannot run in LIVE mode")
+
+    def _load_live_seen_fills(self) -> None:
+        if not self.state_file.exists():
+            return
+        try:
+            payload = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+        if isinstance(payload, dict):
+            self._seen_fill_ids = {str(x) for x in payload.get("seen_fill_ids", [])}
+
+    def save_state(self) -> None:
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "mode": "live",
+            "seen_fill_ids": sorted(self._seen_fill_ids)[-1000:],
+            "last_real_trade_ts": self.last_real_trade_ts.isoformat() if self.last_real_trade_ts else "",
+        }
+        self.state_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def sync_account(self, symbol: str, mark_price: float | None = None) -> dict:
+        balance = self.client.get_balance()
+        position = self.client.get_position(symbol)
+        size = float(position.get("szi", 0.0) or 0.0)
+        entry_px = float(position.get("entryPx", 0.0) or 0.0)
+        self.paper.position_size = size
+        self.paper.avg_entry = entry_px
+        self.paper.cash = float(balance.get("equity", 0.0) or 0.0)
+        if mark_price is not None:
+            self.paper.daily_start_equity = self.paper.daily_start_equity or self.paper.cash
+        self.sync_open_orders(symbol)
+        return {"equity": self.paper.cash, "position_size": size, "avg_entry": entry_px, "open_orders": len(self.open_orders)}
+
+    def sync_open_orders(self, symbol: str) -> list[dict]:
+        orders: list[dict] = []
+        for raw in self.client.get_open_orders(symbol):
+            side_raw = str(raw.get("side", "")).lower()
+            side = "buy" if side_raw in {"b", "buy"} else "sell"
+            orders.append(
+                {
+                    "symbol": raw.get("coin", symbol),
+                    "side": side,
+                    "price": float(raw.get("limitPx", raw.get("px", 0.0)) or 0.0),
+                    "size": float(raw.get("sz", 0.0) or 0.0),
+                    "oid": raw.get("oid"),
+                    "reduce_only": bool(raw.get("reduceOnly", False)),
+                    "raw": raw,
+                }
+            )
+        self.open_orders = orders
+        return self.open_orders
+
+    def cancel_replace_grid(self, symbol: str, plan: GridPlan) -> dict[str, int | str]:
+        if not plan.should_regrid:
+            self.sync_open_orders(symbol)
+            return {"canceled": 0, "placed": 0, "symbol": symbol}
+        canceled = self.cancel_all_orders(symbol)
+        placed = 0
+        for order in plan.long_levels + plan.short_levels:
+            if self._submit_live_limit(symbol, order.side, order.size, order.price, reduce_only=False):
+                placed += 1
+        self.sync_open_orders(symbol)
+        return {"canceled": canceled, "placed": placed, "symbol": symbol}
+
+    def cancel_all_orders(self, symbol: str) -> int:
+        canceled = self.client.cancel_all_orders(symbol)
+        self.sync_open_orders(symbol)
+        return canceled
+
+    def place_reduce_only_orders(self, symbol: str, position_size: float, mark_price: float, order_size: float, levels: int = 3) -> int:
+        self.sync_account(symbol, mark_price)
+        live_position_size = self.paper.position_size
+        if abs(live_position_size) < 1e-12:
+            return 0
+        side = "buy" if live_position_size < 0 else "sell"
+        remaining = abs(live_position_size)
+        per_level = max(min(order_size, remaining), 0.0)
+        placed = 0
+        for i in range(levels):
+            if remaining <= 1e-12:
+                break
+            size = min(per_level, remaining)
+            price = mark_price * (1 - 0.001 * (i + 1)) if side == "buy" else mark_price * (1 + 0.001 * (i + 1))
+            if self._submit_live_limit(symbol, side, size, price, reduce_only=True):
+                placed += 1
+            remaining -= size
+        self.sync_open_orders(symbol)
+        return placed
+
+    def flatten_position(self, symbol: str, mark_price: float) -> bool:
+        self.sync_account(symbol, mark_price)
+        if abs(self.paper.position_size) < 1e-12:
+            return False
+        side = "buy" if self.paper.position_size < 0 else "sell"
+        return self._submit_live_limit(symbol, side, abs(self.paper.position_size), mark_price, reduce_only=True)
+
+    def on_candle(self, candle: dict, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", strategy_status: str = "running") -> list[dict]:
+        symbol = str(candle.get("symbol") or "")
+        if not symbol and self.open_orders:
+            symbol = str(self.open_orders[0].get("symbol", ""))
+        # No candle-touch fill simulation in live mode. This only polls exchange fills.
+        return self.sync_user_fills(symbol or None, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason)
+
+    def sync_user_fills(self, symbol: str | None = None, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "") -> list[dict]:
+        fills = self.client.get_user_fills(symbol)
+        new_entries: list[dict] = []
+        for raw in fills:
+            fill_id = self._fill_id(raw)
+            if fill_id in self._seen_fill_ids:
+                continue
+            entry = self._ledger_entry_from_exchange_fill(raw, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason)
+            self._seen_fill_ids.add(fill_id)
+            self.trade_log.append(entry)
+            self._append_trade_ledger(entry)
+            new_entries.append(entry)
+        if new_entries:
+            self.last_real_trade_ts = datetime.now(timezone.utc)
+            if symbol:
+                self.sync_account(symbol, None)
+            self.save_state()
+        return new_entries
+
+    def _submit_live_limit(self, symbol: str, side: str, size: float, price: float, *, reduce_only: bool) -> bool:
+        notional = abs(float(size) * float(price))
+        if notional > self.max_notional_per_trade_usd + 1e-9:
+            size = self.max_notional_per_trade_usd / max(float(price), 1e-9)
+            notional = abs(size * float(price))
+        if notional <= 0:
+            return False
+        if not reduce_only and abs((self.paper.position_size + _signed_order_size(side, size)) * price) > self.max_position_notional_usd + 1e-9:
+            logger.warning("live_order_blocked reason=max_position_notional side=%s price=%s size=%s", side, price, size)
+            return False
+        logger.info("order_submitted mode=live side=%s price=%s qty=%s reduce_only=%s", side, price, size, reduce_only)
+        self.client.place_limit_order(symbol, side, size, price, reduce_only=reduce_only)
+        return True
+
+    def _fill_id(self, raw: dict) -> str:
+        for key in ("tid", "hash", "oid"):
+            if raw.get(key) is not None:
+                return f"{key}:{raw.get(key)}:{raw.get('time', '')}"
+        return json.dumps(raw, sort_keys=True)
+
+    def _ledger_entry_from_exchange_fill(self, raw: dict, *, regime: str, mode: str, risk_state: str, pause_reason: str) -> dict:
+        price = float(raw.get("px", raw.get("price", 0.0)) or 0.0)
+        size = float(raw.get("sz", raw.get("size", 0.0)) or 0.0)
+        side_raw = str(raw.get("side", "")).lower()
+        side = "buy" if side_raw in {"b", "buy"} else "sell"
+        fee = abs(float(raw.get("fee", 0.0) or 0.0))
+        realized_delta = float(raw.get("closedPnl", raw.get("closed_pnl", 0.0)) or 0.0)
+        ts_raw = raw.get("time")
+        if ts_raw is not None:
+            timestamp = datetime.fromtimestamp(float(ts_raw) / 1000, tz=timezone.utc).isoformat()
+        else:
+            timestamp = datetime.now(timezone.utc).isoformat()
+        position_notional = abs(self.paper.position_size * price)
+        return {
+            "timestamp": timestamp,
+            "symbol": raw.get("coin", ""),
+            "side": side,
+            "price": price,
+            "qty": size,
+            "notional": abs(price * size),
+            "fee": fee,
+            "realized_pnl_delta": realized_delta,
+            "realized_pnl_total": self.paper.realized_pnl + realized_delta,
+            "cash": self.paper.cash,
+            "equity": self.paper.cash,
+            "position_size": self.paper.position_size,
+            "position_notional": position_notional,
+            "regime": regime,
+            "mode": mode,
+            "risk_state": risk_state,
+            "pause_reason": pause_reason,
+            "reason": "exchange_fill",
+        }
+
+
+# Backwards-compatible public name used by existing tests and integrations.
+ExecutionEngine = PaperExecutionEngine

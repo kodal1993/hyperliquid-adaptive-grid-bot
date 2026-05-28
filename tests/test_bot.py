@@ -853,3 +853,92 @@ def test_live_preflight_script_does_not_print_secrets():
     assert result.returncode != 0
     assert secret_key not in combined_output
     assert secret_token not in combined_output
+
+
+def test_live_execution_engine_does_not_use_candle_touch_fills(tmp_path):
+    from src.execution_engine import LiveExecutionEngine
+
+    class FakeLiveClient:
+        def __init__(self):
+            self.orders = [{"coin": "BTC", "side": "B", "limitPx": "100", "sz": "0.1", "oid": 1}]
+
+        def require_live_execution_support(self):
+            return None
+
+        def get_balance(self):
+            return {"equity": 160.0}
+
+        def get_position(self, symbol):
+            return {"coin": symbol, "szi": "0", "entryPx": "0"}
+
+        def get_open_orders(self, symbol):
+            return self.orders
+
+        def get_user_fills(self, symbol=None):
+            return []
+
+    eng = LiveExecutionEngine(
+        FakeLiveClient(),
+        str(tmp_path / "live_state.json"),
+        start_balance=160,
+        trade_ledger_csv=str(tmp_path / "trades.csv"),
+        trade_ledger_jsonl=str(tmp_path / "trades.jsonl"),
+        risk_decisions_csv=str(tmp_path / "risk.csv"),
+    )
+    fills = eng.on_candle({"symbol": "BTC", "high": 101, "low": 99, "close": 100})
+    assert fills == []
+    assert eng.paper.position_size == 0.0
+    assert not (tmp_path / "trades.csv").exists()
+
+
+def test_live_execution_engine_writes_ledger_only_from_exchange_fills(tmp_path):
+    from src.execution_engine import LiveExecutionEngine
+
+    class FakeLiveClient:
+        def require_live_execution_support(self):
+            return None
+
+        def get_balance(self):
+            return {"equity": 161.0}
+
+        def get_position(self, symbol):
+            return {"coin": symbol, "szi": "0.001", "entryPx": "100000"}
+
+        def get_open_orders(self, symbol):
+            return []
+
+        def get_user_fills(self, symbol=None):
+            return [{"coin": "BTC", "side": "B", "px": "100000", "sz": "0.0001", "fee": "0.004", "closedPnl": "0", "time": 1760000000000, "tid": 123}]
+
+    eng = LiveExecutionEngine(
+        FakeLiveClient(),
+        str(tmp_path / "live_state.json"),
+        start_balance=160,
+        trade_ledger_csv=str(tmp_path / "trades.csv"),
+        trade_ledger_jsonl=str(tmp_path / "trades.jsonl"),
+        risk_decisions_csv=str(tmp_path / "risk.csv"),
+    )
+    fills = eng.sync_user_fills("BTC")
+    assert len(fills) == 1
+    assert fills[0]["reason"] == "exchange_fill"
+    assert (tmp_path / "trades.csv").read_text(encoding="utf-8").count("exchange_fill") == 1
+    assert eng.consume_trade_log()[0]["symbol"] == "BTC"
+    assert eng.sync_user_fills("BTC") == []
+
+
+def test_live_execution_engine_missing_executor_fails(tmp_path):
+    from src.execution_engine import LiveExecutionEngine
+
+    class MissingLiveClient:
+        def require_live_execution_support(self):
+            raise RuntimeError("live_execution_not_implemented: nope")
+
+    with pytest.raises(RuntimeError, match="live_execution_not_implemented"):
+        LiveExecutionEngine(MissingLiveClient(), str(tmp_path / "live_state.json"), start_balance=160)
+
+
+def test_live_preflight_script_does_not_echo_secret_names_as_values():
+    script = Path("scripts/live_preflight_check.sh").read_text(encoding="utf-8")
+    assert "HL_PRIVATE_KEY}" not in script
+    assert "TELEGRAM_BOT_TOKEN}" not in script
+    assert "telegram_credentials_present=true" in script

@@ -14,7 +14,7 @@ import fcntl
 import pandas as pd
 
 from .config import BotConfig
-from .execution_engine import ExecutionEngine
+from .execution_engine import ExecutionEngine, LiveExecutionEngine
 from .hyperliquid_client import HyperliquidClient
 from .startup_validation import run_startup_validation
 from .strategy_orchestrator import StrategyOrchestrator
@@ -35,10 +35,13 @@ def to_df(candles: list[dict]) -> pd.DataFrame:
 
 
 def _paper_metrics(cfg: BotConfig, engine: ExecutionEngine, client: HyperliquidClient, latest_close: float) -> tuple[float, float, float]:
-    unrealized_pnl = engine.unrealized_pnl(latest_close) if cfg.paper_mode else 0.0
-    equity = engine.equity(latest_close) if cfg.paper_mode else client.get_balance().get("equity", cfg.paper_start_balance_usd)
-    position_notional = abs(engine.paper.position_size * latest_close) if cfg.paper_mode else 0.0
-    return unrealized_pnl, equity, position_notional
+    if cfg.paper_mode:
+        return engine.unrealized_pnl(latest_close), engine.equity(latest_close), abs(engine.paper.position_size * latest_close)
+    if hasattr(engine, "sync_account"):
+        engine.sync_account(cfg.default_symbol, latest_close)
+    equity = client.get_balance().get("equity", cfg.paper_start_balance_usd)
+    position_notional = abs(engine.paper.position_size * latest_close)
+    return 0.0, equity, position_notional
 
 
 def _write_status(payload: dict) -> None:
@@ -277,7 +280,11 @@ def run() -> None:
 
     client = HyperliquidClient(cfg.private_key, cfg.account_address, cfg.hl_network)
     client.connect()
-    engine = ExecutionEngine(client=client, state_file=cfg.state_file, paper_mode=cfg.paper_mode, enable_live_trading=cfg.enable_live_trading, start_balance=cfg.paper_start_balance_usd, fill_model=cfg.fill_model, max_position_notional_usd=cfg.max_position_notional_usd, soft_exposure_cap_pct=cfg.soft_exposure_cap_pct, hard_exposure_cap_pct=cfg.hard_exposure_cap_pct, absolute_exposure_cap_pct=cfg.absolute_exposure_cap_pct, allow_position_flip=cfg.allow_position_flip)
+    if cfg.paper_mode:
+        engine = ExecutionEngine(client=client, state_file=cfg.state_file, paper_mode=True, enable_live_trading=False, start_balance=cfg.paper_start_balance_usd, fill_model=cfg.fill_model, max_position_notional_usd=cfg.max_position_notional_usd, soft_exposure_cap_pct=cfg.soft_exposure_cap_pct, hard_exposure_cap_pct=cfg.hard_exposure_cap_pct, absolute_exposure_cap_pct=cfg.absolute_exposure_cap_pct, allow_position_flip=cfg.allow_position_flip)
+    else:
+        engine = LiveExecutionEngine(client=client, state_file=cfg.state_file, start_balance=cfg.paper_start_balance_usd, fill_model=cfg.fill_model, max_position_notional_usd=cfg.max_position_notional_usd, soft_exposure_cap_pct=cfg.soft_exposure_cap_pct, hard_exposure_cap_pct=cfg.hard_exposure_cap_pct, absolute_exposure_cap_pct=cfg.absolute_exposure_cap_pct, allow_position_flip=cfg.allow_position_flip, max_notional_per_trade_usd=cfg.max_notional_per_trade_usd, leverage=cfg.base_leverage)
+        client.set_leverage(cfg.default_symbol, cfg.base_leverage)
     orchestrator = StrategyOrchestrator(config=cfg, execution_engine=engine)
     current_day = datetime.now(timezone.utc).date()
     if engine.paper.current_day:
@@ -314,7 +321,9 @@ def run() -> None:
         risk_state = _derive_risk_state(strategy_status, reason)
         mode = status.get("mode", "reduce_only" if reason == "reduce_only_requested" else "neutral")
 
-        fills = engine.on_candle(candles.iloc[-1].to_dict(), regime=status.get("regime", "unknown"), mode=mode, risk_state=risk_state, pause_reason=reason, strategy_status=strategy_status)
+        latest_candle = candles.iloc[-1].to_dict()
+        latest_candle["symbol"] = cfg.default_symbol
+        fills = engine.on_candle(latest_candle, regime=status.get("regime", "unknown"), mode=mode, risk_state=risk_state, pause_reason=reason, strategy_status=strategy_status)
         trade_events = engine.consume_trade_log()
         unrealized_pnl, equity, position_notional = _paper_metrics(cfg, engine, client, latest_close)
 
