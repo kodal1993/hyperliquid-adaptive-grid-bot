@@ -22,6 +22,17 @@ if [[ -f "$PROFILE_FILE" ]]; then
   set +a
 fi
 
+PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+  else
+    fail "python interpreter not found"
+  fi
+fi
+
 [[ "${ENV_PROFILE:-}" == "live" ]] || fail "ENV_PROFILE must be live (current: ${ENV_PROFILE:-unset})"
 [[ "${HL_NETWORK:-}" == "mainnet" ]] || fail "HL_NETWORK must be mainnet (current: ${HL_NETWORK:-unset})"
 [[ "${PAPER_MODE:-}" == "false" ]] || fail "PAPER_MODE must be false (current: ${PAPER_MODE:-unset})"
@@ -37,8 +48,9 @@ STOP_FILE="${EMERGENCY_STOP_FILE:-state/STOP_LIVE}"
 [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] || fail "TELEGRAM_BOT_TOKEN is missing"
 [[ -n "${TELEGRAM_CHAT_ID:-}" ]] || fail "TELEGRAM_CHAT_ID is missing"
 echo "telegram_credentials_present=true"
+echo "python_bin=${PYTHON_BIN}"
 
-python - <<'PY'
+"$PYTHON_BIN" - <<'PY'
 import os
 import sys
 from src.hyperliquid_client import HyperliquidClient
