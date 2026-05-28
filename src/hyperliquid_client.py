@@ -3,7 +3,11 @@ from __future__ import annotations
 import logging
 import time
 from typing import Any
+
 import requests
+from eth_account import Account
+from hyperliquid.exchange import Exchange
+from hyperliquid.info import Info
 
 logger = logging.getLogger(__name__)
 
@@ -14,17 +18,24 @@ class HyperliquidClient:
         self.account_address = account_address
         self.network = network
         self.info: Any | None = None
+        self.exchange: Any | None = None
         self.base_url = "https://api.hyperliquid-testnet.xyz" if network == "testnet" else "https://api.hyperliquid.xyz"
 
     def connect(self) -> None:
         try:
-            from hyperliquid.info import Info
-
             self.info = Info(self.base_url, skip_ws=True)
             logger.info("Hyperliquid SDK Info connected network=%s", self.network)
         except Exception as exc:
             self.info = None
-            logger.warning("SDK init failed, using HTTP fallback: %s", exc)
+            logger.warning("SDK info init failed, using HTTP fallback: %s", exc)
+        if self.private_key:
+            try:
+                wallet = Account.from_key(self.private_key)
+                self.exchange = Exchange(wallet, base_url=self.base_url, account_address=self.account_address or None)
+                logger.info("Hyperliquid SDK Exchange connected network=%s account_present=%s", self.network, bool(self.account_address))
+            except Exception as exc:
+                self.exchange = None
+                logger.error("Hyperliquid SDK Exchange init failed: %s", exc)
 
     def _post_info(self, payload: dict[str, Any]) -> Any:
         resp = requests.post(f"{self.base_url}/info", json=payload, timeout=10)
@@ -59,15 +70,18 @@ class HyperliquidClient:
             return max(1, int(interval[:-1]) * 24 * 60)
         return 1
 
-
     def has_live_execution_support(self) -> bool:
-        """Return True only when authenticated order/cancel/fill execution is implemented.
+        """Return True when authenticated Hyperliquid order/cancel/fill APIs are usable."""
+        if not self.private_key or not self.account_address:
+            return False
+        if self.exchange is not None and self.info is not None:
+            return True
+        self.connect()
+        return self.exchange is not None and self.info is not None
 
-        The current client intentionally exposes read-only market/account helpers.
-        Startup safety gates use this to prevent paper-simulated fills from running
-        under a live trading configuration.
-        """
-        return False
+    def require_live_execution_support(self) -> None:
+        if not self.has_live_execution_support():
+            raise RuntimeError("live_execution_not_implemented: authenticated Hyperliquid Exchange client is unavailable")
 
     def get_user_state(self) -> dict[str, Any]:
         if self.info is not None and self.account_address:
@@ -96,8 +110,48 @@ class HyperliquidClient:
             return state.get("assetPositions", [])
         return []
 
+    def get_position(self, symbol: str) -> dict[str, Any]:
+        for item in self.get_positions():
+            pos = item.get("position", item) if isinstance(item, dict) else {}
+            if str(pos.get("coin", "")).upper() == symbol.upper():
+                return pos
+        return {}
+
     def get_open_orders(self, symbol: str) -> list[dict[str, Any]]:
         if self.info is not None and self.account_address:
             orders = self.info.open_orders(self.account_address)
             return [o for o in orders if o.get("coin") == symbol]
         return []
+
+    def get_user_fills(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        if self.info is None or not self.account_address:
+            return []
+        fills = self.info.user_fills(self.account_address)
+        if symbol:
+            return [f for f in fills if str(f.get("coin", "")).upper() == symbol.upper()]
+        return fills
+
+    def place_limit_order(self, symbol: str, side: str, size: float, price: float, *, reduce_only: bool = False) -> Any:
+        self.require_live_execution_support()
+        assert self.exchange is not None
+        return self.exchange.order(symbol, side.lower() == "buy", float(size), float(price), {"limit": {"tif": "Gtc"}}, reduce_only=reduce_only)
+
+    def cancel_order(self, symbol: str, oid: int) -> Any:
+        self.require_live_execution_support()
+        assert self.exchange is not None
+        return self.exchange.cancel(symbol, int(oid))
+
+    def cancel_all_orders(self, symbol: str) -> int:
+        canceled = 0
+        for order in self.get_open_orders(symbol):
+            oid = order.get("oid")
+            if oid is None:
+                continue
+            self.cancel_order(symbol, int(oid))
+            canceled += 1
+        return canceled
+
+    def set_leverage(self, symbol: str, leverage: int, *, is_cross: bool = True) -> Any:
+        self.require_live_execution_support()
+        assert self.exchange is not None
+        return self.exchange.update_leverage(int(leverage), symbol, is_cross=is_cross)

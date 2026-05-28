@@ -21,10 +21,26 @@ def validate_live_execution_gate(config: BotConfig, client: HyperliquidClient | 
         raise RuntimeError("live_execution_not_implemented: authenticated exchange order/cancel/fill execution is not implemented")
 
 
+def _validate_micro_live_limits(config: BotConfig) -> None:
+    if config.paper_mode:
+        return
+    if config.max_notional_per_trade_usd > 10:
+        raise ValueError("micro_live_limit: MAX_NOTIONAL_PER_TRADE_USD must be <= 10")
+    if config.max_position_notional_usd > 50:
+        raise ValueError("micro_live_limit: MAX_POSITION_NOTIONAL_USD must be <= 50")
+    if config.base_leverage != 1 or config.leverage_min != 1 or config.leverage_max != 1:
+        raise ValueError("micro_live_limit: leverage must be fixed at 1x")
+    if config.daily_loss_limit_pct > 0.015:
+        raise ValueError("micro_live_limit: DAILY_LOSS_LIMIT_PCT must be <= 0.015")
+    if config.max_drawdown_pct > 0.03:
+        raise ValueError("micro_live_limit: MAX_DRAWDOWN_PCT must be <= 0.03")
+
+
 def run_startup_validation(config: BotConfig) -> dict:
     if config.hl_network not in {"testnet", "mainnet"}:
         raise ValueError("HL_NETWORK must be testnet or mainnet")
     validate_live_execution_gate(config)
+    _validate_micro_live_limits(config)
     if config.grid_levels <= 0 or config.grid_spacing_pct <= 0 or config.max_position_notional_usd <= 0:
         raise ValueError("Invalid grid config")
     if config.min_notional_usd > config.max_notional_per_trade_usd:
