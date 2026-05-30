@@ -5,9 +5,11 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+import requests
 
 from src.config import BotConfig
 from src.grid_manager import GridManager
+from src.hyperliquid_client import HyperliquidClient
 from src.regime_detector import RegimeDetector
 from src.risk_manager import RiskManager
 from src.types import MarketRegime, GridMode
@@ -942,3 +944,61 @@ def test_live_preflight_script_does_not_echo_secret_names_as_values():
     assert "HL_PRIVATE_KEY}" not in script
     assert "TELEGRAM_BOT_TOKEN}" not in script
     assert "telegram_credentials_present=true" in script
+
+
+def _http_error(status_code: int) -> requests.exceptions.HTTPError:
+    response = requests.Response()
+    response.status_code = status_code
+    return requests.exceptions.HTTPError(f"HTTP {status_code}", response=response)
+
+
+def test_hyperliquid_post_info_retries_retryable_http_errors(monkeypatch):
+    client = HyperliquidClient("", "", network="testnet")
+    sleeps = []
+    attempts = {"count": 0}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            attempts["count"] += 1
+            if attempts["count"] <= 2:
+                raise _http_error(500 if attempts["count"] == 1 else 502)
+
+        def json(self):
+            return {"BTC": "100.0"}
+
+    monkeypatch.setattr("src.hyperliquid_client.time.sleep", sleeps.append)
+    monkeypatch.setattr("src.hyperliquid_client.requests.post", lambda *args, **kwargs: FakeResponse())
+
+    assert client._post_info({"type": "allMids"}) == {"BTC": "100.0"}
+    assert attempts["count"] == 3
+    assert sleeps == [1, 2]
+
+
+def test_hyperliquid_retry_exhaustion_raises_after_backoff(monkeypatch):
+    client = HyperliquidClient("", "", network="testnet")
+    sleeps = []
+    attempts = {"count": 0}
+
+    def always_timeout():
+        attempts["count"] += 1
+        raise requests.exceptions.ReadTimeout("read timed out")
+
+    monkeypatch.setattr("src.hyperliquid_client.time.sleep", sleeps.append)
+
+    with pytest.raises(requests.exceptions.ReadTimeout):
+        client._retry_hyperliquid_api("test", always_timeout)
+
+    assert attempts["count"] == 5
+    assert sleeps == [1, 2, 5, 10]
+
+
+def test_hyperliquid_retry_skips_non_retryable_http_status(monkeypatch):
+    client = HyperliquidClient("", "", network="testnet")
+    sleeps = []
+
+    monkeypatch.setattr("src.hyperliquid_client.time.sleep", sleeps.append)
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        client._retry_hyperliquid_api("test", lambda: (_ for _ in ()).throw(_http_error(400)))
+
+    assert sleeps == []
