@@ -20,11 +20,13 @@ from src.hyperliquid_client import HyperliquidClient
 
 SERVICE_NAME = os.getenv("TELEGRAM_CONTROL_SERVICE_NAME", "hyperliquid-grid-bot-live")
 STATUS_FILE = Path(os.getenv("TELEGRAM_CONTROL_STATUS_FILE", "data/status.json"))
+TRADES_FILE = Path(os.getenv("TELEGRAM_CONTROL_TRADES_FILE", "logs/trades.jsonl"))
 OFFSET_FILE = Path(os.getenv("TELEGRAM_CONTROL_OFFSET_FILE", "state/telegram_control.offset"))
 POLL_TIMEOUT_SECONDS = int(os.getenv("TELEGRAM_CONTROL_POLL_TIMEOUT_SECONDS", "25"))
 POLL_SLEEP_SECONDS = float(os.getenv("TELEGRAM_CONTROL_POLL_SLEEP_SECONDS", "1"))
 MAX_MESSAGE_LEN = 3800
 BOT_COMMANDS = [
+    {"command": "menu", "description": "Inline vezérlő menü"},
     {"command": "status", "description": "Bot + exchange státusz"},
     {"command": "startbot", "description": "Live bot service indítása"},
     {"command": "stopbot", "description": "Live bot service leállítása"},
@@ -33,6 +35,9 @@ BOT_COMMANDS = [
     {"command": "panic", "description": "Vészstop: stop + cancel + snapshot"},
     {"command": "orders", "description": "Open orderek lekérése"},
     {"command": "position", "description": "Aktuális pozíció lekérése"},
+    {"command": "trades", "description": "Utolsó trade-ek"},
+    {"command": "performance", "description": "Teljesítmény statisztika"},
+    {"command": "closeposition", "description": "Pozíció zárása"},
     {"command": "help", "description": "Parancslista"},
 ]
 
@@ -54,10 +59,71 @@ def register_bot_commands(token: str) -> None:
     requests.post(telegram_api(token, "setMyCommands"), json={"commands": BOT_COMMANDS}, timeout=15).raise_for_status()
 
 
-def send_message(token: str, chat_id: str, text: str) -> None:
+def main_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📊 Status", "callback_data": "cmd:status"},
+                {"text": "📌 Position", "callback_data": "cmd:position"},
+            ],
+            [
+                {"text": "📋 Orders", "callback_data": "cmd:orders"},
+                {"text": "📈 Trades", "callback_data": "cmd:trades"},
+            ],
+            [{"text": "📉 Performance", "callback_data": "cmd:performance"}],
+            [
+                {"text": "🛑 Stop bot", "callback_data": "confirm:stopbot"},
+                {"text": "▶️ Start bot", "callback_data": "cmd:startbot"},
+            ],
+            [
+                {"text": "❌ Cancel orders", "callback_data": "confirm:cancelall"},
+                {"text": "🚪 Close position", "callback_data": "confirm:closeposition"},
+            ],
+            [{"text": "🔄 Refresh", "callback_data": "cmd:menu"}],
+        ]
+    }
+
+
+def confirm_keyboard(action: str) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Confirm", "callback_data": f"do:{action}"},
+                {"text": "❌ Cancel", "callback_data": "cmd:menu"},
+            ]
+        ]
+    }
+
+
+def send_message(token: str, chat_id: str, text: str, reply_markup: dict[str, Any] | None = None) -> bool:
     chunks = [text[i : i + MAX_MESSAGE_LEN] for i in range(0, len(text), MAX_MESSAGE_LEN)] or [text]
-    for chunk in chunks:
-        requests.post(telegram_api(token, "sendMessage"), json={"chat_id": chat_id, "text": chunk}, timeout=15).raise_for_status()
+    for idx, chunk in enumerate(chunks):
+        payload: dict[str, Any] = {"chat_id": chat_id, "text": chunk}
+        if reply_markup is not None and idx == len(chunks) - 1:
+            payload["reply_markup"] = reply_markup
+        try:
+            requests.post(telegram_api(token, "sendMessage"), json=payload, timeout=15).raise_for_status()
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            return False
+    return True
+
+
+def answer_callback(token: str, callback_query_id: str, text: str = "") -> None:
+    try:
+        requests.post(
+            telegram_api(token, "answerCallbackQuery"),
+            json={"callback_query_id": callback_query_id, "text": text},
+            timeout=10,
+        ).raise_for_status()
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        return
+
+
+def menu_text() -> str:
+    return """🤖 HYPERLIQUID LIVE BOT
+Execution: LIVE
+
+Choose action:"""
 
 
 def run_cmd(args: list[str], *, timeout: int = 30) -> tuple[int, str]:
@@ -136,7 +202,7 @@ def get_exchange_data(cfg: BotConfig) -> tuple[dict[str, Any], list[dict[str, An
 
 
 def format_orders(orders: list[dict[str, Any]], symbol: str) -> str:
-    lines = ["📋 OPEN ORDERS", f"Symbol: {symbol}", f"Count: {len(orders)}", ""]
+    lines = ["📋 OPEN ORDERS", "Execution: LIVE", f"Symbol: {symbol}", f"Count: {len(orders)}", ""]
     if not orders:
         lines.append("✅ Nincs nyitott order.")
         return "\n".join(lines)
@@ -164,7 +230,7 @@ def format_orders(orders: list[dict[str, Any]], symbol: str) -> str:
 
 
 def format_position(position: Any, symbol: str) -> str:
-    lines = ["📌 POSITION", f"Symbol: {symbol}", ""]
+    lines = ["📌 POSITION", "Execution: LIVE", f"Symbol: {symbol}", ""]
     if not position:
         lines.append("✅ FLAT — nincs nyitott pozíció.")
         return "\n".join(lines)
@@ -195,7 +261,7 @@ def format_position(position: Any, symbol: str) -> str:
         )
         return "\n".join(lines)
 
-    return "📌 POSITION\n" + json.dumps(position, indent=2, ensure_ascii=False)[:2500]
+    return "📌 POSITION\nExecution: LIVE\n" + json.dumps(position, indent=2, ensure_ascii=False)[:2500]
 
 
 def format_account(state: dict[str, Any]) -> str:
@@ -203,12 +269,104 @@ def format_account(state: dict[str, Any]) -> str:
     return "\n".join(
         [
             "🏦 ACCOUNT",
+            "Execution: LIVE",
             f"Equity: {fmt_money(margin.get('accountValue'))}",
             f"Withdrawable: {fmt_money(state.get('withdrawable') if isinstance(state, dict) else None)}",
             f"Total notional pos: {fmt_money(margin.get('totalNtlPos'))}",
             f"Margin used: {fmt_money(margin.get('totalMarginUsed'))}",
         ]
     )
+
+
+def read_trades(limit: int | None = None) -> list[dict[str, Any]]:
+    if not TRADES_FILE.exists():
+        return []
+    trades: list[dict[str, Any]] = []
+    try:
+        with TRADES_FILE.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    trades.append(item)
+    except OSError:
+        return []
+    if limit is not None:
+        return trades[-limit:]
+    return trades
+
+
+def _trade_float(trade: dict[str, Any], key: str) -> float:
+    try:
+        return float(trade.get(key, 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def format_trades(limit: int = 10) -> str:
+    trades = read_trades(limit)
+    lines = ["📈 TRADES", f"Execution: LIVE", f"Source: {TRADES_FILE}", f"Last: {len(trades)}", ""]
+    if not trades:
+        lines.append("No trades found.")
+        return "\n".join(lines)
+
+    for idx, trade in enumerate(reversed(trades), 1):
+        side = str(trade.get("side") or "n/a").upper()
+        ts = str(trade.get("timestamp") or "n/a")
+        symbol = str(trade.get("symbol") or "n/a")
+        lines.extend(
+            [
+                f"#{idx} {short_side_icon(side)} {symbol}",
+                f"├ Time: {ts}",
+                f"├ Price: {fmt_price(trade.get('price'))}",
+                f"├ Qty: {fmt_num(trade.get('qty'), 8)}",
+                f"├ Notional: {fmt_money(trade.get('notional'))}",
+                f"├ Fee: {fmt_money(trade.get('fee'), 4)}",
+                f"└ Realized Δ: {fmt_money(trade.get('realized_pnl_delta'), 4)}",
+                "",
+            ]
+        )
+    return "\n".join(lines).strip()
+
+
+def format_performance() -> str:
+    trades = read_trades()
+    lines = ["📉 PERFORMANCE", "Execution: LIVE", f"Source: {TRADES_FILE}", ""]
+    if not trades:
+        lines.append("No trades found.")
+        return "\n".join(lines)
+
+    total_notional = sum(abs(_trade_float(t, "notional")) for t in trades)
+    total_fees = sum(abs(_trade_float(t, "fee")) for t in trades)
+    realized_delta = sum(_trade_float(t, "realized_pnl_delta") for t in trades)
+    wins = sum(1 for t in trades if _trade_float(t, "realized_pnl_delta") > 0)
+    losses = sum(1 for t in trades if _trade_float(t, "realized_pnl_delta") < 0)
+    buys = sum(1 for t in trades if str(t.get("side", "")).lower() in {"buy", "b"})
+    sells = sum(1 for t in trades if str(t.get("side", "")).lower() in {"sell", "a", "ask"})
+    first_ts = str(trades[0].get("timestamp") or "n/a")
+    last_ts = str(trades[-1].get("timestamp") or "n/a")
+    win_rate = wins / max(wins + losses, 1)
+    last_equity = trades[-1].get("equity")
+
+    lines.extend(
+        [
+            f"Trades: {len(trades)} | BUY {buys} / SELL {sells}",
+            f"Win/Loss: {wins}/{losses} ({fmt_pct(win_rate, 2)})",
+            f"Volume: {fmt_money(total_notional)}",
+            f"Fees: {fmt_money(total_fees, 4)}",
+            f"Realized PnL Δ: {fmt_money(realized_delta, 4)}",
+            f"Last equity: {fmt_money(last_equity)}",
+            "",
+            f"First trade: {first_ts}",
+            f"Last trade: {last_ts}",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def compact_status() -> str:
@@ -226,10 +384,11 @@ def compact_status() -> str:
     return "\n".join(
         [
             "📊 HYPERLIQUID LIVE BOT",
+            "Execution: LIVE",
             f"Service: {'🟢' if active == 'active' else '🔴'} {active} | enabled: {enabled}",
             "",
             "⚙️ STRATÉGIA",
-            f"Állapot: {status.get('status')} | paper: {status.get('paper_mode')}",
+            f"Állapot: {status.get('status')}",
             f"Piac: {status.get('symbol')} @ {fmt_price(status.get('price'))}",
             f"Regime/mode: {status.get('regime')} / {status.get('mode')}",
             f"Risk: {risk_icon} {risk}",
@@ -268,21 +427,21 @@ def exchange_snapshot(cfg: BotConfig) -> str:
 def stop_service() -> str:
     rc, out = run_cmd(["systemctl", "stop", SERVICE_NAME], timeout=30)
     active, enabled = service_state()
-    return f"⏸ STOP\nResult: rc={rc}\nActive: {active}\nEnabled: {enabled}\n{out}".strip()
+    return f"⏸ STOP\nExecution: LIVE\nResult: rc={rc}\nActive: {active}\nEnabled: {enabled}\n{out}".strip()
 
 
 def start_service() -> str:
     rc, out = run_cmd(["systemctl", "start", SERVICE_NAME], timeout=30)
     time.sleep(2)
     active, enabled = service_state()
-    return f"▶️ START\nResult: rc={rc}\nActive: {active}\nEnabled: {enabled}\n{out}".strip()
+    return f"▶️ START\nExecution: LIVE\nResult: rc={rc}\nActive: {active}\nEnabled: {enabled}\n{out}".strip()
 
 
 def restart_service() -> str:
     rc, out = run_cmd(["systemctl", "restart", SERVICE_NAME], timeout=30)
     time.sleep(2)
     active, enabled = service_state()
-    return f"🔄 RESTART\nResult: rc={rc}\nActive: {active}\nEnabled: {enabled}\n{out}".strip()
+    return f"🔄 RESTART\nExecution: LIVE\nResult: rc={rc}\nActive: {active}\nEnabled: {enabled}\n{out}".strip()
 
 
 def cancel_all_orders(cfg: BotConfig) -> str:
@@ -291,33 +450,76 @@ def cancel_all_orders(cfg: BotConfig) -> str:
     try:
         canceled = client.cancel_all_orders(cfg.default_symbol)
     except Exception as exc:
-        return f"❌ CANCEL ERROR\n{type(exc).__name__}: {exc}\nOpen orders before: {before}"
+        return f"❌ CANCEL ERROR\nExecution: LIVE\n{type(exc).__name__}: {exc}\nOpen orders before: {before}"
     after_orders = client.get_open_orders(cfg.default_symbol)
-    return "\n".join(["🧹 CANCEL ALL", f"Open before: {before}", f"Canceled: {canceled}", f"Open after: {len(after_orders)}"])
+    return "\n".join(["🧹 CANCEL ALL", "Execution: LIVE", f"Open before: {before}", f"Canceled: {canceled}", f"Open after: {len(after_orders)}"])
+
+
+def close_position(cfg: BotConfig) -> str:
+    client = make_client(cfg)
+    position = client.get_position(cfg.default_symbol)
+    if not position:
+        return "🚪 CLOSE POSITION\nExecution: LIVE\n\n✅ Already flat."
+    try:
+        size = float(position.get("szi") or position.get("size") or 0.0)
+    except Exception:
+        size = 0.0
+    if abs(size) < 1e-12:
+        return "🚪 CLOSE POSITION\nExecution: LIVE\n\n✅ Already flat."
+
+    try:
+        client.require_live_execution_support()
+        assert client.exchange is not None
+        if hasattr(client.exchange, "market_close"):
+            result = client.exchange.market_close(cfg.default_symbol)
+        else:
+            mid = client.get_mid_price(cfg.default_symbol)
+            side = "buy" if size < 0 else "sell"
+            result = client.place_limit_order(cfg.default_symbol, side, abs(size), mid, reduce_only=True)
+    except Exception as exc:
+        return f"❌ CLOSE POSITION ERROR\nExecution: LIVE\n{type(exc).__name__}: {exc}"
+
+    after = client.get_position(cfg.default_symbol)
+    return "\n".join(
+        [
+            "🚪 CLOSE POSITION",
+            "Execution: LIVE",
+            f"Symbol: {cfg.default_symbol}",
+            f"Requested size: {fmt_num(size, 8)} BTC",
+            f"Result: {json.dumps(result, ensure_ascii=False)[:1200]}",
+            "",
+            format_position(after, cfg.default_symbol),
+        ]
+    )
 
 
 def panic(cfg: BotConfig) -> str:
-    parts = ["🚨 PANIC / SAFE MODE", stop_service(), cancel_all_orders(cfg), exchange_snapshot(cfg)]
+    parts = ["🚨 PANIC / SAFE MODE\nExecution: LIVE", stop_service(), cancel_all_orders(cfg), exchange_snapshot(cfg)]
     return "\n\n".join(parts)
 
 
 def help_text() -> str:
     return """🤖 HYPERLIQUID LIVE BOT VEZÉRLÉS
+Execution: LIVE
 
+🧭 /menu - inline gombos vezérlő menü
 📊 /status - szép bot + exchange státusz
 📋 /orders - nyitott orderek designos nézetben
 📌 /position - aktuális pozíció
+📈 /trades - utolsó trade-ek logs/trades.jsonl alapján
+📉 /performance - statisztika logs/trades.jsonl alapján
 ▶️ /startbot - live service indítása
 ⏸ /stopbot - live service leállítása
 🔄 /restartbot - live service újraindítása
 🧹 /cancelall - stop + összes open order törlése
+🚪 /closeposition - aktuális pozíció zárása
 🚨 /panic - vészstop: stop + cancel + snapshot
 ❓ /help - parancslista
 
 Biztonság:
 - Csak whitelistelt Telegram chat ID használhatja.
 - /cancelall és /panic először leállítja a service-t, hogy ne rakja vissza az ordereket.
-- Market flatten nincs automatikusan engedélyezve.
+- A veszélyes gombos műveletek külön megerősítést kérnek.
 """
 
 
@@ -326,6 +528,8 @@ def handle_command(cfg: BotConfig, text: str) -> str:
 
     if command in {"/help", "/start"}:
         return help_text()
+    if command == "/menu":
+        return menu_text()
     if command == "/status":
         return compact_status() + "\n\n" + exchange_snapshot(cfg)
     if command == "/startbot":
@@ -344,7 +548,45 @@ def handle_command(cfg: BotConfig, text: str) -> str:
     if command == "/position":
         state, _, pos = get_exchange_data(cfg)
         return format_position(pos, cfg.default_symbol) + "\n\n" + format_account(state)
-    return "Ismeretlen parancs. /help"
+    if command == "/trades":
+        return format_trades()
+    if command == "/performance":
+        return format_performance()
+    if command == "/closeposition":
+        return close_position(cfg)
+    return "Ismeretlen parancs. /help\nExecution: LIVE"
+
+
+def handle_callback(cfg: BotConfig, data: str) -> tuple[str, dict[str, Any] | None]:
+    if data == "cmd:menu":
+        return menu_text(), main_menu_keyboard()
+    if data.startswith("cmd:"):
+        action = data.split(":", 1)[1]
+        return handle_command(cfg, f"/{action}"), main_menu_keyboard()
+    if data.startswith("confirm:"):
+        action = data.split(":", 1)[1]
+        labels = {
+            "stopbot": "🛑 Stop bot",
+            "cancelall": "❌ Cancel all open orders",
+            "closeposition": "🚪 Close current position",
+        }
+        return (
+            "\n".join(
+                [
+                    "⚠️ CONFIRM ACTION",
+                    "Execution: LIVE",
+                    "",
+                    labels.get(action, action),
+                    "",
+                    "This action affects the live bot/account.",
+                ]
+            ),
+            confirm_keyboard(action),
+        )
+    if data.startswith("do:"):
+        action = data.split(":", 1)[1]
+        return handle_command(cfg, f"/{action}"), main_menu_keyboard()
+    return "Unknown button. Use /menu.\nExecution: LIVE", main_menu_keyboard()
 
 
 def read_offset() -> int | None:
@@ -368,8 +610,16 @@ def poll_loop() -> None:
     allowed = allowed_chat_ids(cfg)
     offset = read_offset()
 
-    register_bot_commands(cfg.telegram_bot_token)
-    send_message(cfg.telegram_bot_token, cfg.telegram_chat_id, "✅ Telegram live control elindult. Designos parancsok aktívak. /help")
+    try:
+        register_bot_commands(cfg.telegram_bot_token)
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        pass
+    send_message(
+        cfg.telegram_bot_token,
+        cfg.telegram_chat_id,
+        "✅ Telegram live control started.\nExecution: LIVE\n\nUse /menu for buttons.",
+        main_menu_keyboard(),
+    )
 
     while True:
         try:
@@ -383,6 +633,29 @@ def poll_loop() -> None:
                 update_id = int(update.get("update_id", 0))
                 offset = update_id + 1
                 write_offset(offset)
+
+                callback = update.get("callback_query") or {}
+                if callback:
+                    callback_id = str(callback.get("id", ""))
+                    message = callback.get("message") or {}
+                    chat = message.get("chat") or {}
+                    chat_id = str(chat.get("id", ""))
+                    data_value = str(callback.get("data", "") or "")
+
+                    if chat_id not in allowed:
+                        answer_callback(cfg.telegram_bot_token, callback_id, "Unauthorized")
+                        if cfg.telegram_chat_id:
+                            send_message(cfg.telegram_bot_token, cfg.telegram_chat_id, f"⚠️ Unauthorized Telegram button attempt chat_id={chat_id}")
+                        continue
+
+                    answer_callback(cfg.telegram_bot_token, callback_id)
+                    try:
+                        cfg = load_config()
+                        reply, markup = handle_callback(cfg, data_value)
+                    except Exception as exc:
+                        reply, markup = f"❌ Button error\nExecution: LIVE\n{type(exc).__name__}: {exc}", main_menu_keyboard()
+                    send_message(cfg.telegram_bot_token, chat_id, reply, markup)
+                    continue
 
                 message = update.get("message") or update.get("edited_message") or {}
                 chat = message.get("chat") or {}
@@ -400,11 +673,16 @@ def poll_loop() -> None:
                     cfg = load_config()
                     reply = handle_command(cfg, text)
                 except Exception as exc:
-                    reply = f"❌ Command error: {type(exc).__name__}: {exc}"
-                send_message(cfg.telegram_bot_token, chat_id, reply)
+                    reply = f"❌ Command error\nExecution: LIVE\n{type(exc).__name__}: {exc}"
+                command = text.strip().split()[0].split("@")[0].lower()
+                markup = main_menu_keyboard() if command in {"/start", "/help", "/menu"} else None
+                send_message(cfg.telegram_bot_token, chat_id, reply, markup)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            time.sleep(POLL_SLEEP_SECONDS)
+            continue
         except Exception as exc:
             try:
-                send_message(cfg.telegram_bot_token, cfg.telegram_chat_id, f"⚠️ Telegram control loop error: {type(exc).__name__}: {exc}")
+                send_message(cfg.telegram_bot_token, cfg.telegram_chat_id, f"⚠️ Telegram control loop error\nExecution: LIVE\n{type(exc).__name__}: {exc}")
             except Exception:
                 pass
             time.sleep(5)
