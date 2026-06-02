@@ -5,12 +5,32 @@ from .types import MarketRegime
 
 
 class RegimeDetector:
+    def __init__(self, trend_hold_ticks: int = 4) -> None:
+        self.trend_hold_ticks = max(int(trend_hold_ticks), 0)
+        self._last_regime: MarketRegime = MarketRegime.RANGE
+        self._trend_hold_remaining = 0
+
     def detect(
         self,
         candles: pd.DataFrame,
-        trend_lookback_candles: int = 60,
-        trend_move_threshold_pct: float = 0.006,
-        ema_slope_threshold_pct: float = 0.003,
+        trend_lookback_candles: int = 90,
+        trend_move_threshold_pct: float = 0.008,
+        ema_slope_threshold_pct: float = 0.004,
+    ) -> MarketRegime:
+        raw_regime = self._detect_raw(
+            candles,
+            trend_lookback_candles=trend_lookback_candles,
+            trend_move_threshold_pct=trend_move_threshold_pct,
+            ema_slope_threshold_pct=ema_slope_threshold_pct,
+        )
+        return self._apply_hysteresis(raw_regime)
+
+    def _detect_raw(
+        self,
+        candles: pd.DataFrame,
+        trend_lookback_candles: int,
+        trend_move_threshold_pct: float,
+        ema_slope_threshold_pct: float,
     ) -> MarketRegime:
         closes = candles["close"].astype(float)
         returns = closes.pct_change().dropna()
@@ -52,3 +72,26 @@ class RegimeDetector:
         if trend_down and not trend_up:
             return MarketRegime.TREND_DOWN
         return MarketRegime.RANGE
+
+    def _apply_hysteresis(self, raw_regime: MarketRegime) -> MarketRegime:
+        if raw_regime in {MarketRegime.RISK_OFF, MarketRegime.HIGH_VOL}:
+            self._last_regime = raw_regime
+            self._trend_hold_remaining = 0
+            return raw_regime
+
+        if raw_regime in {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN}:
+            self._last_regime = raw_regime
+            self._trend_hold_remaining = self.trend_hold_ticks
+            return raw_regime
+
+        if (
+            raw_regime == MarketRegime.RANGE
+            and self._last_regime in {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN}
+            and self._trend_hold_remaining > 0
+        ):
+            self._trend_hold_remaining -= 1
+            return self._last_regime
+
+        self._last_regime = raw_regime
+        self._trend_hold_remaining = 0
+        return raw_regime
