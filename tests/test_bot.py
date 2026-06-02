@@ -1002,3 +1002,88 @@ def test_hyperliquid_retry_skips_non_retryable_http_status(monkeypatch):
         client._retry_hyperliquid_api("test", lambda: (_ for _ in ()).throw(_http_error(400)))
 
     assert sleeps == []
+
+
+def load_telegram_control_bot_module():
+    import importlib.util
+
+    module_path = Path(__file__).resolve().parents[1] / "scripts" / "telegram_control_bot.py"
+    spec = importlib.util.spec_from_file_location("telegram_control_bot", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_pull_restart_script_uses_fixed_command_and_timeout(monkeypatch):
+    telegram_bot = load_telegram_control_bot_module()
+    calls = []
+
+    def fake_run(args, capture_output, text, timeout, check):
+        calls.append(
+            {
+                "args": args,
+                "capture_output": capture_output,
+                "text": text,
+                "timeout": timeout,
+                "check": check,
+            }
+        )
+        return subprocess.CompletedProcess(args, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(telegram_bot.subprocess, "run", fake_run)
+
+    rc, reply = telegram_bot.run_pull_restart_script()
+
+    assert rc == 0
+    assert reply == "✅ Git pull kész, LIVE bot újraindítva."
+    assert calls == [
+        {
+            "args": ["/usr/local/bin/hyperliquid_pull_restart.sh"],
+            "capture_output": True,
+            "text": True,
+            "timeout": 60,
+            "check": False,
+        }
+    ]
+
+
+def test_pull_restart_script_failure_summarizes_and_redacts_secrets(monkeypatch):
+    telegram_bot = load_telegram_control_bot_module()
+    secret_key = "0x" + "a" * 64
+
+    def fake_run(args, capture_output, text, timeout, check):
+        return subprocess.CompletedProcess(
+            args,
+            7,
+            stdout=f"HL_PRIVATE_KEY={secret_key}\nstdout detail",
+            stderr="TELEGRAM_BOT_TOKEN=123456:abcdefghijklmnopqrstuvwxyzABCDEF\nstderr detail",
+        )
+
+    monkeypatch.setattr(telegram_bot.subprocess, "run", fake_run)
+
+    rc, reply = telegram_bot.run_pull_restart_script()
+
+    assert rc == 7
+    assert "rc=7" in reply
+    assert "stdout detail" in reply
+    assert "stderr detail" in reply
+    assert secret_key not in reply
+    assert "123456:abcdefghijklmnopqrstuvwxyzABCDEF" not in reply
+    assert "[REDACTED]" in reply
+
+
+def test_pull_restart_script_timeout_returns_timeout_message(monkeypatch):
+    telegram_bot = load_telegram_control_bot_module()
+
+    def fake_run(args, capture_output, text, timeout, check):
+        raise subprocess.TimeoutExpired(args, timeout, output="partial stdout", stderr="partial stderr")
+
+    monkeypatch.setattr(telegram_bot.subprocess, "run", fake_run)
+
+    rc, reply = telegram_bot.run_pull_restart_script()
+
+    assert rc == 124
+    assert "timeout (60s)" in reply
+    assert "partial stdout" in reply
+    assert "partial stderr" in reply
