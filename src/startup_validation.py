@@ -6,6 +6,8 @@ from .hyperliquid_client import HyperliquidClient
 
 LIVE_EXECUTION_DISABLED = "live_execution_disabled"
 LIVE_EXECUTION_NOT_IMPLEMENTED = "live_execution_not_implemented"
+MICRO_LIVE_MAX_NOTIONAL_PER_TRADE_USD = 12
+MICRO_LIVE_MAX_POSITION_NOTIONAL_USD = 50
 
 
 def validate_live_execution_gate(config: BotConfig, client: HyperliquidClient | None = None) -> None:
@@ -24,10 +26,14 @@ def validate_live_execution_gate(config: BotConfig, client: HyperliquidClient | 
 def _validate_micro_live_limits(config: BotConfig) -> None:
     if config.paper_mode:
         return
-    if config.max_notional_per_trade_usd > 10:
-        raise ValueError("micro_live_limit: MAX_NOTIONAL_PER_TRADE_USD must be <= 10")
-    if config.max_position_notional_usd > 50:
-        raise ValueError("micro_live_limit: MAX_POSITION_NOTIONAL_USD must be <= 50")
+    if config.max_notional_per_trade_usd > MICRO_LIVE_MAX_NOTIONAL_PER_TRADE_USD:
+        raise ValueError(
+            f"micro_live_limit: MAX_NOTIONAL_PER_TRADE_USD must be <= {MICRO_LIVE_MAX_NOTIONAL_PER_TRADE_USD}"
+        )
+    if config.max_position_notional_usd > MICRO_LIVE_MAX_POSITION_NOTIONAL_USD:
+        raise ValueError(
+            f"micro_live_limit: MAX_POSITION_NOTIONAL_USD must be <= {MICRO_LIVE_MAX_POSITION_NOTIONAL_USD}"
+        )
     if config.base_leverage != 1 or config.leverage_min != 1 or config.leverage_max != 1:
         raise ValueError("micro_live_limit: leverage must be fixed at 1x")
     if config.daily_loss_limit_pct > 0.015:
