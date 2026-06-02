@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -15,6 +16,46 @@ logger = logging.getLogger(__name__)
 _RETRYABLE_HTTP_STATUSES = {500, 502, 503}
 _DEFAULT_RETRY_DELAYS_SECONDS = (1, 2, 5, 10)
 _R = TypeVar("_R")
+
+_SIZE_DECIMALS_BY_SYMBOL = {"BTC": 5}
+_DEFAULT_SIZE_DECIMALS = 8
+_MAX_PRICE_SIGNIFICANT_FIGURES = 5
+_MAX_PERP_PRICE_DECIMALS = 6
+
+
+def _decimal_from_number(value: float | int | str | Decimal) -> Decimal:
+    return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def normalize_price(symbol: str, price: float | int | str | Decimal) -> float:
+    """Return a Hyperliquid-safe limit price using Decimal rounding.
+
+    Hyperliquid perp prices are accepted with limited tick precision. For BTC
+    and other perps this helper rounds to at most five significant figures and
+    no more than six decimal places, which also guarantees the SDK's
+    float_to_wire conversion will not perform implicit rounding.
+    """
+    raw_price = _decimal_from_number(price)
+    if raw_price <= 0:
+        return 0.0
+
+    significant_figure_exponent = raw_price.adjusted() - _MAX_PRICE_SIGNIFICANT_FIGURES + 1
+    decimal_exponent = max(significant_figure_exponent, -_MAX_PERP_PRICE_DECIMALS)
+    quantum = Decimal(f"1e{decimal_exponent}")
+    normalized = raw_price.quantize(quantum, rounding=ROUND_HALF_UP).normalize()
+    return float(normalized)
+
+
+def normalize_size(symbol: str, size: float | int | str | Decimal) -> float:
+    """Return a Hyperliquid-safe order size rounded down for the symbol."""
+    raw_size = _decimal_from_number(size)
+    if raw_size <= 0:
+        return 0.0
+
+    decimals = _SIZE_DECIMALS_BY_SYMBOL.get(symbol.upper(), _DEFAULT_SIZE_DECIMALS)
+    quantum = Decimal(f"1e-{decimals}")
+    normalized = raw_size.quantize(quantum, rounding=ROUND_DOWN).normalize()
+    return float(normalized)
 
 
 class HyperliquidClient:

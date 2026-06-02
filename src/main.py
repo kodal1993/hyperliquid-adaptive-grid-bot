@@ -283,7 +283,7 @@ def run() -> None:
     if cfg.paper_mode:
         engine = ExecutionEngine(client=client, state_file=cfg.state_file, paper_mode=True, enable_live_trading=False, start_balance=cfg.paper_start_balance_usd, fill_model=cfg.fill_model, max_position_notional_usd=cfg.max_position_notional_usd, soft_exposure_cap_pct=cfg.soft_exposure_cap_pct, hard_exposure_cap_pct=cfg.hard_exposure_cap_pct, absolute_exposure_cap_pct=cfg.absolute_exposure_cap_pct, allow_position_flip=cfg.allow_position_flip)
     else:
-        engine = LiveExecutionEngine(client=client, state_file=cfg.state_file, start_balance=cfg.paper_start_balance_usd, fill_model=cfg.fill_model, max_position_notional_usd=cfg.max_position_notional_usd, soft_exposure_cap_pct=cfg.soft_exposure_cap_pct, hard_exposure_cap_pct=cfg.hard_exposure_cap_pct, absolute_exposure_cap_pct=cfg.absolute_exposure_cap_pct, allow_position_flip=cfg.allow_position_flip, max_notional_per_trade_usd=cfg.max_notional_per_trade_usd, leverage=cfg.base_leverage)
+        engine = LiveExecutionEngine(client=client, state_file=cfg.state_file, start_balance=cfg.paper_start_balance_usd, fill_model=cfg.fill_model, max_position_notional_usd=cfg.max_position_notional_usd, soft_exposure_cap_pct=cfg.soft_exposure_cap_pct, hard_exposure_cap_pct=cfg.hard_exposure_cap_pct, absolute_exposure_cap_pct=cfg.absolute_exposure_cap_pct, allow_position_flip=cfg.allow_position_flip, max_notional_per_trade_usd=cfg.max_notional_per_trade_usd, min_notional_usd=cfg.min_notional_usd, leverage=cfg.base_leverage)
         client.set_leverage(cfg.default_symbol, cfg.base_leverage)
     orchestrator = StrategyOrchestrator(config=cfg, execution_engine=engine)
     current_day = datetime.now(timezone.utc).date()

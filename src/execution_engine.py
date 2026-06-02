@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 import logging
+from decimal import Decimal
 from datetime import datetime, timezone
 import time
 from pathlib import Path
 
 from .grid_manager import GridPlan
-from .hyperliquid_client import HyperliquidClient
+from .hyperliquid_client import HyperliquidClient, normalize_price, normalize_size
 
 
 @dataclass
@@ -412,11 +413,13 @@ class LiveExecutionEngine(PaperExecutionEngine):
         state_file: str,
         *,
         max_notional_per_trade_usd: float = 10.0,
+        min_notional_usd: float = 10.0,
         leverage: int = 1,
         **kwargs,
     ) -> None:
         super().__init__(client=client, state_file=state_file, paper_mode=False, enable_live_trading=True, **kwargs)
         self.max_notional_per_trade_usd = max_notional_per_trade_usd
+        self.min_notional_usd = min_notional_usd
         self.leverage = leverage
         self._seen_fill_ids: set[str] = set()
         self._load_live_seen_fills()
@@ -547,17 +550,58 @@ class LiveExecutionEngine(PaperExecutionEngine):
         return new_entries
 
     def _submit_live_limit(self, symbol: str, side: str, size: float, price: float, *, reduce_only: bool) -> bool:
-        notional = abs(float(size) * float(price))
-        if notional > self.max_notional_per_trade_usd + 1e-9:
-            size = self.max_notional_per_trade_usd / max(float(price), 1e-9)
-            notional = abs(size * float(price))
-        if notional <= 0:
+        normalized_price = normalize_price(symbol, price)
+        normalized_size = normalize_size(symbol, size)
+        notional_decimal = abs(Decimal(str(normalized_size)) * Decimal(str(normalized_price)))
+        min_notional_decimal = Decimal(str(self.min_notional_usd))
+        max_notional_decimal = Decimal(str(self.max_notional_per_trade_usd))
+
+        if normalized_price <= 0 or normalized_size <= 0:
+            logger.warning(
+                "live_order_skipped reason=non_positive_normalized_order side=%s raw_price=%s raw_size=%s normalized_price=%s normalized_size=%s",
+                side,
+                price,
+                size,
+                normalized_price,
+                normalized_size,
+            )
             return False
-        if not reduce_only and abs((self.paper.position_size + _signed_order_size(side, size)) * price) > self.max_position_notional_usd + 1e-9:
-            logger.warning("live_order_blocked reason=max_position_notional side=%s price=%s size=%s", side, price, size)
+
+        if notional_decimal > max_notional_decimal:
+            capped_size_decimal = max_notional_decimal / Decimal(str(normalized_price))
+            normalized_size = normalize_size(symbol, capped_size_decimal)
+            notional_decimal = abs(Decimal(str(normalized_size)) * Decimal(str(normalized_price)))
+
+        if normalized_size <= 0 or notional_decimal < min_notional_decimal:
+            logger.warning(
+                "live_order_skipped reason=min_notional normalized_price=%s normalized_size=%s notional=%s min_notional_usd=%s",
+                normalized_price,
+                normalized_size,
+                notional_decimal,
+                self.min_notional_usd,
+            )
             return False
-        logger.info("order_submitted mode=live side=%s price=%s qty=%s reduce_only=%s", side, price, size, reduce_only)
-        self.client.place_limit_order(symbol, side, size, price, reduce_only=reduce_only)
+
+        if notional_decimal > max_notional_decimal:
+            logger.warning(
+                "live_order_skipped reason=max_notional normalized_price=%s normalized_size=%s notional=%s max_notional_per_trade_usd=%s",
+                normalized_price,
+                normalized_size,
+                notional_decimal,
+                self.max_notional_per_trade_usd,
+            )
+            return False
+
+        notional = float(notional_decimal)
+        if not reduce_only and abs((self.paper.position_size + _signed_order_size(side, normalized_size)) * normalized_price) > self.max_position_notional_usd + 1e-9:
+            logger.warning("live_order_blocked reason=max_position_notional side=%s price=%s size=%s", side, normalized_price, normalized_size)
+            return False
+        logger.info("order_submitted mode=live side=%s price=%s qty=%s notional=%s reduce_only=%s", side, normalized_price, normalized_size, notional, reduce_only)
+        try:
+            self.client.place_limit_order(symbol, side, normalized_size, normalized_price, reduce_only=reduce_only)
+        except ValueError as exc:
+            logger.warning("live_order_skipped reason=sdk_wire_rounding_error side=%s price=%s size=%s error=%s", side, normalized_price, normalized_size, exc)
+            return False
         return True
 
     def _fill_id(self, raw: dict) -> str:

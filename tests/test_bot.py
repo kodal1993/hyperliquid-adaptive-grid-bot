@@ -9,7 +9,7 @@ import requests
 
 from src.config import BotConfig
 from src.grid_manager import GridManager
-from src.hyperliquid_client import HyperliquidClient
+from src.hyperliquid_client import HyperliquidClient, normalize_price, normalize_size
 from src.regime_detector import RegimeDetector
 from src.risk_manager import RiskManager
 from src.types import MarketRegime, GridMode
@@ -856,6 +856,141 @@ def test_live_preflight_script_does_not_print_secrets():
     assert secret_key not in combined_output
     assert secret_token not in combined_output
 
+
+
+def test_btc_live_order_normalizers_use_exchange_safe_wire_precision():
+    from hyperliquid.utils.signing import float_to_wire
+
+    price = normalize_price("BTC", 71059.67467196014)
+    size = normalize_size("BTC", 0.00014072480485628953)
+
+    assert price == 71060.0
+    assert size == 0.00014
+    assert float_to_wire(price) == "71060"
+    assert float_to_wire(size) == "0.00014"
+
+
+def test_live_submit_skips_btc_order_below_min_notional_after_normalization(tmp_path, caplog):
+    from src.execution_engine import LiveExecutionEngine
+
+    class FakeLiveClient:
+        def __init__(self):
+            self.placed = []
+
+        def require_live_execution_support(self):
+            return None
+
+        def get_balance(self):
+            return {"equity": 160.0}
+
+        def get_position(self, symbol):
+            return {"coin": symbol, "szi": "0", "entryPx": "0"}
+
+        def get_open_orders(self, symbol):
+            return []
+
+        def get_user_fills(self, symbol=None):
+            return []
+
+        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False):
+            self.placed.append((symbol, side, size, price, reduce_only))
+
+    client = FakeLiveClient()
+    eng = LiveExecutionEngine(
+        client,
+        str(tmp_path / "live_state.json"),
+        start_balance=160,
+        min_notional_usd=10,
+        max_notional_per_trade_usd=50,
+        trade_ledger_csv=str(tmp_path / "trades.csv"),
+        trade_ledger_jsonl=str(tmp_path / "trades.jsonl"),
+        risk_decisions_csv=str(tmp_path / "risk.csv"),
+    )
+
+    assert not eng._submit_live_limit("BTC", "buy", 0.00014072480485628953, 71059.67467196014, reduce_only=False)
+    assert client.placed == []
+    assert "live_order_skipped reason=min_notional" in caplog.text
+
+
+def test_live_submit_sends_normalized_btc_wire_values_and_not_raw_floats(tmp_path):
+    from hyperliquid.utils.signing import float_to_wire
+    from src.execution_engine import LiveExecutionEngine
+
+    class FakeLiveClient:
+        def __init__(self):
+            self.placed = []
+
+        def require_live_execution_support(self):
+            return None
+
+        def get_balance(self):
+            return {"equity": 160.0}
+
+        def get_position(self, symbol):
+            return {"coin": symbol, "szi": "0", "entryPx": "0"}
+
+        def get_open_orders(self, symbol):
+            return []
+
+        def get_user_fills(self, symbol=None):
+            return []
+
+        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False):
+            float_to_wire(price)
+            float_to_wire(size)
+            self.placed.append((symbol, side, size, price, reduce_only))
+
+    client = FakeLiveClient()
+    eng = LiveExecutionEngine(
+        client,
+        str(tmp_path / "live_state.json"),
+        start_balance=160,
+        min_notional_usd=10,
+        max_notional_per_trade_usd=50,
+        trade_ledger_csv=str(tmp_path / "trades.csv"),
+        trade_ledger_jsonl=str(tmp_path / "trades.jsonl"),
+        risk_decisions_csv=str(tmp_path / "risk.csv"),
+    )
+
+    assert eng._submit_live_limit("BTC", "buy", 0.00028144960971257906, 71059.67467196014, reduce_only=False)
+    assert client.placed == [("BTC", "buy", 0.00028, 71060.0, False)]
+
+
+def test_live_submit_catches_sdk_wire_rounding_error_and_continues(tmp_path, caplog):
+    from src.execution_engine import LiveExecutionEngine
+
+    class FakeLiveClient:
+        def require_live_execution_support(self):
+            return None
+
+        def get_balance(self):
+            return {"equity": 160.0}
+
+        def get_position(self, symbol):
+            return {"coin": symbol, "szi": "0", "entryPx": "0"}
+
+        def get_open_orders(self, symbol):
+            return []
+
+        def get_user_fills(self, symbol=None):
+            return []
+
+        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False):
+            raise ValueError("float_to_wire causes rounding", price)
+
+    eng = LiveExecutionEngine(
+        FakeLiveClient(),
+        str(tmp_path / "live_state.json"),
+        start_balance=160,
+        min_notional_usd=10,
+        max_notional_per_trade_usd=50,
+        trade_ledger_csv=str(tmp_path / "trades.csv"),
+        trade_ledger_jsonl=str(tmp_path / "trades.jsonl"),
+        risk_decisions_csv=str(tmp_path / "risk.csv"),
+    )
+
+    assert not eng._submit_live_limit("BTC", "buy", 0.00028144960971257906, 71059.67467196014, reduce_only=False)
+    assert "live_order_skipped reason=sdk_wire_rounding_error" in caplog.text
 
 def test_live_execution_engine_does_not_use_candle_touch_fills(tmp_path):
     from src.execution_engine import LiveExecutionEngine
