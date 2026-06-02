@@ -27,35 +27,56 @@ def _decimal_from_number(value: float | int | str | Decimal) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
-def normalize_price(symbol: str, price: float | int | str | Decimal) -> float:
-    """Return a Hyperliquid-safe limit price using Decimal rounding.
+def normalize_price_decimal(symbol: str, price: float | int | str | Decimal) -> Decimal:
+    """Return a Hyperliquid-safe limit price as Decimal.
 
-    Hyperliquid perp prices are accepted with limited tick precision. For BTC
-    and other perps this helper rounds to at most five significant figures and
-    no more than six decimal places, which also guarantees the SDK's
-    float_to_wire conversion will not perform implicit rounding.
+    Hyperliquid rejects Python floats when the SDK would need to round them
+    during float_to_wire conversion. Keeping the normalization in Decimal first
+    lets all callers derive a short, deterministic decimal representation.
     """
     raw_price = _decimal_from_number(price)
     if raw_price <= 0:
-        return 0.0
+        return Decimal("0")
 
     significant_figure_exponent = raw_price.adjusted() - _MAX_PRICE_SIGNIFICANT_FIGURES + 1
     decimal_exponent = max(significant_figure_exponent, -_MAX_PERP_PRICE_DECIMALS)
     quantum = Decimal(f"1e{decimal_exponent}")
-    normalized = raw_price.quantize(quantum, rounding=ROUND_HALF_UP).normalize()
-    return float(normalized)
+    return raw_price.quantize(quantum, rounding=ROUND_HALF_UP).normalize()
+
+
+def normalize_size_decimal(symbol: str, size: float | int | str | Decimal) -> Decimal:
+    """Return a Hyperliquid-safe order size as Decimal, rounded down."""
+    raw_size = _decimal_from_number(size)
+    if raw_size <= 0:
+        return Decimal("0")
+
+    decimals = _SIZE_DECIMALS_BY_SYMBOL.get(symbol.upper(), _DEFAULT_SIZE_DECIMALS)
+    quantum = Decimal(f"1e-{decimals}")
+    return raw_size.quantize(quantum, rounding=ROUND_DOWN).normalize()
+
+
+def normalize_price(symbol: str, price: float | int | str | Decimal) -> float:
+    """Return a Hyperliquid-safe limit price using Decimal rounding."""
+    return float(normalize_price_decimal(symbol, price))
 
 
 def normalize_size(symbol: str, size: float | int | str | Decimal) -> float:
     """Return a Hyperliquid-safe order size rounded down for the symbol."""
-    raw_size = _decimal_from_number(size)
-    if raw_size <= 0:
-        return 0.0
+    return float(normalize_size_decimal(symbol, size))
 
-    decimals = _SIZE_DECIMALS_BY_SYMBOL.get(symbol.upper(), _DEFAULT_SIZE_DECIMALS)
-    quantum = Decimal(f"1e-{decimals}")
-    normalized = raw_size.quantize(quantum, rounding=ROUND_DOWN).normalize()
-    return float(normalized)
+
+def _wire_float(value: Decimal) -> float:
+    """Convert a normalized Decimal to a short float for the Hyperliquid SDK.
+
+    The SDK currently accepts numeric floats, but it raises
+    ``float_to_wire causes rounding`` when raw binary floats carry excess
+    precision. Passing through a fixed decimal string first prevents accidental
+    values such as 71059.67467196014 or 0.00014072480485628953 from reaching
+    the SDK.
+    """
+    if value <= 0:
+        return 0.0
+    return float(format(value, "f"))
 
 
 class HyperliquidClient:
@@ -267,13 +288,31 @@ class HyperliquidClient:
     ) -> Any:
         self.require_live_execution_support()
         assert self.exchange is not None
+        normalized_size_decimal = normalize_size_decimal(symbol, size)
+        normalized_price_decimal = normalize_price_decimal(symbol, price)
+        normalized_size = _wire_float(normalized_size_decimal)
+        normalized_price = _wire_float(normalized_price_decimal)
+        if normalized_size <= 0 or normalized_price <= 0:
+            raise ValueError(
+                f"invalid_normalized_order: symbol={symbol} side={side} raw_size={size} raw_price={price} normalized_size={normalized_size} normalized_price={normalized_price}"
+            )
+        logger.debug(
+            "place_limit_order_normalized symbol=%s side=%s raw_size=%s raw_price=%s normalized_size=%s normalized_price=%s reduce_only=%s",
+            symbol,
+            side,
+            size,
+            price,
+            normalized_size,
+            normalized_price,
+            reduce_only,
+        )
         return self._retry_hyperliquid_api(
             "Exchange.order",
             lambda: self.exchange.order(
                 symbol,
                 side.lower() == "buy",
-                float(size),
-                float(price),
+                normalized_size,
+                normalized_price,
                 {"limit": {"tif": "Gtc"}},
                 reduce_only=reduce_only,
             ),
