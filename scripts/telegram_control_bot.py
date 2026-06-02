@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -24,13 +26,18 @@ TRADES_FILE = Path(os.getenv("TELEGRAM_CONTROL_TRADES_FILE", "logs/trades.jsonl"
 OFFSET_FILE = Path(os.getenv("TELEGRAM_CONTROL_OFFSET_FILE", "state/telegram_control.offset"))
 POLL_TIMEOUT_SECONDS = int(os.getenv("TELEGRAM_CONTROL_POLL_TIMEOUT_SECONDS", "25"))
 POLL_SLEEP_SECONDS = float(os.getenv("TELEGRAM_CONTROL_POLL_SLEEP_SECONDS", "1"))
+PULL_RESTART_SCRIPT = "/usr/local/bin/hyperliquid_pull_restart.sh"
+PULL_RESTART_TIMEOUT_SECONDS = 60
 MAX_MESSAGE_LEN = 3800
+logger = logging.getLogger(__name__)
 BOT_COMMANDS = [
     {"command": "menu", "description": "Inline vezérlő menü"},
     {"command": "status", "description": "Bot + exchange státusz"},
     {"command": "startbot", "description": "Live bot service indítása"},
     {"command": "stopbot", "description": "Live bot service leállítása"},
     {"command": "restartbot", "description": "Live bot service újraindítása"},
+    {"command": "pull", "description": "Git pull + LIVE bot újraindítás"},
+    {"command": "update", "description": "Git pull + LIVE bot újraindítás"},
     {"command": "cancelall", "description": "Stop + összes open order törlése"},
     {"command": "panic", "description": "Vészstop: stop + cancel + snapshot"},
     {"command": "orders", "description": "Open orderek lekérése"},
@@ -134,6 +141,53 @@ def run_cmd(args: list[str], *, timeout: int = 30) -> tuple[int, str]:
     except Exception as exc:
         return 1, f"{type(exc).__name__}: {exc}"
 
+
+
+def redact_sensitive_output(text: str) -> str:
+    redacted = text
+    redacted = re.sub(
+        r"(?i)(telegram[_-]?(?:bot[_-]?)?token|hl[_-]?private[_-]?key|private[_-]?key|secret|password|passphrase|api[_-]?key)\s*([:=])\s*([^\s]+)",
+        r"\1\2[REDACTED]",
+        redacted,
+    )
+    redacted = re.sub(r"(?i)(bot)[0-9]{5,}:[A-Za-z0-9_-]{20,}", r"\1[REDACTED]", redacted)
+    redacted = re.sub(r"(?i)0x[a-f0-9]{64}", "0x[REDACTED]", redacted)
+    return redacted
+
+
+def summarize_command_output(stdout: str, stderr: str, *, max_chars: int = 3000) -> str:
+    output = "\n".join(part for part in [stdout.strip(), stderr.strip()] if part)
+    if not output:
+        return "(nincs stdout/stderr)"
+    output = redact_sensitive_output(output)
+    if len(output) > max_chars:
+        output = output[:max_chars].rstrip() + "\n... (truncated)"
+    return output
+
+
+def run_pull_restart_script() -> tuple[int, str]:
+    logger.info("Telegram /pull execution starting script=%s timeout=%ss", PULL_RESTART_SCRIPT, PULL_RESTART_TIMEOUT_SECONDS)
+    try:
+        completed = subprocess.run(
+            [PULL_RESTART_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=PULL_RESTART_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        summary = summarize_command_output(exc.stdout or "", exc.stderr or "")
+        logger.warning("Telegram /pull execution timed out script=%s timeout=%ss", PULL_RESTART_SCRIPT, PULL_RESTART_TIMEOUT_SECONDS)
+        return 124, f"❌ Git pull / restart timeout ({PULL_RESTART_TIMEOUT_SECONDS}s).\n{summary}"
+    except Exception as exc:
+        logger.exception("Telegram /pull execution failed before completion script=%s", PULL_RESTART_SCRIPT)
+        return 1, f"❌ Git pull / restart hiba.\n{type(exc).__name__}: {redact_sensitive_output(str(exc))}"
+
+    summary = summarize_command_output(completed.stdout or "", completed.stderr or "")
+    logger.info("Telegram /pull execution finished script=%s rc=%s", PULL_RESTART_SCRIPT, completed.returncode)
+    if completed.returncode == 0:
+        return completed.returncode, "✅ Git pull kész, LIVE bot újraindítva."
+    return completed.returncode, f"❌ Git pull / restart hiba (rc={completed.returncode}).\n{summary}"
 
 def fmt_money(value: Any, digits: int = 2) -> str:
     try:
@@ -511,6 +565,7 @@ Execution: LIVE
 ▶️ /startbot - live service indítása
 ⏸ /stopbot - live service leállítása
 🔄 /restartbot - live service újraindítása
+⬇️ /pull vagy /update - fix git pull + LIVE bot újraindító script futtatása
 🧹 /cancelall - stop + összes open order törlése
 🚪 /closeposition - aktuális pozíció zárása
 🚨 /panic - vészstop: stop + cancel + snapshot
@@ -538,6 +593,8 @@ def handle_command(cfg: BotConfig, text: str) -> str:
         return stop_service()
     if command == "/restartbot":
         return restart_service()
+    if command in {"/pull", "/update"}:
+        return "Use the Telegram poll loop for /pull or /update so progress messages can be sent safely."
     if command == "/cancelall":
         return stop_service() + "\n\n" + cancel_all_orders(cfg)
     if command == "/panic":
@@ -664,6 +721,25 @@ def poll_loop() -> None:
                 if not text.startswith("/"):
                     continue
 
+                command = text.strip().split()[0].split("@")[0].lower()
+
+                if command in {"/pull", "/update"}:
+                    cfg = load_config()
+                    if chat_id != cfg.telegram_chat_id:
+                        logger.warning("Unauthorized Telegram /pull attempt chat_id=%s", chat_id)
+                        if cfg.telegram_chat_id:
+                            send_message(cfg.telegram_bot_token, cfg.telegram_chat_id, f"⚠️ Jogosulatlan Telegram /pull próbálkozás chat_id={chat_id}")
+                        continue
+
+                    send_message(
+                        cfg.telegram_bot_token,
+                        chat_id,
+                        f"⏳ Git pull + LIVE bot újraindítás indul. Timeout: {PULL_RESTART_TIMEOUT_SECONDS}s.\nExecution: LIVE",
+                    )
+                    _, reply = run_pull_restart_script()
+                    send_message(cfg.telegram_bot_token, chat_id, reply)
+                    continue
+
                 if chat_id not in allowed:
                     if cfg.telegram_chat_id:
                         send_message(cfg.telegram_bot_token, cfg.telegram_chat_id, f"⚠️ Jogosulatlan Telegram command próbálkozás chat_id={chat_id}: {text[:80]}")
@@ -674,7 +750,6 @@ def poll_loop() -> None:
                     reply = handle_command(cfg, text)
                 except Exception as exc:
                     reply = f"❌ Command error\nExecution: LIVE\n{type(exc).__name__}: {exc}"
-                command = text.strip().split()[0].split("@")[0].lower()
                 markup = main_menu_keyboard() if command in {"/start", "/help", "/menu"} else None
                 send_message(cfg.telegram_bot_token, chat_id, reply, markup)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
@@ -690,4 +765,5 @@ def poll_loop() -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
     poll_loop()
