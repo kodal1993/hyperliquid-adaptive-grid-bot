@@ -22,6 +22,9 @@ class StrategyOrchestrator:
         self.risk = RiskManager(config.max_drawdown_pct, config.daily_loss_limit_pct)
         self.grid_manager = GridManager()
         self.last_recenter_ts: datetime | None = None
+        self.last_trend_regime: MarketRegime | None = None
+        self.trend_flip_cooldown_remaining = 0
+        self.trend_flip_cooldown_ticks = 6
 
     def on_tick(self, candles: pd.DataFrame, equity: float, daily_pnl_pct: float, symbol: str, position_notional: float = 0.0) -> dict:
         regime = self.detector.detect(candles, trend_lookback_candles=self.config.trend_lookback_candles, trend_move_threshold_pct=self.config.trend_move_threshold_pct, ema_slope_threshold_pct=self.config.ema_slope_threshold_pct)
@@ -53,6 +56,19 @@ class StrategyOrchestrator:
                 mode = GridMode.SHORT_BIASED
             else:
                 neutral_entries_blocked = True
+
+        trend_flip_detected = False
+        if regime in {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN}:
+            if self.last_trend_regime in {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN} and self.last_trend_regime != regime:
+                trend_flip_detected = True
+                self.trend_flip_cooldown_remaining = self.trend_flip_cooldown_ticks
+                logger.info(
+                    "trend_flip_detected previous=%s current=%s cooldown_ticks=%s",
+                    self.last_trend_regime.value,
+                    regime.value,
+                    self.trend_flip_cooldown_remaining,
+                )
+            self.last_trend_regime = regime
 
         vol = candles["close"].pct_change().std()
         order_size = self._calculate_order_size(price)
@@ -96,9 +112,29 @@ class StrategyOrchestrator:
                 allow_sells = False
 
         if regime == MarketRegime.TREND_UP and mode == GridMode.LONG_BIASED and not force_reduce_only:
-            allow_sells = False
+            allow_sells = effective_position_side == "SHORT"
         if regime == MarketRegime.TREND_DOWN and mode == GridMode.SHORT_BIASED and not force_reduce_only:
-            allow_buys = False
+            allow_buys = effective_position_side == "LONG"
+
+        # Trend flip protection:
+        # When the detector flips TREND_DOWN <-> TREND_UP, do not immediately
+        # open the opposite direction while flat. First allow only exposure
+        # reduction for an existing wrong-way position, then wait a few ticks.
+        # This prevents one large losing flip from wiping several small grid wins.
+        flip_cooldown_active = self.trend_flip_cooldown_remaining > 0
+        if flip_cooldown_active and not force_reduce_only:
+            if effective_position_side == "FLAT":
+                allow_buys = False
+                allow_sells = False
+                self.trend_flip_cooldown_remaining -= 1
+            elif regime == MarketRegime.TREND_UP and effective_position_side == "SHORT":
+                allow_buys = True
+                allow_sells = False
+            elif regime == MarketRegime.TREND_DOWN and effective_position_side == "LONG":
+                allow_buys = False
+                allow_sells = True
+            else:
+                self.trend_flip_cooldown_remaining = max(self.trend_flip_cooldown_remaining - 1, 0)
 
         # Critical dust fix: if the remaining position is only dust, treat the bot as flat.
         # In RANGE/neutral this must restore a two-sided grid instead of leaving only a
@@ -119,7 +155,20 @@ class StrategyOrchestrator:
             liquidation_distance_pct=liquidation_distance_pct, min_liquidation_distance_pct=self.config.liquidation_distance_min_pct,
             attempted_side=attempted_side, would_increase_exposure=would_increase_exposure,
         )
-        logger.info("risk_check risk_state=%s pause_reason=%s current_position_notional=%.2f effective_position_notional=%.2f is_dust_position=%s max_position_notional_usd=%.2f attempted_side=%s would_increase_exposure=%s exposure_reducing_override=%s decision=%s", risk_state.reason or "ok", "" if risk_state.can_trade else risk_state.reason, raw_position_notional, effective_position_notional, is_dust_position, self.config.max_position_notional_usd, attempted_side, would_increase_exposure, risk_state.exposure_reducing_override, risk_state.decision)
+        logger.info(
+            "risk_check risk_state=%s pause_reason=%s current_position_notional=%.2f effective_position_notional=%.2f is_dust_position=%s max_position_notional_usd=%.2f attempted_side=%s would_increase_exposure=%s exposure_reducing_override=%s decision=%s trend_flip_cooldown_remaining=%s",
+            risk_state.reason or "ok",
+            "" if risk_state.can_trade else risk_state.reason,
+            raw_position_notional,
+            effective_position_notional,
+            is_dust_position,
+            self.config.max_position_notional_usd,
+            attempted_side,
+            would_increase_exposure,
+            risk_state.exposure_reducing_override,
+            risk_state.decision,
+            self.trend_flip_cooldown_remaining,
+        )
         if effective_position_notional > self.config.max_position_notional_usd:
             canceled = self.execution_engine.cancel_all_orders(symbol)
             flattened = False
@@ -169,6 +218,7 @@ class StrategyOrchestrator:
             "recenter_blocked_by_cooldown": recenter_blocked_by_cooldown,
             "force_recenter": force_recenter,
             "in_position_for_recenter": in_position,
+            "trend_flip_cooldown_remaining": self.trend_flip_cooldown_remaining,
         }
 
         plan: GridPlan = self.grid_manager.build_grid(price, self.config.grid_levels, self.config.grid_spacing_pct, float(vol), regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=allow_buys, allow_sells=allow_sells, force_recenter=force_recenter)
