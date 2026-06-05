@@ -1735,3 +1735,43 @@ def test_daily_pnl_baseline_calculation_is_equity_based():
     assert metrics["net_daily_pnl"] == pytest.approx(1.0)
     assert metrics["daily_pnl_pct"] == pytest.approx(1.0 / 160.0)
     assert metrics["daily_pnl_pct"] < 0.61
+
+
+def test_minimum_expected_edge_filter_blocks_fee_dominated_entries(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MIN_EXPECTED_NET_EDGE_USD", "999")
+    cfg = BotConfig.from_env()
+    eng = make_test_engine(tmp_path, "state.json")
+    orchestrator = StrategyOrchestrator(cfg, eng)
+    plan = GridManager().build_grid(100, 2, 0.003, 0.0, MarketRegime.RANGE, 1, 0.0, 0.0, GridMode.NEUTRAL)
+
+    edge = orchestrator._apply_minimum_expected_edge_filter(plan, mid_price=100, position_size=0.0)
+
+    assert edge["edge_filter_skipped_orders"] == 4
+    assert len(plan.long_levels) == 0
+    assert len(plan.short_levels) == 0
+    assert edge["expected_net_edge"] is not None
+
+
+def test_trade_analytics_report_calculates_profitability_metrics(tmp_path):
+    from src.main import _trade_analytics_report
+
+    trades = tmp_path / "trades.csv"
+    trades.write_text(
+        "timestamp,symbol,side,price,qty,notional,fee,realized_pnl_delta,realized_pnl_total,cash,equity,position_size,position_notional,regime,mode,risk_state,pause_reason,reason\n"
+        "2026-01-01T00:00:00+00:00,BTC,buy,10000,1,10000,0.04,0,0,500,500,1,100,RANGE,neutral,OK,,grid_fill\n"
+        "2026-01-01T00:10:00+00:00,BTC,sell,10100,1,10100,0.04,1,1,501,501,0,0,RANGE,neutral,OK,,grid_fill\n"
+        "2026-01-01T00:20:00+00:00,BTC,sell,10000,1,10000,0.04,0,1,501,501,-1,100,TREND_DOWN,short_biased,OK,,grid_fill\n"
+        "2026-01-01T00:30:00+00:00,BTC,buy,10100,1,10100,0.04,-1,0,500,500,0,0,TREND_DOWN,short_biased,OK,,grid_fill\n"
+    )
+
+    report = _trade_analytics_report("BTC", trades)
+
+    assert report["avg_winner"] == pytest.approx(1.0)
+    assert report["avg_loser"] == pytest.approx(-1.0)
+    assert report["profit_factor"] == pytest.approx(1.0)
+    assert report["expectancy"] == pytest.approx(-0.04)
+    assert report["fee_gross_profit_ratio"] == pytest.approx(0.16)
+    assert report["average_holding_time_seconds"] == pytest.approx(600.0)
+    assert report["pnl_by_regime"]["RANGE"] == pytest.approx(0.92)
+    assert report["pnl_by_regime"]["TREND_DOWN"] == pytest.approx(-1.08)

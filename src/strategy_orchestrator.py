@@ -414,21 +414,138 @@ class StrategyOrchestrator:
         if effective_grid_levels <= 0 and (allow_buys or allow_sells):
             logger.warning("no_new_order_placed reason=max_exposure_too_small_for_min_order order_notional=%.4f threshold=%.4f", order_notional, threshold)
         plan: GridPlan = self.grid_manager.build_grid(price, max(effective_grid_levels, 1), final_spacing_pct, 0.0, regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=build_allow_buys, allow_sells=build_allow_sells, force_recenter=force_recenter, spacing_source=spacing_source, atr_pct=atr_pct, trend_bias=trend_bias, regime_confidence=regime_confidence)
+        edge_context = self._apply_minimum_expected_edge_filter(plan, mid_price=price, position_size=effective_position_size)
         try:
             result = self.execution_engine.cancel_replace_grid(symbol, plan)
         except Exception as exc:
             logger.warning("state_uncertain_skip_cycle reason=grid_rebuild_api_error error=%s", exc)
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "allowed_to_trade": False, "allowed_to_reduce": False, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "allowed_to_trade": False, "allowed_to_reduce": False, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
         if result.get("error"):
             logger.warning("state_uncertain_skip_cycle reason=%s", result.get("error"))
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "orders": result, "allowed_to_trade": False, "allowed_to_reduce": False, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "orders": result, "allowed_to_trade": False, "allowed_to_reduce": False, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
         logger.info("grid_state regime=%s mode=%s position_side=%s open_orders_before=%s buy_before=%s sell_before=%s allow_buys=%s allow_sells=%s placed=%s canceled=%s order_notional=%.4f spacing_source=%s atr_pct=%.6f final_spacing_pct=%.6f state_source=%s", regime.value, mode.value, effective_position_side, len(open_orders), buy_order_count, sell_order_count, allow_buys, allow_sells, result.get("placed", 0), result.get("canceled", 0), order_notional, spacing_source, atr_pct, final_spacing_pct, account_state.state_source)
         if neutral_entries_blocked and abs(effective_position_size) > 1e-12:
-            return {"status": "managing_position", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": False, "allowed_to_reduce": True, "reason": "neutral_entries_blocked_in_trend", "position_management_action": "reduce_only_grid", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context}
+            return {"status": "managing_position", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": False, "allowed_to_reduce": True, "reason": "neutral_entries_blocked_in_trend", "position_management_action": "reduce_only_grid", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
         if neutral_entries_blocked:
             canceled = self.execution_engine.cancel_all_orders(symbol)
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context}
-        return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
+        return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
+
+
+    def _apply_minimum_expected_edge_filter(self, plan: GridPlan, *, mid_price: float, position_size: float) -> dict:
+        """Remove exposure-building grid orders whose expected net edge cannot pay fees.
+
+        Expected edge is evaluated as a round-trip grid capture: the distance from
+        the candidate entry price back to the current grid center, minus estimated
+        entry and exit fees. Exposure-reducing orders are never blocked by this
+        profitability filter because exits are risk-management actions.
+        """
+        estimates: list[dict] = []
+        kept_long = []
+        kept_short = []
+        skipped = 0
+        skipped_by_reason: dict[str, int] = {}
+        fee_rate = max(float(getattr(self.execution_engine, "fee_rate", 0.0)), 0.0)
+        min_edge_usd = max(float(self.config.min_expected_net_edge_usd), 0.0)
+        min_edge_pct = max(float(self.config.min_expected_net_edge_pct), 0.0)
+        min_rr = max(float(self.config.min_rr_ratio), 0.0)
+
+        for order in plan.long_levels + plan.short_levels:
+            action = self._classify_order_action(position_size, order.side, order.size)
+            estimate = self._expected_edge_for_order(
+                price=order.price,
+                size=order.size,
+                mid_price=mid_price,
+                grid_spacing_pct=plan.spacing_pct,
+                fee_rate=fee_rate,
+            )
+            estimate.update({"side": order.side, "price": order.price, "size": order.size, "exposure_action": action})
+            block_reason = ""
+            if action not in {"reducing", "flat"}:
+                if estimate["expected_net_edge"] <= 0:
+                    block_reason = "non_positive_expected_net_edge"
+                elif estimate["expected_net_edge"] < min_edge_usd:
+                    block_reason = "below_min_expected_net_edge_usd"
+                elif estimate["expected_net_edge_pct"] < min_edge_pct:
+                    block_reason = "below_min_expected_net_edge_pct"
+                elif estimate["rr_ratio"] < min_rr:
+                    block_reason = "below_min_rr_ratio"
+
+            estimate["edge_filter_decision"] = "block" if block_reason else "allow"
+            estimate["edge_filter_reason"] = block_reason
+            estimates.append(estimate)
+            if block_reason:
+                skipped += 1
+                skipped_by_reason[block_reason] = skipped_by_reason.get(block_reason, 0) + 1
+                logger.info(
+                    "order_skipped reason=edge_filter side=%s price=%s size=%s expected_move_pct=%.6f grid_spacing_pct=%.6f expected_gross_pnl=%.6f expected_fee_cost=%.6f expected_net_edge=%.6f expected_net_edge_pct=%.6f rr_ratio=%.3f block_reason=%s",
+                    order.side,
+                    order.price,
+                    order.size,
+                    estimate["expected_move_pct"],
+                    estimate["grid_spacing_pct"],
+                    estimate["expected_gross_pnl"],
+                    estimate["expected_fee_cost"],
+                    estimate["expected_net_edge"],
+                    estimate["expected_net_edge_pct"],
+                    estimate["rr_ratio"],
+                    block_reason,
+                )
+                continue
+            if order.side == "buy":
+                kept_long.append(order)
+            else:
+                kept_short.append(order)
+
+        plan.long_levels = kept_long
+        plan.short_levels = kept_short
+        allowed_estimates = [e for e in estimates if e["edge_filter_decision"] == "allow"]
+        best = max(allowed_estimates or estimates, key=lambda e: e["expected_net_edge"], default={})
+        return {
+            "edge_filter_enabled": True,
+            "edge_filter_skipped_orders": skipped,
+            "edge_filter_skipped_by_reason": skipped_by_reason,
+            "min_expected_net_edge_usd": min_edge_usd,
+            "min_expected_net_edge_pct": min_edge_pct,
+            "min_rr_ratio": min_rr,
+            "expected_move_pct": best.get("expected_move_pct"),
+            "expected_gross_pnl": best.get("expected_gross_pnl"),
+            "expected_fee_cost": best.get("expected_fee_cost"),
+            "expected_net_edge": best.get("expected_net_edge"),
+            "expected_net_edge_pct": best.get("expected_net_edge_pct"),
+            "expected_rr_ratio": best.get("rr_ratio"),
+        }
+
+    def _expected_edge_for_order(self, *, price: float, size: float, mid_price: float, grid_spacing_pct: float, fee_rate: float) -> dict:
+        notional = abs(price * size)
+        expected_move_pct = abs(mid_price - price) / max(price, 1e-9)
+        expected_gross_pnl = notional * expected_move_pct
+        expected_fee_cost = notional * fee_rate * 2
+        expected_net_edge = expected_gross_pnl - expected_fee_cost
+        expected_net_edge_pct = expected_net_edge / max(notional, 1e-9)
+        rr_ratio = expected_gross_pnl / max(expected_fee_cost, 1e-9)
+        return {
+            "expected_move_pct": expected_move_pct,
+            "grid_spacing_pct": grid_spacing_pct,
+            "expected_gross_pnl": expected_gross_pnl,
+            "expected_fee_cost": expected_fee_cost,
+            "expected_net_edge": expected_net_edge,
+            "expected_net_edge_pct": expected_net_edge_pct,
+            "rr_ratio": rr_ratio,
+        }
+
+    def _classify_order_action(self, position_size: float, side: str, qty: float) -> str:
+        signed_order = qty if side.lower() == "buy" else -qty
+        pos_after = position_size + signed_order
+        if abs(position_size) < 1e-12:
+            return "increasing"
+        if abs(pos_after) < 1e-12:
+            return "flat"
+        if position_size * pos_after < 0:
+            return "flipping"
+        if abs(pos_after) > abs(position_size):
+            return "increasing"
+        return "reducing"
 
     def _expected_min_entry_levels(self, mode: GridMode, allowed_buys: bool, allowed_sells: bool) -> int:
         buy_count, sell_count = self.grid_manager._level_counts(self.config.grid_levels, mode)

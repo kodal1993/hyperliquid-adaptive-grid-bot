@@ -39,6 +39,9 @@ class BotConfig:
     max_active_exposure_usd: float
     regrid_threshold_pct: float
     min_grid_profit_over_fees_pct: float
+    min_expected_net_edge_usd: float
+    min_expected_net_edge_pct: float
+    min_rr_ratio: float
     max_notional_per_trade_usd: float
     min_order_size: float
     max_order_size: float
@@ -141,6 +144,9 @@ class BotConfig:
             max_active_exposure_usd=float(os.getenv("MAX_ACTIVE_EXPOSURE_USD", "50")),
             regrid_threshold_pct=float(os.getenv("REGRID_THRESHOLD_PCT", "0.003")),
             min_grid_profit_over_fees_pct=float(os.getenv("MIN_GRID_PROFIT_OVER_FEES_PCT", "0.0005")),
+            min_expected_net_edge_usd=float(os.getenv("MIN_EXPECTED_NET_EDGE_USD", "0")),
+            min_expected_net_edge_pct=float(os.getenv("MIN_EXPECTED_NET_EDGE_PCT", "0")),
+            min_rr_ratio=float(os.getenv("MIN_RR_RATIO", "1.0")),
             max_notional_per_trade_usd=float(os.getenv("MAX_NOTIONAL_PER_TRADE_USD", os.getenv("ORDER_NOTIONAL_USD", "10"))),
             min_order_size=float(os.getenv("MIN_ORDER_SIZE", "0.0001")),
             max_order_size=float(os.getenv("MAX_ORDER_SIZE", "10")),

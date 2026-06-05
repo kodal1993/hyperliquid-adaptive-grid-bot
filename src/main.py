@@ -220,6 +220,80 @@ def _trade_stats_window(now_ts: float, expected_symbol: str, window_seconds: int
     return stats
 
 
+
+def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV) -> dict:
+    analytics = {
+        "avg_winner": 0.0,
+        "avg_loser": 0.0,
+        "profit_factor": 0.0,
+        "expectancy": 0.0,
+        "fee_gross_profit_ratio": 0.0,
+        "average_holding_time_seconds": 0.0,
+        "pnl_by_regime": {},
+        "pnl_long_trades": 0.0,
+        "pnl_short_trades": 0.0,
+    }
+    if not csv_path.exists():
+        return analytics
+
+    winners: list[float] = []
+    losers: list[float] = []
+    gross_profit = 0.0
+    gross_loss = 0.0
+    total_fees = 0.0
+    net_pnl = 0.0
+    trade_count = 0
+    pnl_by_regime: Counter[str] = Counter()
+    holding_times: list[float] = []
+    open_position_started_at: datetime | None = None
+    previous_position_size = 0.0
+
+    with csv_path.open(encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if not _is_valid_trade_row(row, expected_symbol):
+                continue
+            ts = _parse_iso_utc(str(row.get("timestamp", "")))
+            fee = _safe_float(row.get("fee")) or 0.0
+            realized = _safe_float(row.get("realized_pnl_delta")) or 0.0
+            net = realized - fee
+            total_fees += fee
+            net_pnl += net
+            trade_count += 1
+            regime = str(row.get("regime") or "unknown")
+            pnl_by_regime[regime] += net
+            side = str(row.get("side", "")).lower()
+            if side == "buy":
+                analytics["pnl_long_trades"] += net
+            elif side == "sell":
+                analytics["pnl_short_trades"] += net
+            if realized > 0:
+                winners.append(realized)
+                gross_profit += realized
+            elif realized < 0:
+                losers.append(realized)
+                gross_loss += abs(realized)
+
+            position_size = _safe_float(row.get("position_size"))
+            if position_size is not None and ts is not None:
+                if abs(previous_position_size) < 1e-12 and abs(position_size) > 1e-12:
+                    open_position_started_at = ts
+                if open_position_started_at is not None and abs(previous_position_size) > 1e-12 and (
+                    abs(position_size) < 1e-12 or previous_position_size * position_size < 0 or realized != 0
+                ):
+                    holding_times.append(max((ts - open_position_started_at).total_seconds(), 0.0))
+                    open_position_started_at = ts if abs(position_size) > 1e-12 else None
+                previous_position_size = position_size
+
+    analytics["avg_winner"] = sum(winners) / len(winners) if winners else 0.0
+    analytics["avg_loser"] = sum(losers) / len(losers) if losers else 0.0
+    analytics["profit_factor"] = gross_profit / gross_loss if gross_loss > 1e-12 else (gross_profit if gross_profit > 0 else 0.0)
+    analytics["expectancy"] = net_pnl / trade_count if trade_count else 0.0
+    analytics["fee_gross_profit_ratio"] = total_fees / gross_profit if gross_profit > 1e-12 else 0.0
+    analytics["average_holding_time_seconds"] = sum(holding_times) / len(holding_times) if holding_times else 0.0
+    analytics["pnl_by_regime"] = dict(pnl_by_regime)
+    return analytics
+
+
 def _parse_iso_utc(ts_raw: str) -> datetime | None:
     if not ts_raw:
         return None
@@ -426,6 +500,7 @@ def run() -> None:
         _write_last_100_real_trades(TRADES_CSV, LAST_100_REAL_TRADES_CSV, cfg.default_symbol)
         blocked_1h, blocked_by_reason_1h, last_block_reason = _risk_block_stats_window(now_ts=time.time())
         trade_stats_1h = _trade_stats_window(now_ts=time.time(), expected_symbol=cfg.default_symbol)
+        trade_analytics = _trade_analytics_report(cfg.default_symbol)
         position_side = "FLAT"
         if account_state.position_size > 0:
             position_side = "LONG"
@@ -500,6 +575,23 @@ def run() -> None:
                 "fees_30m": trade_stats_1h["fees"],
                 "realized_pnl_delta_30m": trade_stats_1h["realized_pnl_delta"],
                 "no_fill_cycles": engine.no_fill_cycles,
+                "avg_winner": trade_analytics["avg_winner"],
+                "avg_loser": trade_analytics["avg_loser"],
+                "profit_factor": trade_analytics["profit_factor"],
+                "expectancy": trade_analytics["expectancy"],
+                "fee_gross_profit_ratio": trade_analytics["fee_gross_profit_ratio"],
+                "average_holding_time_seconds": trade_analytics["average_holding_time_seconds"],
+                "pnl_by_regime": trade_analytics["pnl_by_regime"],
+                "pnl_long_trades": trade_analytics["pnl_long_trades"],
+                "pnl_short_trades": trade_analytics["pnl_short_trades"],
+                "edge_filter_skipped_orders": status.get("edge_filter_skipped_orders", 0),
+                "edge_filter_skipped_by_reason": status.get("edge_filter_skipped_by_reason", {}),
+                "expected_move_pct": status.get("expected_move_pct"),
+                "expected_gross_pnl": status.get("expected_gross_pnl"),
+                "expected_fee_cost": status.get("expected_fee_cost"),
+                "expected_net_edge": status.get("expected_net_edge"),
+                "expected_net_edge_pct": status.get("expected_net_edge_pct"),
+                "expected_rr_ratio": status.get("expected_rr_ratio"),
                 "orphan_order_cleanup_count": status.get("orphan_order_cleanup_count", 0),
                 "stale_order_cleanup_count": status.get("stale_order_cleanup_count", 0),
                 "orphan_order_detected": bool(status.get("orphan_order_detected", False)),
