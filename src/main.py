@@ -145,18 +145,31 @@ def _read_last_valid_trade(csv_path: Path, expected_symbol: str) -> dict:
     return last
 
 
+def _sanitize_trade_csv_row(row: dict) -> dict:
+    sanitized = {key: value for key, value in row.items() if key is not None}
+    if len(sanitized) != len(row):
+        logger.warning("malformed_trade_csv_row_skipped_or_sanitized")
+    return sanitized
+
+
 def _write_last_100_real_trades(csv_path: Path, out_path: Path, expected_symbol: str) -> None:
     if not csv_path.exists():
         return
     rows: list[dict] = []
+    fields: list[str] = []
     with csv_path.open(encoding="utf-8") as f:
-        for row in csv.DictReader(f):
+        for raw_row in csv.DictReader(f):
+            row = _sanitize_trade_csv_row(raw_row)
             if _is_valid_trade_row(row, expected_symbol):
                 rows.append(row)
+                for key in row:
+                    if key not in fields:
+                        fields.append(key)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fields = list(rows[0].keys()) if rows else ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_size", "position_notional", "regime", "mode", "risk_state", "pause_reason", "reason"]
+    if not fields:
+        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_size", "position_notional", "regime", "mode", "risk_state", "pause_reason", "reason"]
     with out_path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows[-100:])
 
@@ -493,7 +506,10 @@ def run() -> None:
         }
 
         last_trade = _read_last_valid_trade(TRADES_CSV, cfg.default_symbol)
-        _write_last_100_real_trades(TRADES_CSV, LAST_100_REAL_TRADES_CSV, cfg.default_symbol)
+        try:
+            _write_last_100_real_trades(TRADES_CSV, LAST_100_REAL_TRADES_CSV, cfg.default_symbol)
+        except Exception:
+            logger.exception("last_100_real_trades_export_failed")
         blocked_1h, blocked_by_reason_1h, last_block_reason = _risk_block_stats_window(now_ts=time.time())
         trade_stats_1h = _trade_stats_window(now_ts=time.time(), expected_symbol=cfg.default_symbol)
         trade_analytics = _trade_analytics_report(cfg.default_symbol)

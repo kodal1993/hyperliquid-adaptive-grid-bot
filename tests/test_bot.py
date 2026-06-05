@@ -577,6 +577,27 @@ def test_last_valid_trade_ignores_invalid_btc_prices(tmp_path):
     assert float(row["price"]) == 80564.96
 
 
+def test_write_last_100_real_trades_sanitizes_extra_delimiter_rows(tmp_path, caplog):
+    from src.main import _write_last_100_real_trades
+
+    trades_csv = tmp_path / "trades.csv"
+    out_csv = tmp_path / "last_100_real_trades.csv"
+    trades_csv.write_text(
+        "timestamp,symbol,side,price,qty,notional\n"
+        "2026-05-08T12:05:00+00:00,BTC,buy,80564.96,0.001,80.56,unexpected_extra_value\n",
+        encoding="utf-8",
+    )
+
+    _write_last_100_real_trades(trades_csv, out_csv, "BTC")
+
+    output = out_csv.read_text(encoding="utf-8")
+    assert out_csv.exists()
+    assert "None" not in output
+    assert "unexpected_extra_value" not in output
+    assert "80564.96" in output
+    assert "malformed_trade_csv_row_skipped_or_sanitized" in caplog.text
+
+
 def test_telegram_interval_logic():
     interval = 300
     last = 0
