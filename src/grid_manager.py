@@ -48,13 +48,13 @@ class GridManager:
         buy_level_count, sell_level_count = self._level_counts(levels, mode)
 
         for i in range(1, buy_level_count + 1):
-            if allow_buys and mode in (GridMode.NEUTRAL, GridMode.LONG_BIASED):
+            if allow_buys:
                 long_levels.append(
                     GridLevel(price=mid_price * (1 - spacing * i), side="buy", size=order_size)
                 )
 
         for i in range(1, sell_level_count + 1):
-            if allow_sells and mode in (GridMode.NEUTRAL, GridMode.SHORT_BIASED):
+            if allow_sells:
                 short_levels.append(
                     GridLevel(price=mid_price * (1 + spacing * i), side="sell", size=order_size)
                 )
