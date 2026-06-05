@@ -38,12 +38,16 @@ class StrategyOrchestrator:
         effective_position_notional = 0.0 if is_dust_position else raw_position_notional
         effective_position_size = 0.0 if is_dust_position else pos_size
         effective_position_side = "LONG" if effective_position_size > 0 else ("SHORT" if effective_position_size < 0 else "FLAT")
+        auto_dust_cleanup_usd = max(float(self.config.auto_dust_cleanup_usd), 0.0)
+        dust_cleanup_requested = 0 < raw_position_notional < auto_dust_cleanup_usd
         dust_context = {
             "position_notional_raw": raw_position_notional,
             "effective_position_notional": effective_position_notional,
             "effective_position_side": effective_position_side,
             "is_dust_position": is_dust_position,
             "dust_threshold_usd": dust_threshold_usd,
+            "auto_dust_cleanup_usd": auto_dust_cleanup_usd,
+            "dust_cleanup_requested": dust_cleanup_requested,
         }
 
         mode = GridMode.NEUTRAL
@@ -58,6 +62,31 @@ class StrategyOrchestrator:
                 mode = GridMode.SHORT_BIASED
             else:
                 neutral_entries_blocked = True
+
+        if dust_cleanup_requested:
+            canceled = self.execution_engine.cancel_all_orders(symbol)
+            flattened = self.execution_engine.flatten_position(symbol, price)
+            logger.warning(
+                "dust_cleanup_requested symbol=%s position_notional=%.8f threshold_usd=%.2f canceled=%s flattened=%s",
+                symbol,
+                raw_position_notional,
+                auto_dust_cleanup_usd,
+                canceled,
+                flattened,
+            )
+            return {
+                "status": "managing_position",
+                "regime": regime.value,
+                "risk": None,
+                "mode": mode.value,
+                "reason": "dust_cleanup_requested",
+                "allowed_to_trade": False,
+                "allowed_to_reduce": True,
+                "canceled_orders": canceled,
+                "flattened": flattened,
+                "position_management_action": "flatten_dust",
+                **dust_context,
+            }
 
         trend_flip_detected = False
         if regime in {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN}:
