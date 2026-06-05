@@ -13,6 +13,22 @@ from .hyperliquid_client import HyperliquidClient, normalize_price, normalize_si
 
 
 @dataclass
+class AccountState:
+    state_source: str
+    equity: float
+    position_size: float
+    avg_entry: float
+    position_notional: float
+    unrealized_pnl: float
+    realized_pnl: float
+    fees_paid: float
+    daily_start_equity: float
+    daily_start_realized_pnl: float
+    daily_start_fees_paid: float
+    current_day: str
+
+
+@dataclass
 class PaperState:
     cash: float
     position_size: float = 0.0
@@ -89,6 +105,22 @@ class PaperExecutionEngine:
     def save_state(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state_file.write_text(json.dumps(asdict(self.paper), indent=2), encoding="utf-8")
+
+    def account_state(self, symbol: str, mark_price: float) -> AccountState:
+        return AccountState(
+            state_source="paper",
+            equity=self.equity(mark_price),
+            position_size=self.paper.position_size,
+            avg_entry=self.paper.avg_entry,
+            position_notional=abs(self.paper.position_size * mark_price),
+            unrealized_pnl=self.unrealized_pnl(mark_price),
+            realized_pnl=self.paper.realized_pnl,
+            fees_paid=self.paper.fees_paid,
+            daily_start_equity=self.paper.daily_start_equity,
+            daily_start_realized_pnl=self.paper.daily_start_realized_pnl,
+            daily_start_fees_paid=self.paper.daily_start_fees_paid,
+            current_day=self.paper.current_day,
+        )
 
     def cancel_replace_grid(self, symbol: str, plan: GridPlan) -> dict[str, int | str]:
         self._require_paper_execution("cancel_replace_grid")
@@ -470,6 +502,30 @@ class LiveExecutionEngine(PaperExecutionEngine):
             self.paper.daily_start_equity = self.paper.daily_start_equity or self.paper.cash
         self.sync_open_orders(symbol)
         return {"equity": self.paper.cash, "position_size": size, "avg_entry": entry_px, "open_orders": len(self.open_orders)}
+
+
+    def account_state(self, symbol: str, mark_price: float) -> AccountState:
+        self.sync_account(symbol, mark_price)
+        unrealized = 0.0
+        try:
+            position = self.client.get_position(symbol)
+            unrealized = float(position.get("unrealizedPnl", position.get("unrealized_pnl", 0.0)) or 0.0)
+        except Exception:
+            unrealized = 0.0
+        return AccountState(
+            state_source="live",
+            equity=self.paper.cash,
+            position_size=self.paper.position_size,
+            avg_entry=self.paper.avg_entry,
+            position_notional=abs(self.paper.position_size * mark_price),
+            unrealized_pnl=unrealized,
+            realized_pnl=self.paper.realized_pnl,
+            fees_paid=self.paper.fees_paid,
+            daily_start_equity=self.paper.daily_start_equity,
+            daily_start_realized_pnl=self.paper.daily_start_realized_pnl,
+            daily_start_fees_paid=self.paper.daily_start_fees_paid,
+            current_day=self.paper.current_day,
+        )
 
     def sync_open_orders(self, symbol: str) -> list[dict]:
         orders: list[dict] = []

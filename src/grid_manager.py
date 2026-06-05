@@ -11,6 +11,12 @@ class GridPlan:
     long_levels: list[GridLevel]
     short_levels: list[GridLevel]
     should_regrid: bool
+    spacing_pct: float = 0.0
+    spacing_source: str = "fixed_pct"
+    atr_pct: float = 0.0
+    grid_levels: int = 0
+    trend_bias: float = 0.5
+    regime_confidence: float = 0.0
 
 
 class GridManager:
@@ -32,6 +38,10 @@ class GridManager:
         allow_buys: bool = True,
         allow_sells: bool = True,
         force_recenter: bool = False,
+        spacing_source: str = "fixed_plus_vol_multiplier",
+        atr_pct: float = 0.0,
+        trend_bias: float = 0.70,
+        regime_confidence: float = 0.0,
     ) -> GridPlan:
         spacing = base_spacing_pct * (1 + volatility)
         should_regrid = (
@@ -45,7 +55,7 @@ class GridManager:
 
         long_levels: list[GridLevel] = []
         short_levels: list[GridLevel] = []
-        buy_level_count, sell_level_count = self._level_counts(levels, mode)
+        buy_level_count, sell_level_count = self._level_counts(levels, mode, trend_bias=trend_bias)
 
         for i in range(1, buy_level_count + 1):
             if allow_buys:
@@ -62,23 +72,35 @@ class GridManager:
         if should_regrid:
             self.last_mid = mid_price
             self.last_regime = regime
-        return GridPlan(regime=regime, mode=mode, long_levels=long_levels, short_levels=short_levels, should_regrid=should_regrid)
+        return GridPlan(
+            regime=regime,
+            mode=mode,
+            long_levels=long_levels,
+            short_levels=short_levels,
+            should_regrid=should_regrid,
+            spacing_pct=spacing,
+            spacing_source=spacing_source,
+            atr_pct=atr_pct,
+            grid_levels=max(int(levels), 1),
+            trend_bias=trend_bias,
+            regime_confidence=regime_confidence,
+        )
 
-    def _level_counts(self, levels: int, mode: GridMode) -> tuple[int, int]:
+    def _level_counts(self, levels: int, mode: GridMode, *, trend_bias: float = 0.70) -> tuple[int, int]:
         """Return buy/sell level counts for the current strategy mode.
 
-        RANGE/neutral stays symmetric. Trend-biased modes are deliberately
-        asymmetric so the bot spends most of its order capacity in the trend
-        direction while still allowing a small amount of passive exit/rebalance
-        structure when the orchestrator permits it.
+        RANGE/neutral stays symmetric. Trend-biased modes are asymmetric, but
+        default to a safer 70/30 split. Strong confidence can lift this to
+        80/20, while weak confidence can ease it toward 60/40.
         """
         levels = max(int(levels), 1)
+        bias = max(0.5, min(float(trend_bias), 0.9))
         if mode == GridMode.LONG_BIASED:
-            trend_levels = max(1, round(levels * 0.8))
+            trend_levels = max(1, round(levels * bias))
             counter_levels = max(1, levels - trend_levels)
             return trend_levels, counter_levels
         if mode == GridMode.SHORT_BIASED:
-            trend_levels = max(1, round(levels * 0.8))
+            trend_levels = max(1, round(levels * bias))
             counter_levels = max(1, levels - trend_levels)
             return counter_levels, trend_levels
         return levels, levels

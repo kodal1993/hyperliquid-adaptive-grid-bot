@@ -23,6 +23,20 @@ class BotConfig:
     grid_levels: int
     grid_spacing_pct: float
     grid_spacing_vol_multiplier: float
+    grid_spacing_min_pct: float
+    grid_spacing_max_pct: float
+    min_grid_levels: int
+    max_grid_levels: int
+    vol_low_threshold: float
+    vol_high_threshold: float
+    vol_extreme_threshold: float
+    trend_bias_base: float
+    trend_bias_strong: float
+    trend_bias_weak: float
+    trend_confidence_strong: float
+    trend_confidence_weak: float
+    order_notional_usd: float
+    max_active_exposure_usd: float
     regrid_threshold_pct: float
     min_grid_profit_over_fees_pct: float
     max_notional_per_trade_usd: float
@@ -108,16 +122,30 @@ class BotConfig:
             leverage_min=int(os.getenv("LEVERAGE_MIN", "3")),
             leverage_max=int(os.getenv("LEVERAGE_MAX", "8")),
             base_leverage=int(os.getenv("BASE_LEVERAGE", "5")),
-            grid_levels=int(os.getenv("GRID_LEVELS", "8")),
+            grid_levels=int(os.getenv("GRID_LEVELS", "3")),
             grid_spacing_pct=float(os.getenv("GRID_SPACING_PCT", "0.003")),
             grid_spacing_vol_multiplier=float(os.getenv("GRID_SPACING_VOL_MULTIPLIER", "1.2")),
+            grid_spacing_min_pct=float(os.getenv("GRID_SPACING_MIN_PCT", "0.0015")),
+            grid_spacing_max_pct=float(os.getenv("GRID_SPACING_MAX_PCT", "0.012")),
+            min_grid_levels=int(os.getenv("MIN_GRID_LEVELS", "2")),
+            max_grid_levels=int(os.getenv("MAX_GRID_LEVELS", "4")),
+            vol_low_threshold=float(os.getenv("VOL_LOW_THRESHOLD", "0.003")),
+            vol_high_threshold=float(os.getenv("VOL_HIGH_THRESHOLD", "0.012")),
+            vol_extreme_threshold=float(os.getenv("VOL_EXTREME_THRESHOLD", "0.025")),
+            trend_bias_base=float(os.getenv("TREND_BIAS_BASE", "0.70")),
+            trend_bias_strong=float(os.getenv("TREND_BIAS_STRONG", "0.80")),
+            trend_bias_weak=float(os.getenv("TREND_BIAS_WEAK", "0.60")),
+            trend_confidence_strong=float(os.getenv("TREND_CONFIDENCE_STRONG", "0.75")),
+            trend_confidence_weak=float(os.getenv("TREND_CONFIDENCE_WEAK", "0.35")),
+            order_notional_usd=float(os.getenv("ORDER_NOTIONAL_USD", os.getenv("MAX_NOTIONAL_PER_TRADE_USD", "10"))),
+            max_active_exposure_usd=float(os.getenv("MAX_ACTIVE_EXPOSURE_USD", "50")),
             regrid_threshold_pct=float(os.getenv("REGRID_THRESHOLD_PCT", "0.003")),
             min_grid_profit_over_fees_pct=float(os.getenv("MIN_GRID_PROFIT_OVER_FEES_PCT", "0.0005")),
-            max_notional_per_trade_usd=float(os.getenv("MAX_NOTIONAL_PER_TRADE_USD", "50")),
+            max_notional_per_trade_usd=float(os.getenv("MAX_NOTIONAL_PER_TRADE_USD", os.getenv("ORDER_NOTIONAL_USD", "10"))),
             min_order_size=float(os.getenv("MIN_ORDER_SIZE", "0.0001")),
             max_order_size=float(os.getenv("MAX_ORDER_SIZE", "10")),
             min_notional_usd=float(os.getenv("MIN_NOTIONAL_USD", "10")),
-            max_position_notional_usd=float(os.getenv("MAX_POSITION_NOTIONAL_USD", "500")),
+            max_position_notional_usd=float(os.getenv("MAX_POSITION_NOTIONAL_USD", "50")),
             max_one_direction_exposure_pct=float(os.getenv("MAX_ONE_DIRECTION_EXPOSURE_PCT", "0.6")),
             max_directional_exposure_pct=float(os.getenv("MAX_DIRECTIONAL_EXPOSURE_PCT", "0.65")),
             max_drawdown_pct=float(os.getenv("MAX_DRAWDOWN_PCT", "0.30")),
