@@ -2,6 +2,7 @@ import os
 import subprocess
 import tempfile
 from datetime import datetime, timezone
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -1421,3 +1422,149 @@ def test_pull_restart_script_timeout_returns_timeout_message(monkeypatch):
     assert "timeout (60s)" in reply
     assert "partial stdout" in reply
     assert "partial stderr" in reply
+
+
+def _cfg_for_grid_tests(monkeypatch):
+    monkeypatch.delenv("ENV_PROFILE", raising=False)
+    cfg = BotConfig.from_env()
+    cfg.allow_long_biased = True
+    cfg.allow_short_biased = True
+    cfg.grid_levels = 4
+    cfg.max_notional_per_trade_usd = 10
+    cfg.min_notional_usd = 1
+    cfg.min_order_size = 0
+    cfg.max_order_size = 10
+    cfg.max_position_notional_usd = 50
+    cfg.max_directional_exposure_pct = 1.0
+    cfg.recenter_cooldown_seconds = 3600
+    cfg.stale_order_max_age_sec = 1800
+    return cfg
+
+
+def test_flat_one_sell_order_orphan_cancel_and_grid_rebuild(tmp_path, monkeypatch):
+    cfg = _cfg_for_grid_tests(monkeypatch)
+    eng = make_test_engine(tmp_path, "orphan_sell.json", paper_mode=True)
+    eng.open_orders = [{"symbol": "BTC", "side": "sell", "price": 201.0, "size": 0.01}]
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [200 - i for i in range(80)], "high": [201 - i for i in range(80)], "low": [199 - i for i in range(80)]})
+
+    status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status["orphan_order_detected"] is True
+    assert status["orphan_order_cleanup_count"] == 1
+    assert status["cleanup_canceled_orders"] == 1
+    assert status["force_recenter"] is True
+    assert len(eng.open_orders) >= 2
+    assert all(o["side"] == "sell" for o in eng.open_orders)
+
+
+def test_flat_one_buy_order_orphan_cancel_and_grid_rebuild(tmp_path, monkeypatch):
+    cfg = _cfg_for_grid_tests(monkeypatch)
+    eng = make_test_engine(tmp_path, "orphan_buy.json", paper_mode=True)
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 0.1}]
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 + i for i in range(80)], "high": [101 + i for i in range(80)], "low": [99 + i for i in range(80)]})
+
+    status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status["orphan_order_detected"] is True
+    assert status["cleanup_canceled_orders"] == 1
+    assert len(eng.open_orders) >= 2
+    assert all(o["side"] == "buy" for o in eng.open_orders)
+
+
+def test_flat_no_orders_rebuilds_grid_even_without_price_recenter(tmp_path, monkeypatch):
+    cfg = _cfg_for_grid_tests(monkeypatch)
+    eng = make_test_engine(tmp_path, "flat_no_orders.json", paper_mode=True)
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [101 for _ in range(80)], "low": [99 for _ in range(80)]})
+    first = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+    assert first["status"] == "running"
+    eng.open_orders = []
+
+    status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status["flat_without_orders"] is True
+    assert status["force_recenter"] is True
+    assert len(eng.open_orders) > 0
+
+
+def test_long_position_sell_tp_is_not_orphan_deleted(tmp_path, monkeypatch):
+    cfg = _cfg_for_grid_tests(monkeypatch)
+    eng = make_test_engine(tmp_path, "long_tp.json", paper_mode=True)
+    eng.paper.position_size = 1.0
+    eng.open_orders = [{"symbol": "BTC", "side": "sell", "price": 102.0, "size": 1.0, "reduce_only": True}]
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [101 for _ in range(80)], "low": [99 for _ in range(80)]})
+
+    status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=40.0)
+
+    assert status["orphan_order_detected"] is False
+    assert status["cleanup_canceled_orders"] == 0
+
+
+def test_short_position_buy_tp_is_not_orphan_deleted(tmp_path, monkeypatch):
+    cfg = _cfg_for_grid_tests(monkeypatch)
+    eng = make_test_engine(tmp_path, "short_tp.json", paper_mode=True)
+    eng.paper.position_size = -1.0
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 98.0, "size": 1.0, "reduce_only": True}]
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [101 for _ in range(80)], "low": [99 for _ in range(80)]})
+
+    status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=40.0)
+
+    assert status["orphan_order_detected"] is False
+    assert status["cleanup_canceled_orders"] == 0
+
+
+def test_stale_flat_order_older_than_timeout_cancelled(tmp_path, monkeypatch):
+    cfg = _cfg_for_grid_tests(monkeypatch)
+    eng = make_test_engine(tmp_path, "stale.json", paper_mode=True)
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 0.1, "created_ts": time.time() - 3600}]
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [101 for _ in range(80)], "low": [99 for _ in range(80)]})
+
+    status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status["stale_order_detected"] is True
+    assert status["stale_order_cleanup_count"] == 1
+    assert status["cleanup_canceled_orders"] == 1
+
+
+def test_daily_pnl_calculation_uses_daily_start_equity_baseline():
+    from src.main import calculate_daily_pnl_metrics
+
+    metrics = calculate_daily_pnl_metrics(
+        current_equity=161.74,
+        daily_start_equity=161.475,
+        realized_pnl_total=1.265,
+        daily_start_realized_pnl=1.0,
+        unrealized_pnl=0.0,
+        fees_paid_total=0.12,
+        daily_start_fees_paid=0.10,
+    )
+
+    assert metrics["daily_pnl"] == pytest.approx(0.265)
+    assert metrics["daily_pnl_pct"] == pytest.approx(0.265 / 161.475)
+    assert metrics["daily_realized_pnl"] == pytest.approx(0.265)
+    assert metrics["daily_fees"] == pytest.approx(0.02)
+
+
+def test_small_equity_grid_does_not_exceed_max_active_exposure(tmp_path, monkeypatch):
+    cfg = _cfg_for_grid_tests(monkeypatch)
+    cfg.grid_levels = 8
+    cfg.max_notional_per_trade_usd = 12
+    cfg.min_notional_usd = 8
+    cfg.max_position_notional_usd = 40
+    cfg.max_directional_exposure_pct = 1.0
+    eng = make_test_engine(tmp_path, "small_equity.json", paper_mode=True)
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [101 for _ in range(80)], "low": [99 for _ in range(80)]})
+
+    status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    buy_exposure = sum(o["price"] * o["size"] for o in eng.open_orders if o["side"] == "buy")
+    sell_exposure = sum(o["price"] * o["size"] for o in eng.open_orders if o["side"] == "sell")
+    assert status["status"] == "running"
+    assert buy_exposure <= 40.0 + 1e-6
+    assert sell_exposure <= 40.0 + 1e-6

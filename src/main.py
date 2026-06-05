@@ -37,11 +37,33 @@ def to_df(candles: list[dict]) -> pd.DataFrame:
 def _paper_metrics(cfg: BotConfig, engine: ExecutionEngine, client: HyperliquidClient, latest_close: float) -> tuple[float, float, float]:
     if cfg.paper_mode:
         return engine.unrealized_pnl(latest_close), engine.equity(latest_close), abs(engine.paper.position_size * latest_close)
+    unrealized = 0.0
     if hasattr(engine, "sync_account"):
         engine.sync_account(cfg.default_symbol, latest_close)
+        try:
+            pos = client.get_position(cfg.default_symbol)
+            unrealized = float(pos.get("unrealizedPnl", pos.get("unrealized_pnl", 0.0)) or 0.0)
+        except Exception:
+            unrealized = 0.0
     equity = client.get_balance().get("equity", cfg.paper_start_balance_usd)
     position_notional = abs(engine.paper.position_size * latest_close)
-    return 0.0, equity, position_notional
+    return unrealized, equity, position_notional
+
+
+def calculate_daily_pnl_metrics(*, current_equity: float, daily_start_equity: float, realized_pnl_total: float, daily_start_realized_pnl: float, unrealized_pnl: float, fees_paid_total: float, daily_start_fees_paid: float) -> dict:
+    daily_pnl_usd = current_equity - daily_start_equity
+    daily_realized_pnl = realized_pnl_total - daily_start_realized_pnl
+    daily_fees = fees_paid_total - daily_start_fees_paid
+    return {
+        "account_equity": current_equity,
+        "daily_start_equity": daily_start_equity,
+        "daily_realized_pnl": daily_realized_pnl,
+        "daily_unrealized_pnl": unrealized_pnl,
+        "daily_fees": daily_fees,
+        "net_daily_pnl": daily_pnl_usd,
+        "daily_pnl": daily_pnl_usd,
+        "daily_pnl_pct": 0.0 if daily_start_equity <= 0 else daily_pnl_usd / daily_start_equity,
+    }
 
 
 def _write_status(payload: dict) -> None:
@@ -289,7 +311,9 @@ def run() -> None:
     current_day = datetime.now(timezone.utc).date()
     if engine.paper.current_day:
         current_day = datetime.fromisoformat(engine.paper.current_day).date()
-    daily_start_equity = engine.paper.daily_start_equity if engine.paper.daily_start_equity > 0 else cfg.paper_start_balance_usd
+    daily_start_equity = engine.paper.daily_start_equity
+    daily_start_realized_pnl = engine.paper.daily_start_realized_pnl
+    daily_start_fees_paid = engine.paper.daily_start_fees_paid
 
     last_telegram_report_ts = 0.0
     last_pause_reason = ""
@@ -306,13 +330,27 @@ def run() -> None:
         latest_close = float(candles["close"].iloc[-1])
         unrealized_pnl, equity, position_notional = _paper_metrics(cfg, engine, client, latest_close)
         now_day = datetime.now(timezone.utc).date()
+        if daily_start_equity <= 0 or not engine.paper.current_day:
+            daily_start_equity = equity
+            daily_start_realized_pnl = engine.paper.realized_pnl
+            daily_start_fees_paid = engine.paper.fees_paid
+            engine.paper.current_day = now_day.isoformat()
+            engine.paper.daily_start_equity = daily_start_equity
+            engine.paper.daily_start_realized_pnl = daily_start_realized_pnl
+            engine.paper.daily_start_fees_paid = daily_start_fees_paid
+            engine.save_state()
         if now_day != current_day:
             current_day = now_day
             daily_start_equity = equity
+            daily_start_realized_pnl = engine.paper.realized_pnl
+            daily_start_fees_paid = engine.paper.fees_paid
             engine.paper.current_day = current_day.isoformat()
             engine.paper.daily_start_equity = daily_start_equity
+            engine.paper.daily_start_realized_pnl = daily_start_realized_pnl
+            engine.paper.daily_start_fees_paid = daily_start_fees_paid
             engine.save_state()
-        daily_pnl_pct = 0.0 if daily_start_equity <= 0 else (equity - daily_start_equity) / daily_start_equity
+        daily_metrics = calculate_daily_pnl_metrics(current_equity=equity, daily_start_equity=daily_start_equity, realized_pnl_total=engine.paper.realized_pnl, daily_start_realized_pnl=daily_start_realized_pnl, unrealized_pnl=unrealized_pnl, fees_paid_total=engine.paper.fees_paid, daily_start_fees_paid=daily_start_fees_paid)
+        daily_pnl_pct = daily_metrics["daily_pnl_pct"]
 
         status = orchestrator.on_tick(candles, equity=equity, daily_pnl_pct=daily_pnl_pct, symbol=cfg.default_symbol, position_notional=position_notional)
         risk = status.get("risk")
@@ -326,6 +364,7 @@ def run() -> None:
         fills = engine.on_candle(latest_candle, regime=status.get("regime", "unknown"), mode=mode, risk_state=risk_state, pause_reason=reason, strategy_status=strategy_status)
         trade_events = engine.consume_trade_log()
         unrealized_pnl, equity, position_notional = _paper_metrics(cfg, engine, client, latest_close)
+        daily_metrics = calculate_daily_pnl_metrics(current_equity=equity, daily_start_equity=daily_start_equity, realized_pnl_total=engine.paper.realized_pnl, daily_start_realized_pnl=daily_start_realized_pnl, unrealized_pnl=unrealized_pnl, fees_paid_total=engine.paper.fees_paid, daily_start_fees_paid=daily_start_fees_paid)
 
         for tr in trade_events:
             logger.info("trade_event side=%s symbol=%s price=%.6f qty=%.8f", tr["side"], tr["symbol"], tr["price"], tr["qty"])
@@ -430,8 +469,14 @@ def run() -> None:
                 "position_management_action": status.get("position_management_action", "none"),
                 "total_pnl": engine.paper.realized_pnl + unrealized_pnl,
                 "total_pnl_pct": ((engine.paper.realized_pnl + unrealized_pnl) / cfg.paper_start_balance_usd) if cfg.paper_start_balance_usd > 0 else None,
-                "daily_pnl": equity - daily_start_equity,
-                "daily_pnl_pct": daily_pnl_pct,
+                "account_equity": daily_metrics["account_equity"],
+                "daily_start_equity": daily_metrics["daily_start_equity"],
+                "daily_realized_pnl": daily_metrics["daily_realized_pnl"],
+                "daily_unrealized_pnl": daily_metrics["daily_unrealized_pnl"],
+                "daily_fees": daily_metrics["daily_fees"],
+                "net_daily_pnl": daily_metrics["net_daily_pnl"],
+                "daily_pnl": daily_metrics["daily_pnl"],
+                "daily_pnl_pct": daily_metrics["daily_pnl_pct"],
                 "unrealized_pnl_pct": ((unrealized_pnl / abs(engine.paper.avg_entry * engine.paper.position_size)) if abs(engine.paper.avg_entry * engine.paper.position_size) > 1e-9 else 0.0),
                 "exposure_pct": (position_notional / equity) if equity > 1e-9 else 0.0,
                 "avg_entry": engine.paper.avg_entry,
@@ -448,6 +493,12 @@ def run() -> None:
                 "fees_30m": trade_stats_1h["fees"],
                 "realized_pnl_delta_30m": trade_stats_1h["realized_pnl_delta"],
                 "no_fill_cycles": engine.no_fill_cycles,
+                "orphan_order_cleanup_count": status.get("orphan_order_cleanup_count", 0),
+                "stale_order_cleanup_count": status.get("stale_order_cleanup_count", 0),
+                "orphan_order_detected": bool(status.get("orphan_order_detected", False)),
+                "stale_order_detected": bool(status.get("stale_order_detected", False)),
+                "cleanup_canceled_orders": status.get("cleanup_canceled_orders", 0),
+                "state_uncertain_skip_cycle": bool(status.get("state_uncertain_skip_cycle", False)),
             }
         )
         last_trade_ts = _resolve_last_real_trade_ts(cfg.default_symbol, fallback=(engine.last_real_trade_ts.isoformat() if engine.last_real_trade_ts else ""))
@@ -516,6 +567,8 @@ def run() -> None:
 
         engine.paper.current_day = current_day.isoformat()
         engine.paper.daily_start_equity = daily_start_equity
+        engine.paper.daily_start_realized_pnl = daily_start_realized_pnl
+        engine.paper.daily_start_fees_paid = daily_start_fees_paid
         engine.save_state()
         time.sleep(cfg.tick_seconds)
 

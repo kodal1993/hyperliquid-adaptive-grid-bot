@@ -36,10 +36,10 @@ class Handler(BaseHTTPRequestHandler):
 <style>body{{font-family:Arial;padding:20px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:6px;font-size:12px}}</style></head><body>
 <h2>Hyperliquid Adaptive Grid Bot</h2>
 <ul>
-<li>equity: {status.get('equity')}</li><li>realized_pnl: {status.get('realized_pnl')}</li><li>unrealized_pnl: {status.get('unrealized_pnl')}</li><li>fees_paid: {status.get('fees_paid')}</li>
+<li>account_equity: {status.get('account_equity', status.get('equity'))}</li><li>daily_start_equity: {status.get('daily_start_equity')}</li><li>daily_realized_pnl: {status.get('daily_realized_pnl')}</li><li>daily_unrealized_pnl: {status.get('daily_unrealized_pnl')}</li><li>daily_fees: {status.get('daily_fees')}</li><li>net_daily_pnl: {status.get('net_daily_pnl')}</li><li>daily_pnl_pct: {status.get('daily_pnl_pct')}</li><li>realized_pnl: {status.get('realized_pnl')}</li><li>unrealized_pnl: {status.get('unrealized_pnl')}</li><li>fees_paid: {status.get('fees_paid')}</li>
 <li>cash: {status.get('cash')}</li><li>position_size: {status.get('position_size')}</li><li>position_notional: {status.get('position_notional')}</li>
 <li>symbol: {status.get('symbol')}</li><li>price: {status.get('price')}</li><li>regime: {status.get('regime')}</li><li>mode: {status.get('mode')}</li>
-<li>risk_state: {status.get('risk_state')}</li><li>pause_reason: {status.get('pause_reason') or 'none'}</li><li>updated: {status.get('timestamp')}</li>
+<li>risk_state: {status.get('risk_state')}</li><li>pause_reason: {status.get('pause_reason') or 'none'}</li><li>orphan_order_cleanup_count: {status.get('orphan_order_cleanup_count', 0)}</li><li>stale_order_cleanup_count: {status.get('stale_order_cleanup_count', 0)}</li><li>updated: {status.get('timestamp')}</li>
 </ul>
 <h3>Last Trades</h3><table><tr>{''.join(f'<th>{k}</th>' for k in (trades[0].keys() if trades else []))}</tr>
 {''.join('<tr>' + ''.join(f'<td>{v}</td>' for v in t.values()) + '</tr>' for t in trades)}
