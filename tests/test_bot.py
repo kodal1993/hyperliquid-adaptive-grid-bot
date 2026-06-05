@@ -912,6 +912,114 @@ def test_live_submit_skips_btc_order_below_min_notional_after_normalization(tmp_
     assert "live_order_skipped reason=min_notional" in caplog.text
 
 
+
+def test_live_submit_allows_reduce_only_btc_order_below_min_notional_after_normalization(tmp_path):
+    from src.execution_engine import LiveExecutionEngine
+
+    class FakeLiveClient:
+        def __init__(self):
+            self.placed = []
+
+        def require_live_execution_support(self):
+            return None
+
+        def get_balance(self):
+            return {"equity": 160.0}
+
+        def get_position(self, symbol):
+            return {"coin": symbol, "szi": "0", "entryPx": "0"}
+
+        def get_open_orders(self, symbol):
+            return []
+
+        def get_user_fills(self, symbol=None):
+            return []
+
+        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False):
+            self.placed.append((symbol, side, size, price, reduce_only))
+
+    client = FakeLiveClient()
+    eng = LiveExecutionEngine(
+        client,
+        str(tmp_path / "live_state.json"),
+        start_balance=160,
+        min_notional_usd=10,
+        max_notional_per_trade_usd=50,
+        trade_ledger_csv=str(tmp_path / "trades.csv"),
+        trade_ledger_jsonl=str(tmp_path / "trades.jsonl"),
+        risk_decisions_csv=str(tmp_path / "risk.csv"),
+    )
+
+    assert eng._submit_live_limit("BTC", "sell", 0.00001, 71059.67467196014, reduce_only=True)
+    assert client.placed == [("BTC", "sell", 0.00001, 71060.0, True)]
+
+
+def test_live_flatten_position_uses_aggressive_reduce_only_limit_for_dust_long(tmp_path):
+    from src.execution_engine import LiveExecutionEngine
+
+    class FakeLiveClient:
+        def __init__(self):
+            self.placed = []
+
+        def require_live_execution_support(self):
+            return None
+
+        def get_balance(self):
+            return {"equity": 160.0}
+
+        def get_position(self, symbol):
+            return {"coin": symbol, "szi": "0.00001", "entryPx": "70000"}
+
+        def get_open_orders(self, symbol):
+            return []
+
+        def get_user_fills(self, symbol=None):
+            return []
+
+        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False):
+            self.placed.append((symbol, side, size, price, reduce_only))
+
+    client = FakeLiveClient()
+    eng = LiveExecutionEngine(
+        client,
+        str(tmp_path / "live_state.json"),
+        start_balance=160,
+        min_notional_usd=10,
+        max_notional_per_trade_usd=50,
+        trade_ledger_csv=str(tmp_path / "trades.csv"),
+        trade_ledger_jsonl=str(tmp_path / "trades.jsonl"),
+        risk_decisions_csv=str(tmp_path / "risk.csv"),
+    )
+
+    assert eng.flatten_position("BTC", 71000.0)
+    assert client.placed == [("BTC", "sell", 0.00001, 70858.0, True)]
+
+
+def test_dust_position_triggers_cleanup_before_grid_management(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.auto_dust_cleanup_usd = 5.0
+    cfg.dust_position_notional_usd = 1.0
+    cfg.allow_long_biased = False
+    cfg.allow_short_biased = False
+    eng = make_test_engine(tmp_path, "dust_cleanup.json", paper_mode=True, enable_live_trading=False)
+    eng.paper.position_size = 0.00003
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 60000, "size": 0.001}]
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [70000 - i for i in range(80)], "high": [70001 - i for i in range(80)], "low": [69999 - i for i in range(80)]})
+
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=2.1)
+
+    assert status["status"] == "managing_position"
+    assert status["reason"] == "dust_cleanup_requested"
+    assert status["allowed_to_trade"] is False
+    assert status["allowed_to_reduce"] is True
+    assert status["canceled_orders"] == 1
+    assert status["flattened"] is True
+    assert status["dust_cleanup_requested"] is True
+    assert eng.open_orders == []
+    assert eng.paper.position_size == 0.0
+
+
 def test_live_submit_sends_normalized_btc_wire_values_and_not_raw_floats(tmp_path):
     from hyperliquid.utils.signing import float_to_wire
     from src.execution_engine import LiveExecutionEngine

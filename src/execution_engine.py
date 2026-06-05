@@ -521,7 +521,8 @@ class LiveExecutionEngine(PaperExecutionEngine):
         if abs(self.paper.position_size) < 1e-12:
             return False
         side = "buy" if self.paper.position_size < 0 else "sell"
-        return self._submit_live_limit(symbol, side, abs(self.paper.position_size), mark_price, reduce_only=True)
+        limit_price = mark_price * 1.002 if side == "buy" else mark_price * 0.998
+        return self._submit_live_limit(symbol, side, abs(self.paper.position_size), limit_price, reduce_only=True)
 
     def on_candle(self, candle: dict, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", strategy_status: str = "running") -> list[dict]:
         symbol = str(candle.get("symbol") or "")
@@ -572,13 +573,14 @@ class LiveExecutionEngine(PaperExecutionEngine):
             normalized_size = normalize_size(symbol, capped_size_decimal)
             notional_decimal = abs(Decimal(str(normalized_size)) * Decimal(str(normalized_price)))
 
-        if normalized_size <= 0 or notional_decimal < min_notional_decimal:
+        if normalized_size <= 0 or (not reduce_only and notional_decimal < min_notional_decimal):
             logger.warning(
-                "live_order_skipped reason=min_notional normalized_price=%s normalized_size=%s notional=%s min_notional_usd=%s",
+                "live_order_skipped reason=min_notional normalized_price=%s normalized_size=%s notional=%s min_notional_usd=%s reduce_only=%s",
                 normalized_price,
                 normalized_size,
                 notional_decimal,
                 self.min_notional_usd,
+                reduce_only,
             )
             return False
 
