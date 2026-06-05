@@ -20,6 +20,8 @@ class PaperState:
     realized_pnl: float = 0.0
     fees_paid: float = 0.0
     daily_start_equity: float = 0.0
+    daily_start_realized_pnl: float = 0.0
+    daily_start_fees_paid: float = 0.0
     current_day: str = ""
 
 
@@ -92,7 +94,8 @@ class PaperExecutionEngine:
         self._require_paper_execution("cancel_replace_grid")
         if not plan.should_regrid:
             return {"canceled": 0, "placed": 0, "symbol": symbol}
-        self.open_orders = [{"symbol": symbol, "side": o.side, "price": o.price, "size": o.size} for o in (plan.long_levels + plan.short_levels)]
+        now_ts = time.time()
+        self.open_orders = [{"symbol": symbol, "side": o.side, "price": o.price, "size": o.size, "created_ts": now_ts} for o in (plan.long_levels + plan.short_levels)]
         return {"canceled": 0, "placed": len(self.open_orders), "symbol": symbol}
 
     def cancel_all_orders(self, symbol: str) -> int:
@@ -114,7 +117,7 @@ class PaperExecutionEngine:
                 break
             sz = min(per_level, remaining)
             px = mark_price * (1 - 0.001 * (i + 1)) if side == "buy" else mark_price * (1 + 0.001 * (i + 1))
-            self.open_orders.append({"symbol": symbol, "side": side, "price": px, "size": sz, "reduce_only": True})
+            self.open_orders.append({"symbol": symbol, "side": side, "price": px, "size": sz, "reduce_only": True, "created_ts": time.time()})
             remaining -= sz
             placed += 1
         return placed
@@ -124,7 +127,7 @@ class PaperExecutionEngine:
         if abs(self.paper.position_size) < 1e-12:
             return False
         side = "buy" if self.paper.position_size < 0 else "sell"
-        self._apply_fill({"symbol": symbol, "side": side, "price": mark_price, "size": abs(self.paper.position_size)})
+        self._apply_fill({"symbol": symbol, "side": side, "price": mark_price, "size": abs(self.paper.position_size), "created_ts": time.time()})
         return True
 
     def on_candle(self, candle: dict, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", strategy_status: str = "running") -> list[dict]:
@@ -437,6 +440,10 @@ class LiveExecutionEngine(PaperExecutionEngine):
             return
         if isinstance(payload, dict):
             self._seen_fill_ids = {str(x) for x in payload.get("seen_fill_ids", [])}
+            self.paper.daily_start_equity = float(payload.get("daily_start_equity", self.paper.daily_start_equity) or 0.0)
+            self.paper.daily_start_realized_pnl = float(payload.get("daily_start_realized_pnl", self.paper.daily_start_realized_pnl) or 0.0)
+            self.paper.daily_start_fees_paid = float(payload.get("daily_start_fees_paid", self.paper.daily_start_fees_paid) or 0.0)
+            self.paper.current_day = str(payload.get("current_day", self.paper.current_day) or "")
 
     def save_state(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -444,6 +451,10 @@ class LiveExecutionEngine(PaperExecutionEngine):
             "mode": "live",
             "seen_fill_ids": sorted(self._seen_fill_ids)[-1000:],
             "last_real_trade_ts": self.last_real_trade_ts.isoformat() if self.last_real_trade_ts else "",
+            "daily_start_equity": self.paper.daily_start_equity,
+            "daily_start_realized_pnl": self.paper.daily_start_realized_pnl,
+            "daily_start_fees_paid": self.paper.daily_start_fees_paid,
+            "current_day": self.paper.current_day,
         }
         self.state_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -473,17 +484,37 @@ class LiveExecutionEngine(PaperExecutionEngine):
                     "size": float(raw.get("sz", 0.0) or 0.0),
                     "oid": raw.get("oid"),
                     "reduce_only": bool(raw.get("reduceOnly", False)),
+                    "created_ts": self._order_created_ts(raw),
                     "raw": raw,
                 }
             )
         self.open_orders = orders
         return self.open_orders
 
+
+    def _order_created_ts(self, raw: dict) -> float | None:
+        for key in ("timestamp", "time", "createdAt", "created_at", "orderTime", "order_time"):
+            value = raw.get(key)
+            if value is None:
+                continue
+            try:
+                ts = float(value)
+            except (TypeError, ValueError):
+                continue
+            if ts > 1_000_000_000_000:
+                return ts / 1000.0
+            return ts
+        return None
+
     def cancel_replace_grid(self, symbol: str, plan: GridPlan) -> dict[str, int | str]:
         if not plan.should_regrid:
             self.sync_open_orders(symbol)
             return {"canceled": 0, "placed": 0, "symbol": symbol}
         canceled = self.cancel_all_orders(symbol)
+        remaining_after_cancel = self.sync_open_orders(symbol)
+        if remaining_after_cancel:
+            logger.warning("live_grid_rebuild_skipped reason=cancel_confirmation_pending remaining_open_orders=%s", len(remaining_after_cancel))
+            return {"canceled": canceled, "placed": 0, "symbol": symbol, "error": "cancel_confirmation_pending"}
         placed = 0
         for order in plan.long_levels + plan.short_levels:
             if self._submit_live_limit(symbol, order.side, order.size, order.price, reduce_only=False):
@@ -540,6 +571,10 @@ class LiveExecutionEngine(PaperExecutionEngine):
                 continue
             entry = self._ledger_entry_from_exchange_fill(raw, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason)
             self._seen_fill_ids.add(fill_id)
+            self.paper.realized_pnl += float(entry.get("realized_pnl_delta", 0.0) or 0.0)
+            self.paper.fees_paid += float(entry.get("fee", 0.0) or 0.0)
+            entry["realized_pnl_total"] = self.paper.realized_pnl
+            entry["fees_paid"] = self.paper.fees_paid
             self.trade_log.append(entry)
             self._append_trade_ledger(entry)
             new_entries.append(entry)

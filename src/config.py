@@ -73,6 +73,7 @@ class BotConfig:
     grid_stale_max_hours: float
     recenter_cooldown_seconds: int
     position_recenter_cooldown_seconds: int
+    stale_order_max_age_sec: int
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -160,4 +161,5 @@ class BotConfig:
             grid_stale_max_hours=float(os.getenv("GRID_STALE_MAX_HOURS", "2")),
             recenter_cooldown_seconds=int(os.getenv("RECENTER_COOLDOWN_SECONDS", "600")),
             position_recenter_cooldown_seconds=int(os.getenv("POSITION_RECENTER_COOLDOWN_SECONDS", "900")),
+            stale_order_max_age_sec=int(os.getenv("STALE_ORDER_MAX_AGE_SEC", "1800")),
         )
