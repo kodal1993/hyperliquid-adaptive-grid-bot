@@ -1,6 +1,7 @@
 import os
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -332,6 +333,96 @@ def test_trend_down_neutral_short_blocks_new_sell_but_allows_buy_exit(tmp_path):
     assert status["allowed_to_trade"] is False
     assert status["allowed_to_reduce"] is True
 
+
+
+def test_trend_up_long_biased_long_position_places_sell_exit(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.allow_long_biased = True
+    cfg.allow_short_biased = True
+    eng = make_test_engine(tmp_path, "trend_up_biased_long_exit.json", paper_mode=True, enable_live_trading=False)
+    eng.paper.position_size = 1.0
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 + i for i in range(80)], "high": [101 + i for i in range(80)], "low": [99 + i for i in range(80)]})
+
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=179.0)
+
+    assert status["status"] == "running"
+    assert status["mode"] == GridMode.LONG_BIASED.value
+    assert status["allow_buys"] is False
+    assert status["allow_sells"] is True
+    assert len(eng.open_orders) > 0
+    assert all(o["side"] == "sell" for o in eng.open_orders)
+
+
+def test_trend_down_short_biased_short_position_places_buy_exit(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.allow_long_biased = True
+    cfg.allow_short_biased = True
+    eng = make_test_engine(tmp_path, "trend_down_biased_short_exit.json", paper_mode=True, enable_live_trading=False)
+    eng.paper.position_size = -1.0
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [200 - i for i in range(80)], "high": [201 - i for i in range(80)], "low": [199 - i for i in range(80)]})
+
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=121.0)
+
+    assert status["status"] == "running"
+    assert status["mode"] == GridMode.SHORT_BIASED.value
+    assert status["allow_sells"] is False
+    assert status["allow_buys"] is True
+    assert len(eng.open_orders) > 0
+    assert all(o["side"] == "buy" for o in eng.open_orders)
+
+
+def test_trend_biased_flat_position_allows_only_trend_entry(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.allow_long_biased = True
+    cfg.allow_short_biased = True
+
+    up_engine = make_test_engine(tmp_path, "trend_up_flat_entry.json", paper_mode=True, enable_live_trading=False)
+    up_orch = StrategyOrchestrator(cfg, up_engine)
+    up_candles = pd.DataFrame({"close": [100 + i for i in range(80)], "high": [101 + i for i in range(80)], "low": [99 + i for i in range(80)]})
+    up_status = up_orch.on_tick(up_candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert up_status["status"] == "running"
+    assert up_status["mode"] == GridMode.LONG_BIASED.value
+    assert up_status["allow_buys"] is True
+    assert up_status["allow_sells"] is False
+    assert len(up_engine.open_orders) > 0
+    assert all(o["side"] == "buy" for o in up_engine.open_orders)
+
+    down_engine = make_test_engine(tmp_path, "trend_down_flat_entry.json", paper_mode=True, enable_live_trading=False)
+    down_orch = StrategyOrchestrator(cfg, down_engine)
+    down_candles = pd.DataFrame({"close": [200 - i for i in range(80)], "high": [201 - i for i in range(80)], "low": [199 - i for i in range(80)]})
+    down_status = down_orch.on_tick(down_candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert down_status["status"] == "running"
+    assert down_status["mode"] == GridMode.SHORT_BIASED.value
+    assert down_status["allow_sells"] is True
+    assert down_status["allow_buys"] is False
+    assert len(down_engine.open_orders) > 0
+    assert all(o["side"] == "sell" for o in down_engine.open_orders)
+
+
+def test_orphan_position_without_open_orders_forces_recenter_despite_cooldown(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.allow_long_biased = True
+    cfg.position_recenter_cooldown_seconds = 3600
+    eng = make_test_engine(tmp_path, "orphan_position_recenter.json", paper_mode=True, enable_live_trading=False)
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 + i for i in range(80)], "high": [101 + i for i in range(80)], "low": [99 + i for i in range(80)]})
+
+    orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+    eng.open_orders = []
+    eng.paper.position_size = 1.0
+    orch.last_recenter_ts = datetime.now(timezone.utc)
+
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=179.0)
+
+    assert status["force_recenter"] is True
+    assert status["orphan_position_no_orders"] is True
+    assert status["recenter_blocked_by_cooldown"] is True
+    assert len(eng.open_orders) > 0
+    assert all(o["side"] == "sell" for o in eng.open_orders)
 
 def test_trend_with_flat_position_blocks_neutral_grid_generation(tmp_path):
     cfg = BotConfig.from_env()

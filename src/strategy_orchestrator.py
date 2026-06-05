@@ -184,9 +184,11 @@ class StrategyOrchestrator:
                 allow_sells = False
 
         if regime == MarketRegime.TREND_UP and mode == GridMode.LONG_BIASED and not force_reduce_only:
-            allow_sells = effective_position_side == "SHORT"
+            allow_buys = effective_position_side != "LONG" and long_exposure < threshold
+            allow_sells = effective_position_side == "LONG"
         if regime == MarketRegime.TREND_DOWN and mode == GridMode.SHORT_BIASED and not force_reduce_only:
-            allow_buys = effective_position_side == "LONG"
+            allow_sells = effective_position_side != "SHORT" and short_exposure < threshold
+            allow_buys = effective_position_side == "SHORT"
 
         flip_cooldown_active = self.trend_flip_cooldown_remaining > 0
         if flip_cooldown_active and not force_reduce_only:
@@ -269,10 +271,19 @@ class StrategyOrchestrator:
         stale_recenter_requested = last_trade_age_hours >= self.config.grid_stale_max_hours
         no_fill_recenter_requested = no_fill_cycles >= self.config.no_fill_cycles_before_recenter
         recenter_requested = no_fill_recenter_requested or stale_recenter_requested
-        force_recenter = recenter_requested and not recenter_blocked_by_cooldown
+        open_orders = getattr(self.execution_engine, "open_orders", [])
+        orphan_position_no_orders = in_position and len(open_orders) == 0
+        force_recenter = (recenter_requested and not recenter_blocked_by_cooldown) or orphan_position_no_orders
+        if orphan_position_no_orders:
+            logger.warning(
+                "orphan_position_no_orders symbol=%s side=%s position_notional=%.2f forcing_recenter=True",
+                symbol,
+                effective_position_side,
+                effective_position_notional,
+            )
         if force_recenter:
             self.last_recenter_ts = now
-            logger.info("grid_recenter_triggered old_center=%s new_center=%s last_trade_age=%.3f no_fill_cycles=%s cooldown_seconds=%s in_position=%s", self.grid_manager.last_mid, price, last_trade_age_hours, no_fill_cycles, recenter_cooldown_seconds, in_position)
+            logger.info("grid_recenter_triggered old_center=%s new_center=%s last_trade_age=%.3f no_fill_cycles=%s cooldown_seconds=%s in_position=%s orphan_position_no_orders=%s", self.grid_manager.last_mid, price, last_trade_age_hours, no_fill_cycles, recenter_cooldown_seconds, in_position, orphan_position_no_orders)
         elif recenter_requested and recenter_blocked_by_cooldown:
             logger.info("grid_recenter_skipped_cooldown last_trade_age=%.3f no_fill_cycles=%s seconds_since_recenter=%.1f cooldown_seconds=%s in_position=%s", last_trade_age_hours, no_fill_cycles, seconds_since_recenter or 0.0, recenter_cooldown_seconds, in_position)
         recenter_context = {
@@ -282,6 +293,7 @@ class StrategyOrchestrator:
             "recenter_requested": recenter_requested,
             "recenter_blocked_by_cooldown": recenter_blocked_by_cooldown,
             "force_recenter": force_recenter,
+            "orphan_position_no_orders": orphan_position_no_orders,
             "in_position_for_recenter": in_position,
             "trend_flip_cooldown_remaining": self.trend_flip_cooldown_remaining,
             "wrong_way_loss_pct": wrong_way_loss_pct,
