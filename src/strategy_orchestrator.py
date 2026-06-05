@@ -7,7 +7,7 @@ import pandas as pd
 from .config import BotConfig
 from .execution_engine import ExecutionEngine
 from .grid_manager import GridManager, GridPlan
-from .regime_detector import RegimeDetector
+from .regime_detector import RegimeDetector, calculate_atr_pct
 from .risk_manager import RiskManager
 from .types import GridMode, MarketRegime
 
@@ -31,11 +31,16 @@ class StrategyOrchestrator:
         self.stale_order_cleanup_count = 0
 
     def on_tick(self, candles: pd.DataFrame, equity: float, daily_pnl_pct: float, symbol: str, position_notional: float = 0.0) -> dict:
-        regime = self.detector.detect(candles, trend_lookback_candles=self.config.trend_lookback_candles, trend_move_threshold_pct=self.config.trend_move_threshold_pct, ema_slope_threshold_pct=self.config.ema_slope_threshold_pct)
+        regime_signal = self.detector.detect_signal(candles, trend_lookback_candles=self.config.trend_lookback_candles, trend_move_threshold_pct=self.config.trend_move_threshold_pct, ema_slope_threshold_pct=self.config.ema_slope_threshold_pct)
+        regime = regime_signal.regime
+        regime_confidence = regime_signal.confidence
         price = float(candles["close"].iloc[-1])
-        pos_size = self.execution_engine.paper.position_size
-        avg_entry = float(getattr(self.execution_engine.paper, "avg_entry", 0.0) or 0.0)
-        raw_position_notional = abs(position_notional)
+        account_state = self.execution_engine.account_state(symbol, price)
+        logger.info("execution_state state_source=%s equity=%.4f position_size=%.8f position_notional=%.4f", account_state.state_source, account_state.equity, account_state.position_size, account_state.position_notional)
+        equity = account_state.equity
+        pos_size = account_state.position_size
+        avg_entry = float(account_state.avg_entry or 0.0)
+        raw_position_notional = abs(account_state.position_notional if position_notional == 0.0 else position_notional)
         dust_threshold_usd = max(float(self.config.dust_position_notional_usd), 0.0)
         is_dust_position = 0 < raw_position_notional < dust_threshold_usd
         effective_position_notional = 0.0 if is_dust_position else raw_position_notional
@@ -104,13 +109,18 @@ class StrategyOrchestrator:
                 )
             self.last_trend_regime = regime
 
-        vol = candles["close"].pct_change().std()
+        vol = float(candles["close"].pct_change().std() or 0.0)
+        atr_pct = regime_signal.atr_pct or calculate_atr_pct(candles, period=14)
+        final_spacing_pct, spacing_source = self._calculate_spacing_pct(atr_pct, vol)
+        volatility_grid_levels = self._volatility_adjusted_grid_levels(atr_pct)
+        trend_bias = self._trend_bias(regime_confidence)
+        logger.info("grid_spacing spacing_source=%s atr_pct=%.6f return_vol_pct=%.6f final_spacing_pct=%.6f volatility_grid_levels=%s regime_confidence=%.3f trend_bias=%.2f", spacing_source, atr_pct, vol, final_spacing_pct, volatility_grid_levels, regime_confidence, trend_bias)
         order_size = self._calculate_order_size(price)
         order_notional = order_size * price
 
         long_exposure = max(effective_position_size, 0.0) * price
         short_exposure = max(-effective_position_size, 0.0) * price
-        threshold = self.config.max_position_notional_usd * self.config.max_directional_exposure_pct
+        threshold = min(self.config.max_position_notional_usd, self.config.max_active_exposure_usd) * self.config.max_directional_exposure_pct
         allow_buys = long_exposure < threshold
         allow_sells = short_exposure < threshold
 
@@ -246,7 +256,7 @@ class StrategyOrchestrator:
                 flattened = self.execution_engine.flatten_position(symbol, price)
             reduce_only_placed = 0 if flattened else self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, order_size)
             logger.warning("reduce_only_requested symbol=%s reason=max_position_notional canceled=%s reduce_only_placed=%s", symbol, canceled, reduce_only_placed)
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled, "reduce_only_placed": reduce_only_placed, "flattened": flattened, **dust_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled, "reduce_only_placed": reduce_only_placed, "flattened": flattened, "state_source": account_state.state_source, **dust_context}
 
         if not risk_state.can_trade or regime == MarketRegime.RISK_OFF:
             if risk_state.reason == "max_position_notional":
@@ -256,7 +266,7 @@ class StrategyOrchestrator:
                     flattened = self.execution_engine.flatten_position(symbol, price)
                 reduce_only_placed = 0 if flattened else self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, self._calculate_order_size(price))
                 logger.warning("reduce_only_requested symbol=%s reason=%s canceled=%s reduce_only_placed=%s", symbol, risk_state.reason, canceled, reduce_only_placed)
-                return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled, "reduce_only_placed": reduce_only_placed, "flattened": flattened, **dust_context}
+                return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled, "reduce_only_placed": reduce_only_placed, "flattened": flattened, "state_source": account_state.state_source, **dust_context}
             return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": False, **dust_context}
 
         no_fill_cycles = self.execution_engine.no_fill_cycles
@@ -351,7 +361,9 @@ class StrategyOrchestrator:
             open_orders = []
             buy_order_count = 0
             sell_order_count = 0
-        force_recenter = (recenter_requested and not recenter_blocked_by_cooldown) or orphan_position_no_orders or flat_without_orders or cleanup_requested
+        forced_rebuild = bool(orphan_position_no_orders or flat_without_orders or cleanup_requested)
+        rebuild_reason = "stale_cleanup" if stale_order_detected else ("orphan_cleanup" if orphan_order_detected else ("orphan_position_no_orders" if orphan_position_no_orders else ("flat_without_orders" if flat_without_orders else ("stale_recenter" if stale_recenter_requested else ("no_fill_recenter" if no_fill_recenter_requested else "none")))))
+        force_recenter = (recenter_requested and not recenter_blocked_by_cooldown) or forced_rebuild
         if orphan_position_no_orders:
             logger.warning(
                 "orphan_position_no_orders symbol=%s side=%s position_notional=%.2f forcing_recenter=True",
@@ -361,9 +373,11 @@ class StrategyOrchestrator:
             )
         if force_recenter:
             self.last_recenter_ts = now
-            logger.info("grid_rebuild_requested reason=%s old_center=%s new_center=%s last_trade_age=%.3f no_fill_cycles=%s cooldown_seconds=%s in_position=%s orphan_position_no_orders=%s flat_without_orders=%s cleanup_requested=%s", "orphan_or_stale_cleanup" if cleanup_requested else ("flat_without_orders" if flat_without_orders else "recenter"), self.grid_manager.last_mid, price, last_trade_age_hours, no_fill_cycles, recenter_cooldown_seconds, in_position, orphan_position_no_orders, flat_without_orders, cleanup_requested)
+            logger.info("grid_rebuild_requested rebuild_reason=%s forced_rebuild=%s old_center=%s new_center=%s last_trade_age=%.3f no_fill_cycles=%s cooldown_seconds=%s in_position=%s orphan_position_no_orders=%s flat_without_orders=%s cleanup_requested=%s", rebuild_reason, forced_rebuild, self.grid_manager.last_mid, price, last_trade_age_hours, no_fill_cycles, recenter_cooldown_seconds, in_position, orphan_position_no_orders, flat_without_orders, cleanup_requested)
         elif recenter_requested and recenter_blocked_by_cooldown:
-            logger.info("grid_recenter_skipped_cooldown last_trade_age=%.3f no_fill_cycles=%s seconds_since_recenter=%.1f cooldown_seconds=%s in_position=%s", last_trade_age_hours, no_fill_cycles, seconds_since_recenter or 0.0, recenter_cooldown_seconds, in_position)
+            seconds_remaining = max(recenter_cooldown_seconds - (seconds_since_recenter or 0.0), 0.0)
+            cooldown_type = "position_recenter" if in_position else "recenter"
+            logger.info("grid_recenter_skipped_cooldown cooldown_type=%s seconds_remaining=%.1f rebuild_reason=%s last_trade_age=%.3f no_fill_cycles=%s seconds_since_recenter=%.1f cooldown_seconds=%s in_position=%s", cooldown_type, seconds_remaining, rebuild_reason, last_trade_age_hours, no_fill_cycles, seconds_since_recenter or 0.0, recenter_cooldown_seconds, in_position)
         recenter_context = {
             "last_recenter_ts": self.last_recenter_ts.isoformat() if self.last_recenter_ts else None,
             "seconds_since_recenter": seconds_since_recenter,
@@ -371,6 +385,8 @@ class StrategyOrchestrator:
             "recenter_requested": recenter_requested,
             "recenter_blocked_by_cooldown": recenter_blocked_by_cooldown,
             "force_recenter": force_recenter,
+            "forced_rebuild": forced_rebuild,
+            "rebuild_reason": rebuild_reason,
             "orphan_position_no_orders": orphan_position_no_orders,
             "flat_without_orders": flat_without_orders,
             "orphan_order_detected": orphan_order_detected,
@@ -389,30 +405,30 @@ class StrategyOrchestrator:
 
         if order_notional + 1e-9 < self.config.min_notional_usd:
             logger.warning("no_new_order_placed reason=min_notional order_notional=%.4f min_notional_usd=%.4f price=%.4f order_size=%.8f", order_notional, self.config.min_notional_usd, price, order_size)
-        effective_grid_levels = self._exposure_limited_grid_levels(mode, allow_buys, allow_sells, order_notional, threshold)
+        effective_grid_levels = self._exposure_limited_grid_levels(mode, allow_buys, allow_sells, order_notional, threshold, configured_levels=volatility_grid_levels)
         projected_one_side = self._projected_grid_notional(mode, allow_buys, allow_sells, order_notional, levels=effective_grid_levels)
-        if effective_grid_levels < self.config.grid_levels:
-            logger.warning("grid_levels_limited_by_exposure configured_levels=%s effective_levels=%s projected_one_side_notional=%.4f threshold=%.4f max_position_notional_usd=%.4f", self.config.grid_levels, effective_grid_levels, projected_one_side, threshold, self.config.max_position_notional_usd)
+        if effective_grid_levels < self.config.grid_levels or volatility_grid_levels != self.config.grid_levels:
+            logger.warning("grid_levels_adjusted configured_levels=%s volatility_levels=%s effective_levels=%s projected_one_side_notional=%.4f threshold=%.4f max_position_notional_usd=%.4f", self.config.grid_levels, volatility_grid_levels, effective_grid_levels, projected_one_side, threshold, self.config.max_position_notional_usd)
         build_allow_buys = allow_buys and effective_grid_levels > 0
         build_allow_sells = allow_sells and effective_grid_levels > 0
         if effective_grid_levels <= 0 and (allow_buys or allow_sells):
             logger.warning("no_new_order_placed reason=max_exposure_too_small_for_min_order order_notional=%.4f threshold=%.4f", order_notional, threshold)
-        plan: GridPlan = self.grid_manager.build_grid(price, max(effective_grid_levels, 1), self.config.grid_spacing_pct, float(vol), regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=build_allow_buys, allow_sells=build_allow_sells, force_recenter=force_recenter)
+        plan: GridPlan = self.grid_manager.build_grid(price, max(effective_grid_levels, 1), final_spacing_pct, 0.0, regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=build_allow_buys, allow_sells=build_allow_sells, force_recenter=force_recenter, spacing_source=spacing_source, atr_pct=atr_pct, trend_bias=trend_bias, regime_confidence=regime_confidence)
         try:
             result = self.execution_engine.cancel_replace_grid(symbol, plan)
         except Exception as exc:
             logger.warning("state_uncertain_skip_cycle reason=grid_rebuild_api_error error=%s", exc)
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "allowed_to_trade": False, "allowed_to_reduce": False, **dust_context, **recenter_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "allowed_to_trade": False, "allowed_to_reduce": False, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context}
         if result.get("error"):
             logger.warning("state_uncertain_skip_cycle reason=%s", result.get("error"))
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "orders": result, "allowed_to_trade": False, "allowed_to_reduce": False, **dust_context, **recenter_context}
-        logger.info("grid_state regime=%s mode=%s position_side=%s open_orders_before=%s buy_before=%s sell_before=%s allow_buys=%s allow_sells=%s placed=%s canceled=%s order_notional=%.4f", regime.value, mode.value, effective_position_side, len(open_orders), buy_order_count, sell_order_count, allow_buys, allow_sells, result.get("placed", 0), result.get("canceled", 0), order_notional)
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "orders": result, "allowed_to_trade": False, "allowed_to_reduce": False, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context}
+        logger.info("grid_state regime=%s mode=%s position_side=%s open_orders_before=%s buy_before=%s sell_before=%s allow_buys=%s allow_sells=%s placed=%s canceled=%s order_notional=%.4f spacing_source=%s atr_pct=%.6f final_spacing_pct=%.6f state_source=%s", regime.value, mode.value, effective_position_side, len(open_orders), buy_order_count, sell_order_count, allow_buys, allow_sells, result.get("placed", 0), result.get("canceled", 0), order_notional, spacing_source, atr_pct, final_spacing_pct, account_state.state_source)
         if neutral_entries_blocked and abs(effective_position_size) > 1e-12:
-            return {"status": "managing_position", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": False, "allowed_to_reduce": True, "reason": "neutral_entries_blocked_in_trend", "position_management_action": "reduce_only_grid", **dust_context, **recenter_context}
+            return {"status": "managing_position", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": False, "allowed_to_reduce": True, "reason": "neutral_entries_blocked_in_trend", "position_management_action": "reduce_only_grid", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context}
         if neutral_entries_blocked:
             canceled = self.execution_engine.cancel_all_orders(symbol)
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", **dust_context, **recenter_context}
-        return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, **dust_context, **recenter_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context}
+        return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context}
 
     def _expected_min_entry_levels(self, mode: GridMode, allowed_buys: bool, allowed_sells: bool) -> int:
         buy_count, sell_count = self.grid_manager._level_counts(self.config.grid_levels, mode)
@@ -460,29 +476,65 @@ class StrategyOrchestrator:
                 return True
         return False
 
-    def _projected_grid_notional(self, mode: GridMode, allow_buys: bool, allow_sells: bool, order_notional: float, *, levels: int | None = None) -> float:
-        buy_levels, sell_levels = self.grid_manager._level_counts(self.config.grid_levels if levels is None else levels, mode)
+    def _projected_grid_notional(self, mode: GridMode, allow_buys: bool, allow_sells: bool, order_notional: float, *, levels: int | None = None, trend_bias: float | None = None) -> float:
+        buy_levels, sell_levels = self.grid_manager._level_counts(self.config.grid_levels if levels is None else levels, mode, trend_bias=self.config.trend_bias_base if trend_bias is None else trend_bias)
         return max((buy_levels if allow_buys else 0) * order_notional, (sell_levels if allow_sells else 0) * order_notional)
 
-    def _exposure_limited_grid_levels(self, mode: GridMode, allow_buys: bool, allow_sells: bool, order_notional: float, threshold: float) -> int:
+    def _exposure_limited_grid_levels(self, mode: GridMode, allow_buys: bool, allow_sells: bool, order_notional: float, threshold: float, *, configured_levels: int | None = None) -> int:
         if order_notional <= 0 or threshold <= 0:
             return 0
-        configured = max(int(self.config.grid_levels), 1)
+        configured = max(int(self.config.grid_levels if configured_levels is None else configured_levels), 1)
         for levels in range(configured, 0, -1):
             if self._projected_grid_notional(mode, allow_buys, allow_sells, order_notional, levels=levels) <= threshold + 1e-9:
                 return levels
         return 0
 
+    def _trend_bias(self, regime_confidence: float) -> float:
+        if regime_confidence >= self.config.trend_confidence_strong:
+            return self.config.trend_bias_strong
+        if regime_confidence <= self.config.trend_confidence_weak:
+            return self.config.trend_bias_weak
+        return self.config.trend_bias_base
+
+    def _calculate_spacing_pct(self, atr_pct: float, return_vol_pct: float) -> tuple[float, str]:
+        atr_component = atr_pct * self.config.grid_spacing_vol_multiplier
+        vol_component = return_vol_pct * self.config.grid_spacing_vol_multiplier
+        raw_spacing = max(self.config.grid_spacing_pct, atr_component, vol_component)
+        final_spacing = min(max(raw_spacing, self.config.grid_spacing_min_pct), self.config.grid_spacing_max_pct)
+        if atr_component >= self.config.grid_spacing_pct and atr_component >= vol_component:
+            source = "atr14"
+        elif vol_component > self.config.grid_spacing_pct:
+            source = "return_volatility"
+        else:
+            source = "base_floor"
+        if final_spacing == self.config.grid_spacing_min_pct and raw_spacing < final_spacing:
+            source = f"{source}_min_floor"
+        elif final_spacing == self.config.grid_spacing_max_pct and raw_spacing > final_spacing:
+            source = f"{source}_max_cap"
+        return final_spacing, source
+
+    def _volatility_adjusted_grid_levels(self, atr_pct: float) -> int:
+        if atr_pct >= self.config.vol_extreme_threshold:
+            return 1
+        if atr_pct >= self.config.vol_high_threshold:
+            desired = 2
+        elif atr_pct <= self.config.vol_low_threshold:
+            desired = 4
+        else:
+            desired = 3
+        return min(max(desired, self.config.min_grid_levels), self.config.max_grid_levels)
+
     def _calculate_order_size(self, price: float) -> float:
-        raw_size = self.config.max_notional_per_trade_usd / max(price, 1e-9)
+        target_notional = min(self.config.order_notional_usd, self.config.max_notional_per_trade_usd)
+        raw_size = target_notional / max(price, 1e-9)
         size = min(max(raw_size, self.config.min_order_size), self.config.max_order_size)
         notional = size * price
-        if notional > self.config.max_notional_per_trade_usd:
-            size = self.config.max_notional_per_trade_usd / max(price, 1e-9)
+        if notional > target_notional:
+            size = target_notional / max(price, 1e-9)
             notional = size * price
         if notional < self.config.min_notional_usd:
             size = self.config.min_notional_usd / max(price, 1e-9)
         size = min(size, self.config.max_order_size)
-        if size * price > self.config.max_notional_per_trade_usd:
-            size = self.config.max_notional_per_trade_usd / max(price, 1e-9)
+        if size * price > target_notional:
+            size = target_notional / max(price, 1e-9)
         return max(size, 0.0)

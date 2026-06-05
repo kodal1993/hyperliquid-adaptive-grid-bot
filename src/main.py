@@ -14,7 +14,7 @@ import fcntl
 import pandas as pd
 
 from .config import BotConfig
-from .execution_engine import ExecutionEngine, LiveExecutionEngine
+from .execution_engine import AccountState, ExecutionEngine, LiveExecutionEngine
 from .hyperliquid_client import HyperliquidClient
 from .startup_validation import run_startup_validation
 from .strategy_orchestrator import StrategyOrchestrator
@@ -34,20 +34,15 @@ def to_df(candles: list[dict]) -> pd.DataFrame:
     return pd.DataFrame([{"open": float(c["o"]), "high": float(c["h"]), "low": float(c["l"]), "close": float(c["c"])} for c in candles])
 
 
+def _account_metrics(cfg: BotConfig, engine: ExecutionEngine, client: HyperliquidClient, latest_close: float) -> AccountState:
+    state = engine.account_state(getattr(cfg, "default_symbol", "BTC"), latest_close)
+    logger.info("account_state state_source=%s equity=%.4f position_size=%.8f position_notional=%.4f", state.state_source, state.equity, state.position_size, state.position_notional)
+    return state
+
+
 def _paper_metrics(cfg: BotConfig, engine: ExecutionEngine, client: HyperliquidClient, latest_close: float) -> tuple[float, float, float]:
-    if cfg.paper_mode:
-        return engine.unrealized_pnl(latest_close), engine.equity(latest_close), abs(engine.paper.position_size * latest_close)
-    unrealized = 0.0
-    if hasattr(engine, "sync_account"):
-        engine.sync_account(cfg.default_symbol, latest_close)
-        try:
-            pos = client.get_position(cfg.default_symbol)
-            unrealized = float(pos.get("unrealizedPnl", pos.get("unrealized_pnl", 0.0)) or 0.0)
-        except Exception:
-            unrealized = 0.0
-    equity = client.get_balance().get("equity", cfg.paper_start_balance_usd)
-    position_notional = abs(engine.paper.position_size * latest_close)
-    return unrealized, equity, position_notional
+    state = _account_metrics(cfg, engine, client, latest_close)
+    return state.unrealized_pnl, state.equity, state.position_notional
 
 
 def calculate_daily_pnl_metrics(*, current_equity: float, daily_start_equity: float, realized_pnl_total: float, daily_start_realized_pnl: float, unrealized_pnl: float, fees_paid_total: float, daily_start_fees_paid: float) -> dict:
@@ -328,12 +323,13 @@ def run() -> None:
         sells: list[dict] = []
         candles = to_df(client.get_candles(cfg.default_symbol, lookback=200))
         latest_close = float(candles["close"].iloc[-1])
-        unrealized_pnl, equity, position_notional = _paper_metrics(cfg, engine, client, latest_close)
+        account_state = _account_metrics(cfg, engine, client, latest_close)
+        unrealized_pnl, equity, position_notional = account_state.unrealized_pnl, account_state.equity, account_state.position_notional
         now_day = datetime.now(timezone.utc).date()
         if daily_start_equity <= 0 or not engine.paper.current_day:
             daily_start_equity = equity
-            daily_start_realized_pnl = engine.paper.realized_pnl
-            daily_start_fees_paid = engine.paper.fees_paid
+            daily_start_realized_pnl = account_state.realized_pnl
+            daily_start_fees_paid = account_state.fees_paid
             engine.paper.current_day = now_day.isoformat()
             engine.paper.daily_start_equity = daily_start_equity
             engine.paper.daily_start_realized_pnl = daily_start_realized_pnl
@@ -342,14 +338,14 @@ def run() -> None:
         if now_day != current_day:
             current_day = now_day
             daily_start_equity = equity
-            daily_start_realized_pnl = engine.paper.realized_pnl
-            daily_start_fees_paid = engine.paper.fees_paid
+            daily_start_realized_pnl = account_state.realized_pnl
+            daily_start_fees_paid = account_state.fees_paid
             engine.paper.current_day = current_day.isoformat()
             engine.paper.daily_start_equity = daily_start_equity
             engine.paper.daily_start_realized_pnl = daily_start_realized_pnl
             engine.paper.daily_start_fees_paid = daily_start_fees_paid
             engine.save_state()
-        daily_metrics = calculate_daily_pnl_metrics(current_equity=equity, daily_start_equity=daily_start_equity, realized_pnl_total=engine.paper.realized_pnl, daily_start_realized_pnl=daily_start_realized_pnl, unrealized_pnl=unrealized_pnl, fees_paid_total=engine.paper.fees_paid, daily_start_fees_paid=daily_start_fees_paid)
+        daily_metrics = calculate_daily_pnl_metrics(current_equity=equity, daily_start_equity=daily_start_equity, realized_pnl_total=account_state.realized_pnl, daily_start_realized_pnl=daily_start_realized_pnl, unrealized_pnl=unrealized_pnl, fees_paid_total=account_state.fees_paid, daily_start_fees_paid=daily_start_fees_paid)
         daily_pnl_pct = daily_metrics["daily_pnl_pct"]
 
         status = orchestrator.on_tick(candles, equity=equity, daily_pnl_pct=daily_pnl_pct, symbol=cfg.default_symbol, position_notional=position_notional)
@@ -363,8 +359,9 @@ def run() -> None:
         latest_candle["symbol"] = cfg.default_symbol
         fills = engine.on_candle(latest_candle, regime=status.get("regime", "unknown"), mode=mode, risk_state=risk_state, pause_reason=reason, strategy_status=strategy_status)
         trade_events = engine.consume_trade_log()
-        unrealized_pnl, equity, position_notional = _paper_metrics(cfg, engine, client, latest_close)
-        daily_metrics = calculate_daily_pnl_metrics(current_equity=equity, daily_start_equity=daily_start_equity, realized_pnl_total=engine.paper.realized_pnl, daily_start_realized_pnl=daily_start_realized_pnl, unrealized_pnl=unrealized_pnl, fees_paid_total=engine.paper.fees_paid, daily_start_fees_paid=daily_start_fees_paid)
+        account_state = _account_metrics(cfg, engine, client, latest_close)
+        unrealized_pnl, equity, position_notional = account_state.unrealized_pnl, account_state.equity, account_state.position_notional
+        daily_metrics = calculate_daily_pnl_metrics(current_equity=equity, daily_start_equity=daily_start_equity, realized_pnl_total=account_state.realized_pnl, daily_start_realized_pnl=daily_start_realized_pnl, unrealized_pnl=unrealized_pnl, fees_paid_total=account_state.fees_paid, daily_start_fees_paid=daily_start_fees_paid)
 
         for tr in trade_events:
             logger.info("trade_event side=%s symbol=%s price=%.6f qty=%.8f", tr["side"], tr["symbol"], tr["price"], tr["qty"])
@@ -375,11 +372,11 @@ def run() -> None:
                 else:
                     logger.warning("telegram_fill_alert_failed error=send_returned_false side=%s", str(tr.get("side", "")).upper())
         last_trade_dt = engine.last_real_trade_ts
-        if cfg.paper_mode and last_trade_dt and abs(engine.paper.position_size) > 1e-12:
+        if cfg.paper_mode and last_trade_dt and abs(account_state.position_size) > 1e-12:
             age_hours = (datetime.now(timezone.utc) - last_trade_dt).total_seconds() / 3600
             if age_hours > cfg.stale_position_max_hours and position_notional > cfg.min_residual_notional_usd:
-                close_side = "sell" if engine.paper.position_size > 0 else "buy"
-                close_qty = abs(engine.paper.position_size)
+                close_side = "sell" if account_state.position_size > 0 else "buy"
+                close_qty = abs(account_state.position_size)
                 logger.warning("stale_position_cleanup_triggered side=%s close_qty=%s position_notional_before=%.4f reason=stale_position age_hours=%.3f", close_side, close_qty, position_notional, age_hours)
                 engine._apply_fill({"symbol": cfg.default_symbol, "side": close_side, "price": latest_close, "size": close_qty}, reason="stale_position_cleanup", regime=status.get("regime", "unknown"), mode=mode, risk_state="OK", pause_reason="")
                 trade_events.extend(engine.consume_trade_log())
@@ -397,24 +394,25 @@ def run() -> None:
         last_risk_state_value = risk_state
         last_pause_reason = reason
 
-        append_csv("logs/equity_curve.csv", [time.time(), equity, engine.paper.cash, engine.paper.realized_pnl, unrealized_pnl, engine.paper.fees_paid], ["ts", "equity", "cash", "realized_pnl", "unrealized_pnl", "fees_paid"])
+        append_csv("logs/equity_curve.csv", [time.time(), equity, account_state.equity, account_state.realized_pnl, unrealized_pnl, account_state.fees_paid], ["ts", "equity", "cash", "realized_pnl", "unrealized_pnl", "fees_paid"])
 
         status_payload = {
             "status": strategy_status,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "paper_mode": cfg.paper_mode,
+            "state_source": account_state.state_source,
             "symbol": cfg.default_symbol,
             "price": latest_close,
             "regime": status.get("regime", "unknown"),
             "mode": mode,
             "order_size": status.get("order_size", 0.0),
             "order_notional": status.get("order_notional", 0.0),
-            "position_size": engine.paper.position_size,
+            "position_size": account_state.position_size,
             "position_notional": position_notional,
-            "cash": engine.paper.cash,
-            "realized_pnl": engine.paper.realized_pnl,
+            "cash": account_state.equity,
+            "realized_pnl": account_state.realized_pnl,
             "unrealized_pnl": unrealized_pnl,
-            "fees_paid": engine.paper.fees_paid,
+            "fees_paid": account_state.fees_paid,
             "equity": equity,
             "daily_pnl_pct": daily_pnl_pct,
             "risk_state": risk_state,
@@ -429,9 +427,9 @@ def run() -> None:
         blocked_1h, blocked_by_reason_1h, last_block_reason = _risk_block_stats_window(now_ts=time.time())
         trade_stats_1h = _trade_stats_window(now_ts=time.time(), expected_symbol=cfg.default_symbol)
         position_side = "FLAT"
-        if engine.paper.position_size > 0:
+        if account_state.position_size > 0:
             position_side = "LONG"
-        elif engine.paper.position_size < 0:
+        elif account_state.position_size < 0:
             position_side = "SHORT"
         effective_position_side = status.get("effective_position_side", position_side)
         is_dust_position = bool(status.get("is_dust_position", False))
@@ -451,6 +449,15 @@ def run() -> None:
                 "recenter_blocked_by_cooldown": bool(status.get("recenter_blocked_by_cooldown", False)),
                 "force_recenter": bool(status.get("force_recenter", False)),
                 "in_position_for_recenter": bool(status.get("in_position_for_recenter", False)),
+                "forced_rebuild": bool(status.get("forced_rebuild", False)),
+                "rebuild_reason": status.get("rebuild_reason"),
+                "grid_spacing_pct": status.get("grid_spacing_pct"),
+                "spacing_source": status.get("spacing_source"),
+                "atr_pct": status.get("atr_pct"),
+                "grid_levels": status.get("grid_levels"),
+                "volatility_grid_levels": status.get("volatility_grid_levels"),
+                "regime_confidence": status.get("regime_confidence"),
+                "trend_bias": status.get("trend_bias"),
                 "mark_price": latest_close,
                 "last_trade_price": _safe_float(last_trade.get("price")),
                 "last_trade_qty": _safe_float(last_trade.get("qty")),
@@ -465,10 +472,10 @@ def run() -> None:
                 "blocked_risk_decisions_by_reason": blocked_by_reason_1h,
                 "last_block_reason": last_block_reason,
                 "allowed_to_trade": bool(status.get("allowed_to_trade", risk_state == "OK")),
-                "allowed_to_reduce": bool(status.get("allowed_to_reduce", abs(engine.paper.position_size) > 1e-12)),
+                "allowed_to_reduce": bool(status.get("allowed_to_reduce", abs(account_state.position_size) > 1e-12)),
                 "position_management_action": status.get("position_management_action", "none"),
-                "total_pnl": engine.paper.realized_pnl + unrealized_pnl,
-                "total_pnl_pct": ((engine.paper.realized_pnl + unrealized_pnl) / cfg.paper_start_balance_usd) if cfg.paper_start_balance_usd > 0 else None,
+                "total_pnl": account_state.realized_pnl + unrealized_pnl,
+                "total_pnl_pct": ((account_state.realized_pnl + unrealized_pnl) / max(daily_start_equity, cfg.paper_start_balance_usd)) if cfg.paper_start_balance_usd > 0 else None,
                 "account_equity": daily_metrics["account_equity"],
                 "daily_start_equity": daily_metrics["daily_start_equity"],
                 "daily_realized_pnl": daily_metrics["daily_realized_pnl"],
@@ -477,9 +484,9 @@ def run() -> None:
                 "net_daily_pnl": daily_metrics["net_daily_pnl"],
                 "daily_pnl": daily_metrics["daily_pnl"],
                 "daily_pnl_pct": daily_metrics["daily_pnl_pct"],
-                "unrealized_pnl_pct": ((unrealized_pnl / abs(engine.paper.avg_entry * engine.paper.position_size)) if abs(engine.paper.avg_entry * engine.paper.position_size) > 1e-9 else 0.0),
+                "unrealized_pnl_pct": ((unrealized_pnl / abs(account_state.avg_entry * account_state.position_size)) if abs(account_state.avg_entry * account_state.position_size) > 1e-9 else 0.0),
                 "exposure_pct": (position_notional / equity) if equity > 1e-9 else 0.0,
-                "avg_entry": engine.paper.avg_entry,
+                "avg_entry": account_state.avg_entry,
                 "trades_1h": trade_stats_1h["trades_count"],
                 "buy_count_1h": trade_stats_1h["buy_count"],
                 "sell_count_1h": trade_stats_1h["sell_count"],
@@ -516,10 +523,10 @@ def run() -> None:
             next_order = {"side": "sell", "price": float(sells[0]["price"])}
         next_exit_side = None
         next_exit_price = None
-        if engine.paper.position_size > 0 and sells:
+        if account_state.position_size > 0 and sells:
             next_exit_side = "sell"
             next_exit_price = float(sells[0]["price"])
-        elif engine.paper.position_size < 0 and buys:
+        elif account_state.position_size < 0 and buys:
             next_exit_side = "buy"
             next_exit_price = float(buys[0]["price"])
 

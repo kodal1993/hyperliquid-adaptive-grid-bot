@@ -1568,3 +1568,170 @@ def test_small_equity_grid_does_not_exceed_max_active_exposure(tmp_path, monkeyp
     assert status["status"] == "running"
     assert buy_exposure <= 40.0 + 1e-6
     assert sell_exposure <= 40.0 + 1e-6
+
+
+def test_small_equity_safe_missing_env_defaults(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ENV_PROFILE", raising=False)
+    monkeypatch.delenv("GRID_LEVELS", raising=False)
+    monkeypatch.delenv("MAX_POSITION_NOTIONAL_USD", raising=False)
+    monkeypatch.delenv("STALE_ORDER_MAX_AGE_SEC", raising=False)
+    monkeypatch.delenv("ORDER_NOTIONAL_USD", raising=False)
+    monkeypatch.delenv("MAX_NOTIONAL_PER_TRADE_USD", raising=False)
+    monkeypatch.delenv("MAX_ACTIVE_EXPOSURE_USD", raising=False)
+    cfg = BotConfig.from_env()
+    assert cfg.grid_levels == 3
+    assert cfg.max_position_notional_usd == 50
+    assert cfg.stale_order_max_age_sec == 1800
+    assert 8 <= cfg.order_notional_usd <= 15
+    assert 30 <= cfg.max_active_exposure_usd <= 50
+
+
+def test_max_active_exposure_caps_grid_notional(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.grid_levels = 4
+    cfg.max_position_notional_usd = 500
+    cfg.max_active_exposure_usd = 50
+    cfg.max_directional_exposure_pct = 1.0
+    cfg.order_notional_usd = 15
+    cfg.max_notional_per_trade_usd = 15
+    cfg.min_notional_usd = 1
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "exposure_cap.json", paper_mode=True, enable_live_trading=False))
+    levels = orch._exposure_limited_grid_levels(GridMode.NEUTRAL, True, True, 15, cfg.max_active_exposure_usd)
+    assert levels * 15 <= 50
+
+
+def test_trend_bias_defaults_and_confidence(tmp_path):
+    cfg = BotConfig.from_env()
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "trend_bias.json", paper_mode=True, enable_live_trading=False))
+    assert orch._trend_bias(0.5) == pytest.approx(0.70)
+    assert orch._trend_bias(0.9) == pytest.approx(0.80)
+    assert orch._trend_bias(0.1) == pytest.approx(0.60)
+
+
+def test_grid_level_counts_use_70_30_default_bias():
+    gm = GridManager()
+    buy, sell = gm._level_counts(10, GridMode.LONG_BIASED, trend_bias=0.70)
+    assert (buy, sell) == (7, 3)
+    buy, sell = gm._level_counts(10, GridMode.SHORT_BIASED, trend_bias=0.70)
+    assert (buy, sell) == (3, 7)
+
+
+def test_volatility_adjusted_grid_levels(tmp_path):
+    cfg = BotConfig.from_env()
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "vol_levels.json", paper_mode=True, enable_live_trading=False))
+    assert orch._volatility_adjusted_grid_levels(cfg.vol_low_threshold / 2) == 4
+    assert orch._volatility_adjusted_grid_levels((cfg.vol_low_threshold + cfg.vol_high_threshold) / 2) == 3
+    assert orch._volatility_adjusted_grid_levels(cfg.vol_high_threshold * 1.1) == 2
+    assert orch._volatility_adjusted_grid_levels(cfg.vol_extreme_threshold * 1.1) == 1
+
+
+def test_atr_spacing_increases_with_volatility(tmp_path):
+    cfg = BotConfig.from_env()
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "atr_spacing.json", paper_mode=True, enable_live_trading=False))
+    low_spacing, low_source = orch._calculate_spacing_pct(0.001, 0.001)
+    high_spacing, high_source = orch._calculate_spacing_pct(0.02, 0.001)
+    assert high_spacing > low_spacing
+    assert "atr" in high_source
+
+
+def test_orphan_cleanup_forced_rebuild_bypasses_cooldown(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.recenter_cooldown_seconds = 3600
+    cfg.order_notional_usd = 10
+    cfg.max_notional_per_trade_usd = 10
+    cfg.min_notional_usd = 1
+    eng = make_test_engine(tmp_path, "orphan_cleanup_forced.json", paper_mode=True, enable_live_trading=False)
+    old_ts = time.time() - 10000
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99, "size": 0.1, "created_ts": old_ts}]
+    orch = StrategyOrchestrator(cfg, eng)
+    orch.last_recenter_ts = datetime.now(timezone.utc)
+    candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [101 for _ in range(80)], "low": [99 for _ in range(80)]})
+    status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+    assert status["force_recenter"] is True
+    assert status["forced_rebuild"] is True
+    assert status["rebuild_reason"] in {"orphan_cleanup", "stale_cleanup"}
+
+
+def test_stale_cleanup_forced_rebuild_bypasses_cooldown(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.recenter_cooldown_seconds = 3600
+    cfg.stale_order_max_age_sec = 1
+    cfg.order_notional_usd = 10
+    cfg.max_notional_per_trade_usd = 10
+    cfg.min_notional_usd = 1
+    eng = make_test_engine(tmp_path, "stale_cleanup_forced.json", paper_mode=True, enable_live_trading=False)
+    eng.open_orders = [
+        {"symbol": "BTC", "side": "buy", "price": 99, "size": 0.1, "created_ts": time.time() - 10},
+        {"symbol": "BTC", "side": "sell", "price": 101, "size": 0.1, "created_ts": time.time() - 10},
+    ]
+    orch = StrategyOrchestrator(cfg, eng)
+    orch.last_recenter_ts = datetime.now(timezone.utc)
+    candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [101 for _ in range(80)], "low": [99 for _ in range(80)]})
+    status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+    assert status["force_recenter"] is True
+    assert status["forced_rebuild"] is True
+    assert status["rebuild_reason"] == "stale_cleanup"
+
+
+class FakeLiveStateEngine:
+    def __init__(self):
+        self.paper_mode = False
+        self.open_orders = []
+        self.no_fill_cycles = 0
+        self.last_real_trade_ts = None
+        self.paper = type("PaperMirror", (), {"position_size": 9.0, "avg_entry": 1.0})()
+
+    def account_state(self, symbol, mark_price):
+        from src.execution_engine import AccountState
+        return AccountState("live", 160.0, 0.01, 100.0, 1.0, 0.0, 0.0, 0.0, 160.0, 0.0, 0.0, "2026-06-05")
+
+    def cancel_replace_grid(self, symbol, plan):
+        self.open_orders = [{"symbol": symbol, "side": o.side, "price": o.price, "size": o.size} for o in plan.long_levels + plan.short_levels]
+        return {"canceled": 0, "placed": len(self.open_orders), "symbol": symbol}
+
+    def cancel_all_orders(self, symbol):
+        self.open_orders = []
+        return 0
+
+    def flatten_position(self, symbol, price):
+        return False
+
+    def place_reduce_only_orders(self, symbol, position_size, mark_price, order_size, levels=3):
+        return 0
+
+
+def test_live_strategy_uses_live_account_state_not_paper_mirror():
+    cfg = BotConfig.from_env()
+    cfg.paper_mode = False
+    cfg.max_position_notional_usd = 50
+    cfg.max_active_exposure_usd = 50
+    cfg.order_notional_usd = 10
+    cfg.max_notional_per_trade_usd = 10
+    cfg.min_notional_usd = 1
+    orch = StrategyOrchestrator(cfg, FakeLiveStateEngine())
+    candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [101 for _ in range(80)], "low": [99 for _ in range(80)]})
+    status = orch.on_tick(candles, equity=9999.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=9999.0)
+    assert status["state_source"] == "live"
+    assert status["position_notional_raw"] == pytest.approx(9999.0)  # explicit caller override is still honored
+    status = orch.on_tick(candles, equity=9999.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+    assert status["position_notional_raw"] == pytest.approx(1.0)
+    assert status["effective_position_side"] == "LONG"
+
+
+def test_daily_pnl_baseline_calculation_is_equity_based():
+    from src.main import calculate_daily_pnl_metrics
+    metrics = calculate_daily_pnl_metrics(
+        current_equity=161.0,
+        daily_start_equity=160.0,
+        realized_pnl_total=2.0,
+        daily_start_realized_pnl=1.0,
+        unrealized_pnl=0.5,
+        fees_paid_total=0.2,
+        daily_start_fees_paid=0.1,
+    )
+    assert metrics["daily_realized_pnl"] == pytest.approx(1.0)
+    assert metrics["daily_fees"] == pytest.approx(0.1)
+    assert metrics["net_daily_pnl"] == pytest.approx(1.0)
+    assert metrics["daily_pnl_pct"] == pytest.approx(1.0 / 160.0)
+    assert metrics["daily_pnl_pct"] < 0.61
