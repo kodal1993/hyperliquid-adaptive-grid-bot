@@ -37,16 +37,20 @@ class StrategyOrchestrator:
         self.grid_manager = GridManager()
         self.last_recenter_ts: datetime | None = None
         self.last_trend_regime: MarketRegime | None = None
+        self.pending_regime: MarketRegime | None = None
+        self.pending_regime_count = 0
         self.trend_flip_cooldown_remaining = 0
-        self.trend_flip_cooldown_ticks = 6
+        self.trend_flip_cooldown_ticks = max(int(getattr(config, "trend_flip_cooldown_ticks", 6)), 0)
         self.wrong_way_exit_loss_pct = 0.0035
         self.orphan_order_cleanup_count = 0
         self.stale_order_cleanup_count = 0
 
     def on_tick(self, candles: pd.DataFrame, equity: float, daily_pnl_pct: float, symbol: str, position_notional: float = 0.0) -> dict:
         regime_signal = self.detector.detect_signal(candles, trend_lookback_candles=self.config.trend_lookback_candles, trend_move_threshold_pct=self.config.trend_move_threshold_pct, ema_slope_threshold_pct=self.config.ema_slope_threshold_pct)
-        regime = regime_signal.regime
-        regime_confidence = regime_signal.confidence
+        raw_regime = regime_signal.regime
+        raw_regime_confidence = regime_signal.confidence
+        regime = self._confirmed_regime(raw_regime, raw_regime_confidence)
+        regime_confidence = raw_regime_confidence if regime == raw_regime else min(raw_regime_confidence, self.config.trend_confidence_weak)
         price = float(candles["close"].iloc[-1])
         account_state = self.execution_engine.account_state(symbol, price)
         logger.info("execution_state state_source=%s equity=%.4f position_size=%.8f position_notional=%.4f", account_state.state_source, account_state.equity, account_state.position_size, account_state.position_notional)
@@ -127,7 +131,7 @@ class StrategyOrchestrator:
         final_spacing_pct, spacing_source = self._calculate_spacing_pct(atr_pct, vol)
         volatility_grid_levels = self._volatility_adjusted_grid_levels(atr_pct)
         trend_bias = self._trend_bias(regime_confidence)
-        logger.info("grid_spacing spacing_source=%s atr_pct=%.6f return_vol_pct=%.6f final_spacing_pct=%.6f volatility_grid_levels=%s regime_confidence=%.3f trend_bias=%.2f", spacing_source, atr_pct, vol, final_spacing_pct, volatility_grid_levels, regime_confidence, trend_bias)
+        logger.info("grid_spacing spacing_source=%s atr_pct=%.6f return_vol_pct=%.6f final_spacing_pct=%.6f volatility_grid_levels=%s raw_regime=%s regime=%s regime_confidence=%.3f trend_bias=%.2f", spacing_source, atr_pct, vol, final_spacing_pct, volatility_grid_levels, raw_regime.value, regime.value, regime_confidence, trend_bias)
         order_size = self._calculate_order_size(price)
         order_notional = order_size * price
 
@@ -409,6 +413,13 @@ class StrategyOrchestrator:
             "pre_rebuild_sell_orders": sell_order_count,
             "in_position_for_recenter": in_position,
             "trend_flip_cooldown_remaining": self.trend_flip_cooldown_remaining,
+            "trend_flip_cooldown_ticks": self.trend_flip_cooldown_ticks,
+            "regime_confirmation_bars": self.config.regime_confirmation_bars,
+            "regime_min_confidence": self.config.regime_min_confidence,
+            "raw_regime": raw_regime.value,
+            "raw_regime_confidence": raw_regime_confidence,
+            "pending_regime": self.pending_regime.value if self.pending_regime else None,
+            "pending_regime_count": self.pending_regime_count,
             "wrong_way_loss_pct": wrong_way_loss_pct,
         }
 
@@ -439,6 +450,43 @@ class StrategyOrchestrator:
             canceled = self.execution_engine.cancel_all_orders(symbol)
             return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
         return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
+
+    def _confirmed_regime(self, raw_regime: MarketRegime, confidence: float) -> MarketRegime:
+        """Require configured confirmation and confidence before acting on trend regimes."""
+        min_confidence = max(float(getattr(self.config, "regime_min_confidence", 0.0)), 0.0)
+        confirmation_bars = max(int(getattr(self.config, "regime_confirmation_bars", 1)), 1)
+        trend_regimes = {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN}
+
+        if raw_regime not in trend_regimes:
+            self.pending_regime = None
+            self.pending_regime_count = 0
+            return raw_regime
+
+        if confidence < min_confidence:
+            logger.info(
+                "regime_confidence_check_blocked raw_regime=%s confidence=%.3f min_confidence=%.3f",
+                raw_regime.value,
+                confidence,
+                min_confidence,
+            )
+            return self.last_trend_regime if self.last_trend_regime == raw_regime else MarketRegime.RANGE
+
+        if self.pending_regime == raw_regime:
+            self.pending_regime_count += 1
+        else:
+            self.pending_regime = raw_regime
+            self.pending_regime_count = 1
+
+        if self.pending_regime_count < confirmation_bars:
+            logger.info(
+                "regime_confirmation_pending raw_regime=%s confirmation_count=%s confirmation_bars=%s",
+                raw_regime.value,
+                self.pending_regime_count,
+                confirmation_bars,
+            )
+            return self.last_trend_regime if self.last_trend_regime == raw_regime else MarketRegime.RANGE
+
+        return raw_regime
 
 
     def _apply_minimum_expected_edge_filter(self, plan: GridPlan, *, mid_price: float, position_size: float) -> dict:

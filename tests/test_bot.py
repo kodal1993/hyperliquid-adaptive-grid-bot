@@ -176,6 +176,38 @@ def test_apply_fill_short_to_long_flip(tmp_path):
     assert eng.paper.avg_entry == 90.0
 
 
+
+def test_apply_fill_records_flip_trade_analytics(tmp_path):
+    eng = make_test_engine(tmp_path, "flip_analytics.json")
+    eng.paper.position_size = 1.0
+    eng.paper.avg_entry = 100.0
+
+    eng._apply_fill({"symbol": "BTC", "side": "sell", "price": 110.0, "size": 2.0})
+
+    [entry] = eng.consume_trade_log()
+    assert entry["exposure_action"] == "flipping"
+    assert entry["trade_category"] == "flip"
+    assert entry["is_flip_trade"] is True
+    assert entry["flip_trade_count"] == 1
+    assert eng.flip_trade_count == 1
+    assert eng.last_flip_trade_ts is not None
+
+
+def test_regime_confirmation_and_confidence_checks(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.regime_confirmation_bars = 2
+    cfg.regime_min_confidence = 0.7
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "regime_confirm.json", paper_mode=True, enable_live_trading=False))
+
+    low_conf = orch._confirmed_regime(MarketRegime.TREND_UP, 0.6)
+    first_high_conf = orch._confirmed_regime(MarketRegime.TREND_UP, 0.8)
+    second_high_conf = orch._confirmed_regime(MarketRegime.TREND_UP, 0.8)
+
+    assert low_conf == MarketRegime.RANGE
+    assert first_high_conf == MarketRegime.RANGE
+    assert second_high_conf == MarketRegime.TREND_UP
+
+
 def test_conservative_fill_model_wide_candle(tmp_path):
     eng = make_test_engine(tmp_path, "s5.json", fill_model="conservative")
     eng.open_orders = [
@@ -1752,11 +1784,11 @@ def test_trade_analytics_report_calculates_profitability_metrics(tmp_path):
 
     trades = tmp_path / "trades.csv"
     trades.write_text(
-        "timestamp,symbol,side,price,qty,notional,fee,realized_pnl_delta,realized_pnl_total,cash,equity,position_size,position_notional,regime,mode,risk_state,pause_reason,reason\n"
-        "2026-01-01T00:00:00+00:00,BTC,buy,10000,1,10000,0.04,0,0,500,500,1,100,RANGE,neutral,OK,,grid_fill\n"
-        "2026-01-01T00:10:00+00:00,BTC,sell,10100,1,10100,0.04,1,1,501,501,0,0,RANGE,neutral,OK,,grid_fill\n"
-        "2026-01-01T00:20:00+00:00,BTC,sell,10000,1,10000,0.04,0,1,501,501,-1,100,TREND_DOWN,short_biased,OK,,grid_fill\n"
-        "2026-01-01T00:30:00+00:00,BTC,buy,10100,1,10100,0.04,-1,0,500,500,0,0,TREND_DOWN,short_biased,OK,,grid_fill\n"
+        "timestamp,symbol,side,price,qty,notional,fee,realized_pnl_delta,realized_pnl_total,cash,equity,position_before,position_after,position_size,position_notional,exposure_action,trade_category,is_flip_trade,flip_trade_count,regime,mode,risk_state,pause_reason,reason\n"
+        "2026-01-01T00:00:00+00:00,BTC,buy,10000,1,10000,0.04,0,0,500,500,0,1,1,100,increasing,entry,False,0,RANGE,neutral,OK,,grid_fill\n"
+        "2026-01-01T00:10:00+00:00,BTC,sell,10100,1,10100,0.04,1,1,501,501,1,0,0,0,flat,close,False,0,RANGE,neutral,OK,,grid_fill\n"
+        "2026-01-01T00:20:00+00:00,BTC,sell,10000,1,10000,0.04,0,1,501,501,0,-1,-1,100,increasing,entry,False,0,TREND_DOWN,short_biased,OK,,grid_fill\n"
+        "2026-01-01T00:30:00+00:00,BTC,buy,10100,1,10100,0.04,-1,0,500,500,-1,0,0,0,flipping,flip,True,1,TREND_DOWN,short_biased,OK,,grid_fill\n"
     )
 
     report = _trade_analytics_report("BTC", trades)
@@ -1769,6 +1801,9 @@ def test_trade_analytics_report_calculates_profitability_metrics(tmp_path):
     assert report["average_holding_time_seconds"] == pytest.approx(600.0)
     assert report["pnl_by_regime"]["RANGE"] == pytest.approx(0.92)
     assert report["pnl_by_regime"]["TREND_DOWN"] == pytest.approx(-1.08)
+    assert report["pnl_by_trade_category"]["flip"] == pytest.approx(-1.04)
+    assert report["flip_trade_count"] == 1
+    assert report["flip_trade_pnl"] == pytest.approx(-1.04)
 
 
 class DummyLiveClient:

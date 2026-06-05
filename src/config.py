@@ -35,6 +35,9 @@ class BotConfig:
     trend_bias_weak: float
     trend_confidence_strong: float
     trend_confidence_weak: float
+    regime_confirmation_bars: int
+    regime_min_confidence: float
+    trend_flip_cooldown_ticks: int
     order_notional_usd: float
     max_active_exposure_usd: float
     regrid_threshold_pct: float
@@ -137,6 +140,9 @@ class BotConfig:
             trend_bias_weak=float(os.getenv("TREND_BIAS_WEAK", "0.60")),
             trend_confidence_strong=float(os.getenv("TREND_CONFIDENCE_STRONG", "0.75")),
             trend_confidence_weak=float(os.getenv("TREND_CONFIDENCE_WEAK", "0.35")),
+            regime_confirmation_bars=int(os.getenv("REGIME_CONFIRMATION_BARS", "1")),
+            regime_min_confidence=float(os.getenv("REGIME_MIN_CONFIDENCE", os.getenv("REGIME_CONFIDENCE_MIN", "0.0"))),
+            trend_flip_cooldown_ticks=int(os.getenv("TREND_FLIP_COOLDOWN_TICKS", os.getenv("FLIP_COOLDOWN_TICKS", "6"))),
             order_notional_usd=float(os.getenv("ORDER_NOTIONAL_USD", os.getenv("MAX_NOTIONAL_PER_TRADE_USD", "10"))),
             max_active_exposure_usd=float(os.getenv("MAX_ACTIVE_EXPOSURE_USD", "50")),
             regrid_threshold_pct=float(os.getenv("REGRID_THRESHOLD_PCT", "0.003")),
