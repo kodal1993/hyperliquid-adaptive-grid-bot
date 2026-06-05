@@ -77,6 +77,15 @@ def classify_exposure_action(position_size: float, side: str, qty: float) -> str
 def would_increase_exposure(position_size: float, side: str, qty: float) -> bool:
     return classify_exposure_action(position_size, side, qty) == "increasing"
 
+
+def trade_category_for_action(exposure_action: str) -> str:
+    return {
+        "increasing": "entry",
+        "reducing": "reduce",
+        "flat": "close",
+        "flipping": "flip",
+    }.get(exposure_action, exposure_action or "unknown")
+
 class PaperExecutionEngine:
     def __init__(self, client: HyperliquidClient, state_file: str, paper_mode: bool = True, enable_live_trading: bool = False, fee_rate: float = 0.0004, start_balance: float = 500.0, fill_model: str = "optimistic", max_position_notional_usd: float = 500.0, soft_exposure_cap_pct: float = 0.6, hard_exposure_cap_pct: float = 0.8, absolute_exposure_cap_pct: float = 1.0, allow_position_flip: bool = False, trade_ledger_csv: str | None = None, trade_ledger_jsonl: str | None = None, risk_decisions_csv: str | None = None) -> None:
         self.client = client
@@ -100,6 +109,8 @@ class PaperExecutionEngine:
         self.allow_position_flip = allow_position_flip
         self.no_fill_cycles = 0
         self.last_real_trade_ts: datetime | None = None
+        self.flip_trade_count = 0
+        self.last_flip_trade_ts: datetime | None = None
 
     def _require_paper_execution(self, action: str) -> None:
         if not self.paper_mode:
@@ -315,6 +326,9 @@ class PaperExecutionEngine:
         price, size = float(fill["price"]), float(fill["size"])
         position_before = self.paper.position_size
         realized_before = self.paper.realized_pnl
+        exposure_action = classify_exposure_action(position_before, fill["side"], size)
+        trade_category = trade_category_for_action(exposure_action)
+        is_flip_trade = exposure_action == "flipping"
         signed = size if fill["side"] == "buy" else -size
         fee = abs(price * size) * self.fee_rate
         self.paper.fees_paid += fee
@@ -338,6 +352,9 @@ class PaperExecutionEngine:
 
         realized_delta = self.paper.realized_pnl - realized_before
         position_notional = abs(self.paper.position_size * price)
+        if is_flip_trade:
+            self.flip_trade_count += 1
+            self.last_flip_trade_ts = datetime.now(timezone.utc)
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "symbol": fill.get("symbol", ""),
@@ -353,6 +370,10 @@ class PaperExecutionEngine:
             "position_before": position_before,
             "position_after": self.paper.position_size,
             "position_size": self.paper.position_size,
+            "exposure_action": exposure_action,
+            "trade_category": trade_category,
+            "is_flip_trade": is_flip_trade,
+            "flip_trade_count": self.flip_trade_count,
             "position_notional": position_notional,
             "regime": regime,
             "mode": mode,
@@ -370,6 +391,8 @@ class PaperExecutionEngine:
         position_size_before = self.paper.position_size
         position_notional_before = abs(position_size_before * mark_price)
         exposure_action = classify_exposure_action(position_size_before, side, qty)
+        trade_category = trade_category_for_action(exposure_action)
+        is_flip_trade = exposure_action == "flipping"
         would_inc = exposure_action == "increasing"
         exposure_reducing_override = exposure_action in {"reducing", "flat"}
         max_n = max(self.max_position_notional_usd, 1e-9)
@@ -400,14 +423,14 @@ class PaperExecutionEngine:
         if exposure_action == "increasing" and (risk_state == "BLOCKED" or pause_reason in {"one_direction_exposure", "max_position_notional", "emergency_stop", "max_drawdown", "daily_loss_limit", "daily_loss", "liquidation_risk", "liq_distance"}):
             decision, block_reason = "block", pause_reason or "risk_state_blocked"
 
-        payload = {"symbol": fill.get("symbol", ""), "side": side, "price": price, "qty": qty, "order_notional": order_notional, "position_size_before": position_size_before, "position_notional_before": position_notional_before, "estimated_position_notional_after": estimated_position_notional_after, "max_position_notional_usd": self.max_position_notional_usd, "exposure_ratio": exposure_ratio, "would_increase_exposure": would_inc, "exposure_action": exposure_action, "exposure_reducing_override": exposure_reducing_override, "risk_state": risk_state, "risk_state_before": risk_state_before, "strategy_status": strategy_status, "pause_reason": pause_reason, "decision": decision, "allow_reason": allow_reason, "block_reason": block_reason, "regime": regime, "mode": mode}
+        payload = {"symbol": fill.get("symbol", ""), "side": side, "price": price, "qty": qty, "order_notional": order_notional, "position_size_before": position_size_before, "position_notional_before": position_notional_before, "estimated_position_notional_after": estimated_position_notional_after, "max_position_notional_usd": self.max_position_notional_usd, "exposure_ratio": exposure_ratio, "would_increase_exposure": would_inc, "exposure_action": exposure_action, "trade_category": trade_category, "is_flip_trade": is_flip_trade, "exposure_reducing_override": exposure_reducing_override, "risk_state": risk_state, "risk_state_before": risk_state_before, "strategy_status": strategy_status, "pause_reason": pause_reason, "decision": decision, "allow_reason": allow_reason, "block_reason": block_reason, "regime": regime, "mode": mode}
         self._append_risk_decision(payload)
         logger.info("risk_decision symbol=%s side=%s price=%s qty=%s order_notional=%s position_notional_before=%s max_position_notional_usd=%s exposure_ratio=%.3f would_increase_exposure=%s exposure_reducing_override=%s risk_state_before=%s risk_state=%s strategy_status=%s pause_reason=%s decision=%s allow_reason=%s block_reason=%s", payload["symbol"], side, price, qty, order_notional, position_notional_before, self.max_position_notional_usd, exposure_ratio, would_inc, exposure_reducing_override, risk_state_before, risk_state, payload["strategy_status"], pause_reason or "none", decision, allow_reason or "none", block_reason or "none")
         return decision, block_reason
 
     def _append_risk_decision(self, entry: dict) -> None:
         self.risk_decisions_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["timestamp", "symbol", "side", "price", "qty", "order_notional", "position_size_before", "position_notional_before", "estimated_position_notional_after", "max_position_notional_usd", "exposure_ratio", "would_increase_exposure", "exposure_action", "exposure_reducing_override", "risk_state_before", "risk_state", "strategy_status", "pause_reason", "decision", "allow_reason", "block_reason", "regime", "mode"]
+        fields = ["timestamp", "symbol", "side", "price", "qty", "order_notional", "position_size_before", "position_notional_before", "estimated_position_notional_after", "max_position_notional_usd", "exposure_ratio", "would_increase_exposure", "exposure_action", "trade_category", "is_flip_trade", "exposure_reducing_override", "risk_state_before", "risk_state", "strategy_status", "pause_reason", "decision", "allow_reason", "block_reason", "regime", "mode"]
         write_header = not self.risk_decisions_csv.exists()
         row = {"timestamp": datetime.now(timezone.utc).isoformat(), **entry}
         with self.risk_decisions_csv.open("a", encoding="utf-8") as f:
@@ -425,7 +448,7 @@ class PaperExecutionEngine:
 
     def _append_trade_ledger(self, entry: dict) -> None:
         self.trade_ledger_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_size", "position_notional", "regime", "mode", "risk_state", "pause_reason", "reason"]
+        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason"]
         write_header = not self.trade_ledger_csv.exists()
         with self.trade_ledger_csv.open("a", encoding="utf-8") as f:
             if write_header:
@@ -472,6 +495,8 @@ class LiveExecutionEngine:
         self.allow_position_flip = bool(kwargs.pop("allow_position_flip", False))
         self.no_fill_cycles = 0
         self.last_real_trade_ts: datetime | None = None
+        self.flip_trade_count = 0
+        self.last_flip_trade_ts: datetime | None = None
         self.max_notional_per_trade_usd = max_notional_per_trade_usd
         self.min_notional_usd = min_notional_usd
         self.leverage = leverage
@@ -648,6 +673,10 @@ class LiveExecutionEngine:
             self._seen_fill_ids.add(fill_id)
             self.state.realized_pnl += float(entry.get("realized_pnl_delta", 0.0) or 0.0)
             self.state.fees_paid += float(entry.get("fee", 0.0) or 0.0)
+            if entry.get("is_flip_trade"):
+                self.flip_trade_count += 1
+                self.last_flip_trade_ts = datetime.now(timezone.utc)
+                entry["flip_trade_count"] = self.flip_trade_count
             entry["realized_pnl_total"] = self.state.realized_pnl
             entry["fees_paid"] = self.state.fees_paid
             self.trade_log.append(entry)
@@ -663,7 +692,7 @@ class LiveExecutionEngine:
 
     def _append_trade_ledger(self, entry: dict) -> None:
         self.trade_ledger_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_size", "position_notional", "regime", "mode", "risk_state", "pause_reason", "reason"]
+        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason"]
         write_header = not self.trade_ledger_csv.exists()
         with self.trade_ledger_csv.open("a", encoding="utf-8") as f:
             if write_header:
@@ -751,6 +780,11 @@ class LiveExecutionEngine:
             timestamp = datetime.fromtimestamp(float(ts_raw) / 1000, tz=timezone.utc).isoformat()
         else:
             timestamp = datetime.now(timezone.utc).isoformat()
+        position_before = self.state.position_size
+        exposure_action = classify_exposure_action(position_before, side, size)
+        trade_category = trade_category_for_action(exposure_action)
+        is_flip_trade = exposure_action == "flipping"
+        position_after = position_before + _signed_order_size(side, size)
         position_notional = abs(self.state.position_size * price)
         return {
             "timestamp": timestamp,
@@ -764,8 +798,14 @@ class LiveExecutionEngine:
             "realized_pnl_total": self.state.realized_pnl + realized_delta,
             "cash": self.state.cash,
             "equity": self.state.cash,
+            "position_before": position_before,
+            "position_after": position_after,
             "position_size": self.state.position_size,
             "position_notional": position_notional,
+            "exposure_action": exposure_action,
+            "trade_category": trade_category,
+            "is_flip_trade": is_flip_trade,
+            "flip_trade_count": self.flip_trade_count,
             "regime": regime,
             "mode": mode,
             "risk_state": risk_state,

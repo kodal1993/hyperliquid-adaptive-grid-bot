@@ -225,6 +225,9 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV) -
         "fee_gross_profit_ratio": 0.0,
         "average_holding_time_seconds": 0.0,
         "pnl_by_regime": {},
+        "pnl_by_trade_category": {},
+        "flip_trade_count": 0,
+        "flip_trade_pnl": 0.0,
         "pnl_long_trades": 0.0,
         "pnl_short_trades": 0.0,
     }
@@ -239,6 +242,7 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV) -
     net_pnl = 0.0
     trade_count = 0
     pnl_by_regime: Counter[str] = Counter()
+    pnl_by_trade_category: Counter[str] = Counter()
     holding_times: list[float] = []
     open_position_started_at: datetime | None = None
     previous_position_size = 0.0
@@ -256,6 +260,12 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV) -
             trade_count += 1
             regime = str(row.get("regime") or "unknown")
             pnl_by_regime[regime] += net
+            trade_category = str(row.get("trade_category") or "unknown")
+            pnl_by_trade_category[trade_category] += net
+            is_flip_trade = str(row.get("is_flip_trade", "")).lower() == "true" or trade_category == "flip"
+            if is_flip_trade:
+                analytics["flip_trade_count"] += 1
+                analytics["flip_trade_pnl"] += net
             side = str(row.get("side", "")).lower()
             if side == "buy":
                 analytics["pnl_long_trades"] += net
@@ -286,6 +296,7 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV) -
     analytics["fee_gross_profit_ratio"] = total_fees / gross_profit if gross_profit > 1e-12 else 0.0
     analytics["average_holding_time_seconds"] = sum(holding_times) / len(holding_times) if holding_times else 0.0
     analytics["pnl_by_regime"] = dict(pnl_by_regime)
+    analytics["pnl_by_trade_category"] = dict(pnl_by_trade_category)
     return analytics
 
 
@@ -567,6 +578,9 @@ def run() -> None:
                 "fee_gross_profit_ratio": trade_analytics["fee_gross_profit_ratio"],
                 "average_holding_time_seconds": trade_analytics["average_holding_time_seconds"],
                 "pnl_by_regime": trade_analytics["pnl_by_regime"],
+                "pnl_by_trade_category": trade_analytics["pnl_by_trade_category"],
+                "flip_trade_count": trade_analytics["flip_trade_count"],
+                "flip_trade_pnl": trade_analytics["flip_trade_pnl"],
                 "pnl_long_trades": trade_analytics["pnl_long_trades"],
                 "pnl_short_trades": trade_analytics["pnl_short_trades"],
                 "edge_filter_skipped_orders": status.get("edge_filter_skipped_orders", 0),
