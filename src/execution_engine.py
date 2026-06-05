@@ -29,8 +29,8 @@ class AccountState:
 
 
 @dataclass
-class PaperState:
-    cash: float
+class ExecutionState:
+    equity: float
     position_size: float = 0.0
     avg_entry: float = 0.0
     realized_pnl: float = 0.0
@@ -39,6 +39,14 @@ class PaperState:
     daily_start_realized_pnl: float = 0.0
     daily_start_fees_paid: float = 0.0
     current_day: str = ""
+
+    @property
+    def cash(self) -> float:
+        return self.equity
+
+    @cash.setter
+    def cash(self, value: float) -> None:
+        self.equity = value
 
 
 logger = logging.getLogger(__name__)
@@ -78,7 +86,9 @@ class PaperExecutionEngine:
         self.state_file = Path(state_file)
         self.open_orders: list[dict] = []
         self.fill_model = fill_model
-        self.paper = self._load_state(start_balance)
+        self.state = self._load_state(start_balance)
+        # Compatibility for unit tests and offline simulation utilities only.
+        self.paper = self.state
         self.trade_log: list[dict] = []
         self.trade_ledger_csv = Path(trade_ledger_csv) if trade_ledger_csv else Path("logs/trades.csv")
         self.trade_ledger_jsonl = Path(trade_ledger_jsonl) if trade_ledger_jsonl else Path("logs/trades.jsonl")
@@ -97,10 +107,10 @@ class PaperExecutionEngine:
                 f"live_execution_not_implemented: {action} cannot use paper-simulated orders/fills when PAPER_MODE=false"
             )
 
-    def _load_state(self, start_balance: float) -> PaperState:
+    def _load_state(self, start_balance: float) -> ExecutionState:
         if self.state_file.exists():
-            return PaperState(**json.loads(self.state_file.read_text()))
-        return PaperState(cash=start_balance, daily_start_equity=start_balance)
+            return ExecutionState(**json.loads(self.state_file.read_text()))
+        return ExecutionState(equity=start_balance, daily_start_equity=start_balance)
 
     def save_state(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -430,17 +440,13 @@ class PaperExecutionEngine:
         return out
 
 
-class LiveExecutionEngine(PaperExecutionEngine):
+class LiveExecutionEngine:
     """Authenticated Hyperliquid execution engine.
 
     Live mode never derives fills from candles. Orders are submitted to the
     exchange and trade ledger entries are emitted only from Hyperliquid user
     fills returned by the authenticated account API.
     """
-
-    def _load_state(self, start_balance: float) -> PaperState:
-        # Live state stores exchange-fill de-duplication metadata, not simulated cash/PnL.
-        return PaperState(cash=start_balance, daily_start_equity=start_balance)
 
     def __init__(
         self,
@@ -452,7 +458,20 @@ class LiveExecutionEngine(PaperExecutionEngine):
         leverage: int = 1,
         **kwargs,
     ) -> None:
-        super().__init__(client=client, state_file=state_file, paper_mode=False, enable_live_trading=True, **kwargs)
+        self.client = client
+        self.execution_mode = "live_only"
+        self.state_file = Path(state_file)
+        self.open_orders: list[dict] = []
+        self.state = ExecutionState(equity=float(kwargs.pop("start_balance", 0.0) or 0.0))
+        self.state.daily_start_equity = self.state.equity
+        self.trade_log: list[dict] = []
+        self.trade_ledger_csv = Path(kwargs.pop("trade_ledger_csv", None) or "logs/trades.csv")
+        self.trade_ledger_jsonl = Path(kwargs.pop("trade_ledger_jsonl", None) or "logs/trades.jsonl")
+        self.risk_decisions_csv = Path(kwargs.pop("risk_decisions_csv", None) or "logs/risk_decisions.csv")
+        self.max_position_notional_usd = float(kwargs.pop("max_position_notional_usd", 500.0))
+        self.allow_position_flip = bool(kwargs.pop("allow_position_flip", False))
+        self.no_fill_cycles = 0
+        self.last_real_trade_ts: datetime | None = None
         self.max_notional_per_trade_usd = max_notional_per_trade_usd
         self.min_notional_usd = min_notional_usd
         self.leverage = leverage
@@ -472,10 +491,10 @@ class LiveExecutionEngine(PaperExecutionEngine):
             return
         if isinstance(payload, dict):
             self._seen_fill_ids = {str(x) for x in payload.get("seen_fill_ids", [])}
-            self.paper.daily_start_equity = float(payload.get("daily_start_equity", self.paper.daily_start_equity) or 0.0)
-            self.paper.daily_start_realized_pnl = float(payload.get("daily_start_realized_pnl", self.paper.daily_start_realized_pnl) or 0.0)
-            self.paper.daily_start_fees_paid = float(payload.get("daily_start_fees_paid", self.paper.daily_start_fees_paid) or 0.0)
-            self.paper.current_day = str(payload.get("current_day", self.paper.current_day) or "")
+            self.state.daily_start_equity = float(payload.get("daily_start_equity", self.state.daily_start_equity) or 0.0)
+            self.state.daily_start_realized_pnl = float(payload.get("daily_start_realized_pnl", self.state.daily_start_realized_pnl) or 0.0)
+            self.state.daily_start_fees_paid = float(payload.get("daily_start_fees_paid", self.state.daily_start_fees_paid) or 0.0)
+            self.state.current_day = str(payload.get("current_day", self.state.current_day) or "")
 
     def save_state(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -483,10 +502,10 @@ class LiveExecutionEngine(PaperExecutionEngine):
             "mode": "live",
             "seen_fill_ids": sorted(self._seen_fill_ids)[-1000:],
             "last_real_trade_ts": self.last_real_trade_ts.isoformat() if self.last_real_trade_ts else "",
-            "daily_start_equity": self.paper.daily_start_equity,
-            "daily_start_realized_pnl": self.paper.daily_start_realized_pnl,
-            "daily_start_fees_paid": self.paper.daily_start_fees_paid,
-            "current_day": self.paper.current_day,
+            "daily_start_equity": self.state.daily_start_equity,
+            "daily_start_realized_pnl": self.state.daily_start_realized_pnl,
+            "daily_start_fees_paid": self.state.daily_start_fees_paid,
+            "current_day": self.state.current_day,
         }
         self.state_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -495,13 +514,13 @@ class LiveExecutionEngine(PaperExecutionEngine):
         position = self.client.get_position(symbol)
         size = float(position.get("szi", 0.0) or 0.0)
         entry_px = float(position.get("entryPx", 0.0) or 0.0)
-        self.paper.position_size = size
-        self.paper.avg_entry = entry_px
-        self.paper.cash = float(balance.get("equity", 0.0) or 0.0)
+        self.state.position_size = size
+        self.state.avg_entry = entry_px
+        self.state.cash = float(balance.get("equity", 0.0) or 0.0)
         if mark_price is not None:
-            self.paper.daily_start_equity = self.paper.daily_start_equity or self.paper.cash
+            self.state.daily_start_equity = self.state.daily_start_equity or self.state.cash
         self.sync_open_orders(symbol)
-        return {"equity": self.paper.cash, "position_size": size, "avg_entry": entry_px, "open_orders": len(self.open_orders)}
+        return {"equity": self.state.cash, "position_size": size, "avg_entry": entry_px, "open_orders": len(self.open_orders)}
 
 
     def account_state(self, symbol: str, mark_price: float) -> AccountState:
@@ -514,17 +533,17 @@ class LiveExecutionEngine(PaperExecutionEngine):
             unrealized = 0.0
         return AccountState(
             state_source="live",
-            equity=self.paper.cash,
-            position_size=self.paper.position_size,
-            avg_entry=self.paper.avg_entry,
-            position_notional=abs(self.paper.position_size * mark_price),
+            equity=self.state.cash,
+            position_size=self.state.position_size,
+            avg_entry=self.state.avg_entry,
+            position_notional=abs(self.state.position_size * mark_price),
             unrealized_pnl=unrealized,
-            realized_pnl=self.paper.realized_pnl,
-            fees_paid=self.paper.fees_paid,
-            daily_start_equity=self.paper.daily_start_equity,
-            daily_start_realized_pnl=self.paper.daily_start_realized_pnl,
-            daily_start_fees_paid=self.paper.daily_start_fees_paid,
-            current_day=self.paper.current_day,
+            realized_pnl=self.state.realized_pnl,
+            fees_paid=self.state.fees_paid,
+            daily_start_equity=self.state.daily_start_equity,
+            daily_start_realized_pnl=self.state.daily_start_realized_pnl,
+            daily_start_fees_paid=self.state.daily_start_fees_paid,
+            current_day=self.state.current_day,
         )
 
     def sync_open_orders(self, symbol: str) -> list[dict]:
@@ -585,7 +604,7 @@ class LiveExecutionEngine(PaperExecutionEngine):
 
     def place_reduce_only_orders(self, symbol: str, position_size: float, mark_price: float, order_size: float, levels: int = 3) -> int:
         self.sync_account(symbol, mark_price)
-        live_position_size = self.paper.position_size
+        live_position_size = self.state.position_size
         if abs(live_position_size) < 1e-12:
             return 0
         side = "buy" if live_position_size < 0 else "sell"
@@ -605,11 +624,11 @@ class LiveExecutionEngine(PaperExecutionEngine):
 
     def flatten_position(self, symbol: str, mark_price: float) -> bool:
         self.sync_account(symbol, mark_price)
-        if abs(self.paper.position_size) < 1e-12:
+        if abs(self.state.position_size) < 1e-12:
             return False
-        side = "buy" if self.paper.position_size < 0 else "sell"
+        side = "buy" if self.state.position_size < 0 else "sell"
         limit_price = mark_price * 1.002 if side == "buy" else mark_price * 0.998
-        return self._submit_live_limit(symbol, side, abs(self.paper.position_size), limit_price, reduce_only=True)
+        return self._submit_live_limit(symbol, side, abs(self.state.position_size), limit_price, reduce_only=True)
 
     def on_candle(self, candle: dict, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", strategy_status: str = "running") -> list[dict]:
         symbol = str(candle.get("symbol") or "")
@@ -627,10 +646,10 @@ class LiveExecutionEngine(PaperExecutionEngine):
                 continue
             entry = self._ledger_entry_from_exchange_fill(raw, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason)
             self._seen_fill_ids.add(fill_id)
-            self.paper.realized_pnl += float(entry.get("realized_pnl_delta", 0.0) or 0.0)
-            self.paper.fees_paid += float(entry.get("fee", 0.0) or 0.0)
-            entry["realized_pnl_total"] = self.paper.realized_pnl
-            entry["fees_paid"] = self.paper.fees_paid
+            self.state.realized_pnl += float(entry.get("realized_pnl_delta", 0.0) or 0.0)
+            self.state.fees_paid += float(entry.get("fee", 0.0) or 0.0)
+            entry["realized_pnl_total"] = self.state.realized_pnl
+            entry["fees_paid"] = self.state.fees_paid
             self.trade_log.append(entry)
             self._append_trade_ledger(entry)
             new_entries.append(entry)
@@ -640,6 +659,23 @@ class LiveExecutionEngine(PaperExecutionEngine):
                 self.sync_account(symbol, None)
             self.save_state()
         return new_entries
+
+
+    def _append_trade_ledger(self, entry: dict) -> None:
+        self.trade_ledger_csv.parent.mkdir(parents=True, exist_ok=True)
+        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_size", "position_notional", "regime", "mode", "risk_state", "pause_reason", "reason"]
+        write_header = not self.trade_ledger_csv.exists()
+        with self.trade_ledger_csv.open("a", encoding="utf-8") as f:
+            if write_header:
+                f.write(",".join(fields) + "\n")
+            f.write(",".join(str(entry.get(k, "")) for k in fields) + "\n")
+        with self.trade_ledger_jsonl.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    def consume_trade_log(self) -> list[dict]:
+        out = list(self.trade_log)
+        self.trade_log.clear()
+        return out
 
     def _submit_live_limit(self, symbol: str, side: str, size: float, price: float, *, reduce_only: bool) -> bool:
         normalized_price = normalize_price(symbol, price)
@@ -686,7 +722,7 @@ class LiveExecutionEngine(PaperExecutionEngine):
             return False
 
         notional = float(notional_decimal)
-        if not reduce_only and abs((self.paper.position_size + _signed_order_size(side, normalized_size)) * normalized_price) > self.max_position_notional_usd + 1e-9:
+        if not reduce_only and abs((self.state.position_size + _signed_order_size(side, normalized_size)) * normalized_price) > self.max_position_notional_usd + 1e-9:
             logger.warning("live_order_blocked reason=max_position_notional side=%s price=%s size=%s", side, normalized_price, normalized_size)
             return False
         logger.info("order_submitted mode=live side=%s price=%s qty=%s notional=%s reduce_only=%s", side, normalized_price, normalized_size, notional, reduce_only)
@@ -715,7 +751,7 @@ class LiveExecutionEngine(PaperExecutionEngine):
             timestamp = datetime.fromtimestamp(float(ts_raw) / 1000, tz=timezone.utc).isoformat()
         else:
             timestamp = datetime.now(timezone.utc).isoformat()
-        position_notional = abs(self.paper.position_size * price)
+        position_notional = abs(self.state.position_size * price)
         return {
             "timestamp": timestamp,
             "symbol": raw.get("coin", ""),
@@ -725,10 +761,10 @@ class LiveExecutionEngine(PaperExecutionEngine):
             "notional": abs(price * size),
             "fee": fee,
             "realized_pnl_delta": realized_delta,
-            "realized_pnl_total": self.paper.realized_pnl + realized_delta,
-            "cash": self.paper.cash,
-            "equity": self.paper.cash,
-            "position_size": self.paper.position_size,
+            "realized_pnl_total": self.state.realized_pnl + realized_delta,
+            "cash": self.state.cash,
+            "equity": self.state.cash,
+            "position_size": self.state.position_size,
             "position_notional": position_notional,
             "regime": regime,
             "mode": mode,
@@ -738,5 +774,5 @@ class LiveExecutionEngine(PaperExecutionEngine):
         }
 
 
-# Backwards-compatible public name used by existing tests and integrations.
+# Offline simulation utility retained for unit tests only. Production uses LiveExecutionEngine.
 ExecutionEngine = PaperExecutionEngine

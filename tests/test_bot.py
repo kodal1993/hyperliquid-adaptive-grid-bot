@@ -15,7 +15,7 @@ from src.hyperliquid_client import HyperliquidClient, normalize_price, normalize
 from src.regime_detector import RegimeDetector
 from src.risk_manager import RiskManager
 from src.types import MarketRegime, GridMode
-from src.execution_engine import ExecutionEngine, would_increase_exposure
+from src.execution_engine import ExecutionEngine, LiveExecutionEngine, PaperExecutionEngine, would_increase_exposure
 from src.strategy_orchestrator import StrategyOrchestrator
 from src.startup_validation import validate_live_execution_gate
 
@@ -118,6 +118,7 @@ def test_regime_detector_basic():
 
 def test_order_size_notional_based(tmp_path):
     cfg = BotConfig.from_env()
+    cfg.order_notional_usd = 50
     cfg.max_notional_per_trade_usd = 50
     cfg.min_order_size = 0.0
     cfg.max_order_size = 10.0
@@ -151,7 +152,7 @@ def test_apply_fill_full_close_resets_avg(tmp_path):
     eng.paper.position_size = 1.0
     eng.paper.avg_entry = 100.0
     eng._apply_fill({"side": "sell", "price": 105.0, "size": 1.0})
-    assert eng.paper.position_size == 0.0
+    assert eng.state.position_size == 0.0
     assert eng.paper.avg_entry == 0.0
 
 
@@ -224,14 +225,9 @@ def test_daily_state_persistence(tmp_path):
     assert eng2.paper.daily_start_equity == 777.0
 
 
-def test_paper_profile_uses_conservative_fill_model(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".env").write_text("ENV_PROFILE=paper\n")
-    (tmp_path / "config").mkdir()
-    (tmp_path / "config" / "paper.env").write_text("FILL_MODEL=conservative\n")
-    cfg = BotConfig.from_env()
-    assert cfg.fill_model == "conservative"
-
+def test_offline_engine_uses_conservative_fill_model_when_requested(tmp_path):
+    eng = make_test_engine(tmp_path, "conservative_fill_model.json", paper_mode=True, enable_live_trading=False, fill_model="conservative")
+    assert eng.fill_model == "conservative"
 
 def test_reduce_only_places_directional_orders_on_max_position_notional(tmp_path):
     cfg = BotConfig.from_env()
@@ -259,7 +255,7 @@ def test_close_only_resize_long_flip_disabled(tmp_path):
     fills = eng.on_candle({"open": 80000, "high": 81000, "low": 79000, "close": 80000})
     assert len(fills) == 1
     assert abs(fills[0]["size"] - (39.0 / 80000.0)) < 1e-12
-    assert eng.paper.position_size == 0.0
+    assert eng.state.position_size == 0.0
 
 
 def test_close_only_resize_short_flip_disabled(tmp_path):
@@ -270,7 +266,7 @@ def test_close_only_resize_short_flip_disabled(tmp_path):
     fills = eng.on_candle({"open": 80000, "high": 81000, "low": 79000, "close": 80000})
     assert len(fills) == 1
     assert abs(fills[0]["size"] - (39.0 / 80000.0)) < 1e-12
-    assert eng.paper.position_size == 0.0
+    assert eng.state.position_size == 0.0
 
 
 def test_flip_enabled_can_flip_when_caps_allow(tmp_path):
@@ -303,6 +299,7 @@ def test_telegram_report_includes_last_trade_age_warning():
 
 def test_trend_up_neutral_long_blocks_new_buy_but_allows_sell_exit(tmp_path):
     cfg = BotConfig.from_env()
+    cfg.max_position_notional_usd = 500
     cfg.allow_long_biased = False
     cfg.allow_short_biased = False
     eng = make_test_engine(tmp_path, "trend_up_long.json", paper_mode=True, enable_live_trading=False)
@@ -320,6 +317,7 @@ def test_trend_up_neutral_long_blocks_new_buy_but_allows_sell_exit(tmp_path):
 
 def test_trend_down_neutral_short_blocks_new_sell_but_allows_buy_exit(tmp_path):
     cfg = BotConfig.from_env()
+    cfg.max_position_notional_usd = 500
     cfg.allow_long_biased = False
     cfg.allow_short_biased = False
     eng = make_test_engine(tmp_path, "trend_down_short.json", paper_mode=True, enable_live_trading=False)
@@ -338,6 +336,7 @@ def test_trend_down_neutral_short_blocks_new_sell_but_allows_buy_exit(tmp_path):
 
 def test_trend_up_long_biased_long_position_places_sell_exit(tmp_path):
     cfg = BotConfig.from_env()
+    cfg.max_position_notional_usd = 500
     cfg.allow_long_biased = True
     cfg.allow_short_biased = True
     eng = make_test_engine(tmp_path, "trend_up_biased_long_exit.json", paper_mode=True, enable_live_trading=False)
@@ -357,6 +356,7 @@ def test_trend_up_long_biased_long_position_places_sell_exit(tmp_path):
 
 def test_trend_down_short_biased_short_position_places_buy_exit(tmp_path):
     cfg = BotConfig.from_env()
+    cfg.max_position_notional_usd = 500
     cfg.allow_long_biased = True
     cfg.allow_short_biased = True
     eng = make_test_engine(tmp_path, "trend_down_biased_short_exit.json", paper_mode=True, enable_live_trading=False)
@@ -406,6 +406,7 @@ def test_trend_biased_flat_position_allows_only_trend_entry(tmp_path):
 
 def test_orphan_position_without_open_orders_forces_recenter_despite_cooldown(tmp_path):
     cfg = BotConfig.from_env()
+    cfg.max_position_notional_usd = 500
     cfg.allow_long_biased = True
     cfg.position_recenter_cooldown_seconds = 3600
     eng = make_test_engine(tmp_path, "orphan_position_recenter.json", paper_mode=True, enable_live_trading=False)
@@ -573,35 +574,28 @@ def test_env_profile_loads_telegram_interval(tmp_path, monkeypatch):
     assert cfg.telegram_report_interval_seconds == 123
 
 
-def test_fill_model_defaults_to_conservative_when_env_missing(monkeypatch):
-    monkeypatch.delenv("FILL_MODEL", raising=False)
-    cfg = BotConfig.from_env()
-    assert cfg.fill_model == "conservative"
-
-
-def test_paper_metrics_reflect_post_fill_state(tmp_path):
-    from src.main import _paper_metrics
+def test_offline_metrics_reflect_post_fill_state(tmp_path):
+    from src.main import _account_metrics
 
     class DummyCfg:
         paper_mode = True
-        paper_start_balance_usd = 500.0
 
     eng = make_test_engine(tmp_path, "post_fill_state.json", paper_mode=True, enable_live_trading=False, start_balance=500.0)
     eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 100.0, "size": 1.0}]
     latest_close = 100.0
 
-    pre_unrealized, pre_equity, pre_notional = _paper_metrics(DummyCfg(), eng, DummyClient(), latest_close)
-    assert pre_unrealized == 0.0
-    assert pre_equity == 500.0
-    assert pre_notional == 0.0
+    pre_state = _account_metrics(DummyCfg(), eng, DummyClient(), latest_close)
+    assert pre_state.unrealized_pnl == 0.0
+    assert pre_state.equity == 500.0
+    assert pre_state.position_notional == 0.0
 
     fills = eng.on_candle({"open": 100.0, "high": 101.0, "low": 99.0, "close": latest_close})
     assert len(fills) == 1
 
-    post_unrealized, post_equity, post_notional = _paper_metrics(DummyCfg(), eng, DummyClient(), latest_close)
-    assert post_unrealized == 0.0
-    assert post_equity < pre_equity
-    assert post_notional == 100.0
+    post_state = _account_metrics(DummyCfg(), eng, DummyClient(), latest_close)
+    assert post_state.unrealized_pnl == 0.0
+    assert post_state.equity < pre_state.equity
+    assert post_state.position_notional == 100.0
 
 
 def test_short_position_cannot_place_more_sell_expansion_orders(tmp_path):
@@ -756,7 +750,6 @@ def test_send_startup_telegram_respects_disabled_flag():
         paper_mode = True
         hl_network = "testnet"
         default_symbol = "BTC"
-        fill_model = "conservative"
         enable_live_trading = False
         env_profile = "paper"
         telegram_bot_token = "x"
@@ -888,7 +881,7 @@ def test_live_mode_fake_execution_is_forbidden(tmp_path):
     with pytest.raises(RuntimeError, match="live_execution_not_implemented"):
         eng.on_candle({"high": 101, "low": 99, "close": 100})
 
-    assert eng.paper.position_size == 0.0
+    assert eng.state.position_size == 0.0
 
 
 def test_live_execution_disabled_gate_fails(tmp_path, monkeypatch):
@@ -913,14 +906,15 @@ def test_live_execution_enabled_without_exchange_executor_fails(tmp_path, monkey
         validate_live_execution_gate(cfg)
 
 
-def test_live_execution_gate_allows_paper_flow(tmp_path, monkeypatch):
+def test_live_execution_gate_rejects_paper_flow(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     cfg = BotConfig.from_env()
     cfg.paper_mode = True
     cfg.enable_live_trading = False
     cfg.live_execution_enabled = False
 
-    validate_live_execution_gate(cfg)
+    with pytest.raises(RuntimeError, match="live_only_mode_required"):
+        validate_live_execution_gate(cfg)
     eng = make_test_engine(tmp_path, "paper_flow.json", paper_mode=True, enable_live_trading=False)
     eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 100, "size": 1}]
     fills = eng.on_candle({"high": 101, "low": 99, "close": 100})
@@ -1109,7 +1103,7 @@ def test_dust_position_triggers_cleanup_before_grid_management(tmp_path):
     assert status["flattened"] is True
     assert status["dust_cleanup_requested"] is True
     assert eng.open_orders == []
-    assert eng.paper.position_size == 0.0
+    assert eng.state.position_size == 0.0
 
 
 def test_live_submit_sends_normalized_btc_wire_values_and_not_raw_floats(tmp_path):
@@ -1224,7 +1218,7 @@ def test_live_execution_engine_does_not_use_candle_touch_fills(tmp_path):
     )
     fills = eng.on_candle({"symbol": "BTC", "high": 101, "low": 99, "close": 100})
     assert fills == []
-    assert eng.paper.position_size == 0.0
+    assert eng.state.position_size == 0.0
     assert not (tmp_path / "trades.csv").exists()
 
 
@@ -1775,3 +1769,47 @@ def test_trade_analytics_report_calculates_profitability_metrics(tmp_path):
     assert report["average_holding_time_seconds"] == pytest.approx(600.0)
     assert report["pnl_by_regime"]["RANGE"] == pytest.approx(0.92)
     assert report["pnl_by_regime"]["TREND_DOWN"] == pytest.approx(-1.08)
+
+
+class DummyLiveClient:
+    def require_live_execution_support(self):
+        return None
+
+    def get_balance(self):
+        return {"equity": 1234.0}
+
+    def get_position(self, symbol):
+        return {"szi": "0.02", "entryPx": "100.0", "unrealizedPnl": "1.5"}
+
+    def get_open_orders(self, symbol):
+        return []
+
+    def get_user_fills(self, symbol=None):
+        return []
+
+    def cancel_all_orders(self, symbol):
+        return 0
+
+    def place_limit_order(self, symbol, side, size, price, reduce_only=False):
+        return {"status": "ok"}
+
+
+def test_live_execution_engine_is_not_paper_engine(tmp_path):
+    engine = LiveExecutionEngine(DummyLiveClient(), str(tmp_path / "live_state.json"), max_notional_per_trade_usd=10, min_notional_usd=1)
+
+    assert not isinstance(engine, PaperExecutionEngine)
+    assert not hasattr(engine, "paper")
+    assert engine.execution_mode == "live_only"
+    with pytest.raises(RuntimeError, match="live_execution_forbids_paper_simulation"):
+        engine._require_paper_execution("on_candle")
+
+
+def test_live_execution_account_state_uses_unified_execution_state(tmp_path):
+    engine = LiveExecutionEngine(DummyLiveClient(), str(tmp_path / "live_state.json"), max_notional_per_trade_usd=10, min_notional_usd=1)
+
+    state = engine.account_state("BTC", 101.0)
+
+    assert state.state_source == "live"
+    assert state.equity == pytest.approx(1234.0)
+    assert state.position_size == pytest.approx(0.02)
+    assert engine.state.position_size == pytest.approx(0.02)

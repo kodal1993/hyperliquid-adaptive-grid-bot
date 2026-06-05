@@ -15,7 +15,7 @@ msg = (
     "Mode: LIVE CONFIG\n"
     f"Network: {cfg.hl_network}\n"
     f"Symbol: {cfg.default_symbol}\n"
-    f"Paper mode: {cfg.paper_mode}\n"
+    f"Execution mode: live_only\n"
     f"Live trading: {cfg.enable_live_trading}\n"
     f"Max trade: {cfg.max_notional_per_trade_usd} USD\n"
     f"Max position: {cfg.max_position_notional_usd} USD"

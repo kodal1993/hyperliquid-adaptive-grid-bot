@@ -3,20 +3,33 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timezone
+from typing import Protocol
+
 import pandas as pd
+
 from .config import BotConfig
-from .execution_engine import ExecutionEngine
 from .grid_manager import GridManager, GridPlan
 from .regime_detector import RegimeDetector, calculate_atr_pct
 from .risk_manager import RiskManager
 from .types import GridMode, MarketRegime
 
 
+class ExecutionEngineProtocol(Protocol):
+    open_orders: list[dict]
+    no_fill_cycles: int
+    last_real_trade_ts: object
+
+    def account_state(self, symbol: str, mark_price: float): ...
+    def cancel_replace_grid(self, symbol: str, plan): ...
+    def cancel_all_orders(self, symbol: str): ...
+    def flatten_position(self, symbol: str, mark_price: float): ...
+    def place_reduce_only_orders(self, symbol: str, position_size: float, mark_price: float, order_size: float, levels: int = 3): ...
+
 logger = logging.getLogger(__name__)
 
 
 class StrategyOrchestrator:
-    def __init__(self, config: BotConfig, execution_engine: ExecutionEngine) -> None:
+    def __init__(self, config: BotConfig, execution_engine: ExecutionEngineProtocol) -> None:
         self.config = config
         self.execution_engine = execution_engine
         self.detector = RegimeDetector()
@@ -225,7 +238,7 @@ class StrategyOrchestrator:
         attempted_side = "both" if (allow_buys and allow_sells) else ("buy" if allow_buys else ("sell" if allow_sells else "none"))
         would_increase_exposure = (effective_position_side == "LONG" and attempted_side in {"buy", "both"}) or (effective_position_side == "SHORT" and attempted_side in {"sell", "both"})
 
-        liquidation_distance_pct = 1.0 if self.config.paper_mode else 0.5
+        liquidation_distance_pct = 0.5
         one_direction_exposure_pct = 0.0 if equity <= 0 else effective_position_notional / equity
         risk_state = self.risk.evaluate(
             equity=equity, daily_pnl_pct=daily_pnl_pct, emergency_stop=self.config.emergency_stop, stop_file=self.config.emergency_stop_file,
@@ -252,9 +265,7 @@ class StrategyOrchestrator:
         if effective_position_notional > self.config.max_position_notional_usd:
             canceled = self.execution_engine.cancel_all_orders(symbol)
             flattened = False
-            if self.config.paper_mode and self.config.paper_auto_flatten_on_max_position:
-                flattened = self.execution_engine.flatten_position(symbol, price)
-            reduce_only_placed = 0 if flattened else self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, order_size)
+            reduce_only_placed = self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, order_size)
             logger.warning("reduce_only_requested symbol=%s reason=max_position_notional canceled=%s reduce_only_placed=%s", symbol, canceled, reduce_only_placed)
             return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled, "reduce_only_placed": reduce_only_placed, "flattened": flattened, "state_source": account_state.state_source, **dust_context}
 
@@ -262,9 +273,7 @@ class StrategyOrchestrator:
             if risk_state.reason == "max_position_notional":
                 canceled = self.execution_engine.cancel_all_orders(symbol)
                 flattened = False
-                if self.config.paper_mode and self.config.paper_auto_flatten_on_max_position:
-                    flattened = self.execution_engine.flatten_position(symbol, price)
-                reduce_only_placed = 0 if flattened else self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, self._calculate_order_size(price))
+                reduce_only_placed = self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, self._calculate_order_size(price))
                 logger.warning("reduce_only_requested symbol=%s reason=%s canceled=%s reduce_only_placed=%s", symbol, risk_state.reason, canceled, reduce_only_placed)
                 return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled, "reduce_only_placed": reduce_only_placed, "flattened": flattened, "state_source": account_state.state_source, **dust_context}
             return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": False, **dust_context}

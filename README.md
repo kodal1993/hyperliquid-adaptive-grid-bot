@@ -1,10 +1,10 @@
 # Hyperliquid Adaptive Grid Bot
 
-Adaptive futures grid bot for Hyperliquid with modular Python architecture, risk controls, Telegram monitoring, and paper execution.
+Adaptive futures grid bot for Hyperliquid with modular Python architecture, risk controls, Telegram monitoring, reporting, and live-only execution.
 
 ## Status
-- **Paper/Testnet ready** after local checks pass.
-- **Live trading is blocked by default** and remains disabled unless `ENABLE_LIVE_TRADING=true`.
+- **Live-only on Hyperliquid**; legacy paper deployment is retired.
+- Live trading requires `PAPER_MODE=false`, `ENABLE_LIVE_TRADING=true`, and `LIVE_EXECUTION_ENABLED=true`.
 - Use testnet first and validate with your own risk limits.
 
 ## Safety Model
@@ -28,16 +28,10 @@ cp .env.example .env
 - Grid: `GRID_LEVELS`, `GRID_SPACING_PCT`, `REGRID_THRESHOLD_PCT`
 - Per-trade sizing: `MIN_NOTIONAL_USD`, `MAX_NOTIONAL_PER_TRADE_USD`, `MIN_ORDER_SIZE`, `MAX_ORDER_SIZE`
 - Exposure/risk: `MAX_POSITION_NOTIONAL_USD`, `MAX_ONE_DIRECTION_EXPOSURE_PCT`, `MAX_DRAWDOWN_PCT`, `DAILY_LOSS_LIMIT_PCT`
-- Execution model: `FILL_MODEL=optimistic|conservative|ohlc_path`
-- Recommended paper profile: `FILL_MODEL=conservative` (avoid `optimistic` for realistic fills).
-- Runtime guard: `PAPER_MODE=true`, `ENABLE_LIVE_TRADING=false`
+- Runtime guard: `PAPER_MODE=false`, `ENABLE_LIVE_TRADING=true`, `LIVE_EXECUTION_ENABLED=true`
+- Startup log includes `execution_mode=live_only`.
 
 ## Run
-Paper profile:
-```bash
-./scripts/start_hyperliquid_paper.sh
-```
-
 Production script (only after explicit live enable + your own validation):
 ```bash
 ./scripts/start_hyperliquid_production.sh
@@ -53,7 +47,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env (keep PAPER_MODE=true first)
+# edit .env / config/live.env (PAPER_MODE=false; live-only)
 PYTHONPATH=. pytest -q
 python -m py_compile src/*.py
 ```
