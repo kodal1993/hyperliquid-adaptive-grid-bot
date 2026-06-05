@@ -1,5 +1,13 @@
 # Changelog
 
+## Live-only paper architecture cleanup
+
+- Removed legacy paper deployment assets and paper profile entry points.
+- Migrated production startup to always instantiate `LiveExecutionEngine` and log `execution_mode=live_only`.
+- Introduced `ExecutionState` for live account, daily PnL baseline, fill de-duplication, ledger, status, dashboard, and Telegram reporting state.
+- Retained `PaperExecutionEngine` only as an offline simulation utility for unit tests and historical analytics fixtures.
+- Added live-only startup validation that rejects `PAPER_MODE=true`.
+
 ## Small-equity adaptive safety tuning
 
 - Lowered missing-env defaults for small live equity: 3 grid levels, 10 USD order notional, 50 USD max position notional, 50 USD max active exposure, and 1800s stale order cleanup.

@@ -37,17 +37,15 @@ Az `accountValue > 0` bizonyítja, hogy a bot a várt, finanszírozott account �
 
 ## Live execution jelenlegi státusza
 
-A repo jelenlegi Hyperliquid kliense read-only jellegű:
+A bot live-only architektúrát használ:
 
-- market adat lekérés van;
-- account state, positions és open orders lekérés van;
-- valódi authenticated order submit nincs implementálva;
-- exchange cancel nincs implementálva;
-- user fills/fill sync nincs implementálva;
-- reduce-only live order placement nincs implementálva;
-- market/limit live order placement nincs implementálva.
+- a production startup csak `LiveExecutionEngine` példányt hoz létre;
+- a stratégia, risk, dashboard és Telegram account state-et kizárólag a live exchange source-ból kap;
+- candle-touch fill szimuláció live módban nincs; a `on_candle()` csak exchange fill szinkront pollol;
+- az order submit, cancel, open order sync és user fill sync a Hyperliquid authenticated API útvonalain keresztül történik;
+- a régi paper engine csak unit tesztekhez/offline szimulációhoz maradt meg.
 
-Ezért a hard safety gate akkor is leállítja az indulást `live_execution_not_implemented` hibával, ha `PAPER_MODE=false`, `ENABLE_LIVE_TRADING=true` és `LIVE_EXECUTION_ENABLED=true`.
+Startupkor kötelező log: `execution_mode=live_only`. `PAPER_MODE=true` esetén a startup validation `live_only_mode_required` hibával leáll.
 
 ## Mikro-live indulási feltételek
 
@@ -63,12 +61,12 @@ LIVE_EXECUTION_ENABLED=true
 
 További feltételek:
 
-- valódi exchange executor implementálva van order submit, cancel, open order sync és fill sync támogatással;
+- authenticated exchange executor elérhető order submit, cancel, open order sync és fill sync támogatással;
 - reduce-only order támogatás validált;
-- market/limit order placement támogatás validált;
+- limit order placement támogatás validált;
 - Telegram credentials jelen vannak;
 - nincs `STOP_LIVE` / emergency stop file;
 - `scripts/live_preflight_check.sh` `LIVE PREFLIGHT OK` eredménnyel fut;
 - a live service indulás előtt továbbra is disabled/stopped, és csak kézi jóváhagyással indítható.
 
-Amíg a fenti exchange executor nincs kész, a botnak live módban fail-fast módon kell megállnia, nem pedig paper szimulációval futnia.
+Ha az authenticated exchange executor nem elérhető, a bot fail-fast módon leáll, nem pedig offline szimulációval fut tovább.

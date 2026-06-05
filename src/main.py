@@ -14,7 +14,7 @@ import fcntl
 import pandas as pd
 
 from .config import BotConfig
-from .execution_engine import AccountState, ExecutionEngine, LiveExecutionEngine
+from .execution_engine import AccountState, LiveExecutionEngine
 from .hyperliquid_client import HyperliquidClient
 from .startup_validation import run_startup_validation
 from .strategy_orchestrator import StrategyOrchestrator
@@ -34,15 +34,10 @@ def to_df(candles: list[dict]) -> pd.DataFrame:
     return pd.DataFrame([{"open": float(c["o"]), "high": float(c["h"]), "low": float(c["l"]), "close": float(c["c"])} for c in candles])
 
 
-def _account_metrics(cfg: BotConfig, engine: ExecutionEngine, client: HyperliquidClient, latest_close: float) -> AccountState:
+def _account_metrics(cfg: BotConfig, engine: LiveExecutionEngine, client: HyperliquidClient, latest_close: float) -> AccountState:
     state = engine.account_state(getattr(cfg, "default_symbol", "BTC"), latest_close)
     logger.info("account_state state_source=%s equity=%.4f position_size=%.8f position_notional=%.4f", state.state_source, state.equity, state.position_size, state.position_notional)
     return state
-
-
-def _paper_metrics(cfg: BotConfig, engine: ExecutionEngine, client: HyperliquidClient, latest_close: float) -> tuple[float, float, float]:
-    state = _account_metrics(cfg, engine, client, latest_close)
-    return state.unrealized_pnl, state.equity, state.position_notional
 
 
 def calculate_daily_pnl_metrics(*, current_equity: float, daily_start_equity: float, realized_pnl_total: float, daily_start_realized_pnl: float, unrealized_pnl: float, fees_paid_total: float, daily_start_fees_paid: float) -> dict:
@@ -322,7 +317,7 @@ def _send_startup_failure_telegram(cfg: BotConfig, tg: TelegramHandler, error_co
         "🛑 HARD STARTUP FAILURE",
         f"error: {error_code}",
         f"detail: {exc}",
-        f"Mode: {'PAPER' if cfg.paper_mode else 'LIVE'}",
+        "Mode: LIVE",
         f"Network: {cfg.hl_network}",
         f"Profile: {cfg.env_profile}",
     ])
@@ -338,7 +333,7 @@ def _send_startup_telegram(cfg: BotConfig, tg: TelegramHandler) -> str:
     if not cfg.telegram_send_startup:
         return telegram_status
     logger.info("telegram_startup_send_attempted")
-    ok = tg.send("\n".join(["🚀 Bot started", f"Mode: {'PAPER' if cfg.paper_mode else 'LIVE'}", f"Network: {cfg.hl_network}", f"Symbol: {cfg.default_symbol}", f"Profile: {cfg.env_profile}", f"Fill model: {cfg.fill_model}", f"Report interval: {cfg.telegram_report_interval_seconds}s"]))
+    ok = tg.send("\n".join(["🚀 Bot started", "Mode: LIVE", f"Network: {cfg.hl_network}", f"Symbol: {cfg.default_symbol}", f"Profile: {cfg.env_profile}", f"Report interval: {cfg.telegram_report_interval_seconds}s"]))
     if ok:
         logger.info("telegram_startup_send_ok")
         return "startup_ok"
@@ -349,8 +344,8 @@ def _send_startup_telegram(cfg: BotConfig, tg: TelegramHandler) -> str:
 def run() -> None:
     cfg = BotConfig.from_env()
     setup_logging(cfg.log_level)
-    logger.info("Startup profile=%s paper_mode=%s fill_model=%s live_execution_enabled=%s", cfg.env_profile, cfg.paper_mode, cfg.fill_model, cfg.live_execution_enabled)
-    logger.info("risk_settings max_position_notional_usd=%s soft_exposure_cap_pct=%s hard_exposure_cap_pct=%s absolute_exposure_cap_pct=%s paper_mode=%s enable_live_trading=%s live_execution_enabled=%s", cfg.max_position_notional_usd, cfg.soft_exposure_cap_pct, cfg.hard_exposure_cap_pct, cfg.absolute_exposure_cap_pct, cfg.paper_mode, cfg.enable_live_trading, cfg.live_execution_enabled)
+    logger.info("Startup profile=%s execution_mode=live_only live_execution_enabled=%s", cfg.env_profile, cfg.live_execution_enabled)
+    logger.info("risk_settings max_position_notional_usd=%s soft_exposure_cap_pct=%s hard_exposure_cap_pct=%s absolute_exposure_cap_pct=%s execution_mode=live_only enable_live_trading=%s live_execution_enabled=%s", cfg.max_position_notional_usd, cfg.soft_exposure_cap_pct, cfg.hard_exposure_cap_pct, cfg.absolute_exposure_cap_pct, cfg.enable_live_trading, cfg.live_execution_enabled)
     tg = TelegramHandler(cfg.telegram_bot_token, cfg.telegram_chat_id)
     try:
         run_startup_validation(cfg)
@@ -361,7 +356,7 @@ def run() -> None:
         _write_status({
             "status": "startup_failed",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "paper_mode": cfg.paper_mode,
+            "execution_mode": "live_only",
             "enable_live_trading": cfg.enable_live_trading,
             "live_execution_enabled": cfg.live_execution_enabled,
             "last_error": error_code,
@@ -371,18 +366,16 @@ def run() -> None:
 
     client = HyperliquidClient(cfg.private_key, cfg.account_address, cfg.hl_network)
     client.connect()
-    if cfg.paper_mode:
-        engine = ExecutionEngine(client=client, state_file=cfg.state_file, paper_mode=True, enable_live_trading=False, start_balance=cfg.paper_start_balance_usd, fill_model=cfg.fill_model, max_position_notional_usd=cfg.max_position_notional_usd, soft_exposure_cap_pct=cfg.soft_exposure_cap_pct, hard_exposure_cap_pct=cfg.hard_exposure_cap_pct, absolute_exposure_cap_pct=cfg.absolute_exposure_cap_pct, allow_position_flip=cfg.allow_position_flip)
-    else:
-        engine = LiveExecutionEngine(client=client, state_file=cfg.state_file, start_balance=cfg.paper_start_balance_usd, fill_model=cfg.fill_model, max_position_notional_usd=cfg.max_position_notional_usd, soft_exposure_cap_pct=cfg.soft_exposure_cap_pct, hard_exposure_cap_pct=cfg.hard_exposure_cap_pct, absolute_exposure_cap_pct=cfg.absolute_exposure_cap_pct, allow_position_flip=cfg.allow_position_flip, max_notional_per_trade_usd=cfg.max_notional_per_trade_usd, min_notional_usd=cfg.min_notional_usd, leverage=cfg.base_leverage)
-        client.set_leverage(cfg.default_symbol, cfg.base_leverage)
+    engine = LiveExecutionEngine(client=client, state_file=cfg.state_file, start_balance=0.0, max_position_notional_usd=cfg.max_position_notional_usd, allow_position_flip=cfg.allow_position_flip, max_notional_per_trade_usd=cfg.max_notional_per_trade_usd, min_notional_usd=cfg.min_notional_usd, leverage=cfg.base_leverage)
+    logger.info("execution_mode=live_only")
+    client.set_leverage(cfg.default_symbol, cfg.base_leverage)
     orchestrator = StrategyOrchestrator(config=cfg, execution_engine=engine)
     current_day = datetime.now(timezone.utc).date()
-    if engine.paper.current_day:
-        current_day = datetime.fromisoformat(engine.paper.current_day).date()
-    daily_start_equity = engine.paper.daily_start_equity
-    daily_start_realized_pnl = engine.paper.daily_start_realized_pnl
-    daily_start_fees_paid = engine.paper.daily_start_fees_paid
+    if engine.state.current_day:
+        current_day = datetime.fromisoformat(engine.state.current_day).date()
+    daily_start_equity = engine.state.daily_start_equity
+    daily_start_realized_pnl = engine.state.daily_start_realized_pnl
+    daily_start_fees_paid = engine.state.daily_start_fees_paid
 
     last_telegram_report_ts = 0.0
     last_pause_reason = ""
@@ -400,24 +393,24 @@ def run() -> None:
         account_state = _account_metrics(cfg, engine, client, latest_close)
         unrealized_pnl, equity, position_notional = account_state.unrealized_pnl, account_state.equity, account_state.position_notional
         now_day = datetime.now(timezone.utc).date()
-        if daily_start_equity <= 0 or not engine.paper.current_day:
+        if daily_start_equity <= 0 or not engine.state.current_day:
             daily_start_equity = equity
             daily_start_realized_pnl = account_state.realized_pnl
             daily_start_fees_paid = account_state.fees_paid
-            engine.paper.current_day = now_day.isoformat()
-            engine.paper.daily_start_equity = daily_start_equity
-            engine.paper.daily_start_realized_pnl = daily_start_realized_pnl
-            engine.paper.daily_start_fees_paid = daily_start_fees_paid
+            engine.state.current_day = now_day.isoformat()
+            engine.state.daily_start_equity = daily_start_equity
+            engine.state.daily_start_realized_pnl = daily_start_realized_pnl
+            engine.state.daily_start_fees_paid = daily_start_fees_paid
             engine.save_state()
         if now_day != current_day:
             current_day = now_day
             daily_start_equity = equity
             daily_start_realized_pnl = account_state.realized_pnl
             daily_start_fees_paid = account_state.fees_paid
-            engine.paper.current_day = current_day.isoformat()
-            engine.paper.daily_start_equity = daily_start_equity
-            engine.paper.daily_start_realized_pnl = daily_start_realized_pnl
-            engine.paper.daily_start_fees_paid = daily_start_fees_paid
+            engine.state.current_day = current_day.isoformat()
+            engine.state.daily_start_equity = daily_start_equity
+            engine.state.daily_start_realized_pnl = daily_start_realized_pnl
+            engine.state.daily_start_fees_paid = daily_start_fees_paid
             engine.save_state()
         daily_metrics = calculate_daily_pnl_metrics(current_equity=equity, daily_start_equity=daily_start_equity, realized_pnl_total=account_state.realized_pnl, daily_start_realized_pnl=daily_start_realized_pnl, unrealized_pnl=unrealized_pnl, fees_paid_total=account_state.fees_paid, daily_start_fees_paid=daily_start_fees_paid)
         daily_pnl_pct = daily_metrics["daily_pnl_pct"]
@@ -440,20 +433,12 @@ def run() -> None:
         for tr in trade_events:
             logger.info("trade_event side=%s symbol=%s price=%.6f qty=%.8f", tr["side"], tr["symbol"], tr["price"], tr["qty"])
             if cfg.telegram_send_fills:
-                msg = tg.format_fill_alert(tr, mode_name="PAPER" if cfg.paper_mode else "LIVE")
+                msg = tg.format_fill_alert(tr, mode_name="LIVE")
                 if tg.send(msg):
                     logger.info("telegram_fill_alert_sent side=%s", str(tr.get("side", "")).upper())
                 else:
                     logger.warning("telegram_fill_alert_failed error=send_returned_false side=%s", str(tr.get("side", "")).upper())
         last_trade_dt = engine.last_real_trade_ts
-        if cfg.paper_mode and last_trade_dt and abs(account_state.position_size) > 1e-12:
-            age_hours = (datetime.now(timezone.utc) - last_trade_dt).total_seconds() / 3600
-            if age_hours > cfg.stale_position_max_hours and position_notional > cfg.min_residual_notional_usd:
-                close_side = "sell" if account_state.position_size > 0 else "buy"
-                close_qty = abs(account_state.position_size)
-                logger.warning("stale_position_cleanup_triggered side=%s close_qty=%s position_notional_before=%.4f reason=stale_position age_hours=%.3f", close_side, close_qty, position_notional, age_hours)
-                engine._apply_fill({"symbol": cfg.default_symbol, "side": close_side, "price": latest_close, "size": close_qty}, reason="stale_position_cleanup", regime=status.get("regime", "unknown"), mode=mode, risk_state="OK", pause_reason="")
-                trade_events.extend(engine.consume_trade_log())
 
         hard_risk_reasons = {"emergency_stop", "max_drawdown", "daily_loss", "daily_loss_limit", "max_position_notional", "liquidation_risk", "liq_distance"}
         now_ts = time.time()
@@ -473,7 +458,7 @@ def run() -> None:
         status_payload = {
             "status": strategy_status,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "paper_mode": cfg.paper_mode,
+            "execution_mode": "live_only",
             "state_source": account_state.state_source,
             "symbol": cfg.default_symbol,
             "price": latest_close,
@@ -550,7 +535,7 @@ def run() -> None:
                 "allowed_to_reduce": bool(status.get("allowed_to_reduce", abs(account_state.position_size) > 1e-12)),
                 "position_management_action": status.get("position_management_action", "none"),
                 "total_pnl": account_state.realized_pnl + unrealized_pnl,
-                "total_pnl_pct": ((account_state.realized_pnl + unrealized_pnl) / max(daily_start_equity, cfg.paper_start_balance_usd)) if cfg.paper_start_balance_usd > 0 else None,
+                "total_pnl_pct": ((account_state.realized_pnl + unrealized_pnl) / daily_start_equity) if daily_start_equity > 0 else None,
                 "account_equity": daily_metrics["account_equity"],
                 "daily_start_equity": daily_metrics["daily_start_equity"],
                 "daily_realized_pnl": daily_metrics["daily_realized_pnl"],
@@ -661,13 +646,13 @@ def run() -> None:
 
         now_ts = time.time()
         if cfg.telegram_send_periodic_status and (now_ts - last_telegram_report_ts) >= cfg.telegram_report_interval_seconds:
-            tg.send_status_report({**status_payload, "status": status.get("status", "unknown"), "network": cfg.hl_network, "mode_name": "PAPER" if cfg.paper_mode else "LIVE", "grid_mode": mode, "fill_model": cfg.fill_model, "risk_reason": reason or "none", "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")})
+            tg.send_status_report({**status_payload, "status": status.get("status", "unknown"), "network": cfg.hl_network, "mode_name": "LIVE", "grid_mode": mode, "risk_reason": reason or "none", "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")})
             last_telegram_report_ts = now_ts
 
-        engine.paper.current_day = current_day.isoformat()
-        engine.paper.daily_start_equity = daily_start_equity
-        engine.paper.daily_start_realized_pnl = daily_start_realized_pnl
-        engine.paper.daily_start_fees_paid = daily_start_fees_paid
+        engine.state.current_day = current_day.isoformat()
+        engine.state.daily_start_equity = daily_start_equity
+        engine.state.daily_start_realized_pnl = daily_start_realized_pnl
+        engine.state.daily_start_fees_paid = daily_start_fees_paid
         engine.save_state()
         time.sleep(cfg.tick_seconds)
 

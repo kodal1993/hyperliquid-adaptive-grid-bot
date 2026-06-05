@@ -70,14 +70,11 @@ class BotConfig:
     live_execution_enabled: bool
     allow_long_biased: bool
     allow_short_biased: bool
-    paper_auto_flatten_on_max_position: bool
     trend_lookback_candles: int
     trend_move_threshold_pct: float
     ema_slope_threshold_pct: float
     stuck_position_minutes: int
     log_level: str
-    paper_start_balance_usd: float
-    fill_model: str
     soft_exposure_cap_pct: float
     hard_exposure_cap_pct: float
     absolute_exposure_cap_pct: float
@@ -99,7 +96,7 @@ class BotConfig:
         if default_env_path.exists():
             default_env_profile = dotenv_values(default_env_path).get("ENV_PROFILE")
 
-        env_profile = os.getenv("ENV_PROFILE") or default_env_profile or "paper"
+        env_profile = os.getenv("ENV_PROFILE") or default_env_profile or "live"
         profile_path = Path("config") / f"{env_profile}.env"
         profile_loaded = False
         if profile_path.exists():
@@ -170,19 +167,16 @@ class BotConfig:
             telegram_send_strategy_pause_alerts=os.getenv("TELEGRAM_SEND_STRATEGY_PAUSE_ALERTS", "false").lower() == "true",
             telegram_send_periodic_status=os.getenv("TELEGRAM_SEND_PERIODIC_STATUS", "true").lower() == "true",
             state_file=os.getenv("STATE_FILE", "state/bot_state.json"),
-            paper_mode=os.getenv("PAPER_MODE", "true").lower() == "true",
-            enable_live_trading=os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true",
-            live_execution_enabled=os.getenv("LIVE_EXECUTION_ENABLED", "false").lower() == "true",
+            paper_mode=os.getenv("PAPER_MODE", "false").lower() == "true",
+            enable_live_trading=os.getenv("ENABLE_LIVE_TRADING", "true").lower() == "true",
+            live_execution_enabled=os.getenv("LIVE_EXECUTION_ENABLED", "true").lower() == "true",
             allow_long_biased=os.getenv("ALLOW_LONG_BIASED", "true").lower() == "true",
             allow_short_biased=os.getenv("ALLOW_SHORT_BIASED", "true").lower() == "true",
-            paper_auto_flatten_on_max_position=os.getenv("PAPER_AUTO_FLATTEN_ON_MAX_POSITION", "false").lower() == "true",
             trend_lookback_candles=int(os.getenv("TREND_LOOKBACK_CANDLES", "60")),
             trend_move_threshold_pct=float(os.getenv("TREND_MOVE_THRESHOLD_PCT", "0.006")),
             ema_slope_threshold_pct=float(os.getenv("EMA_SLOPE_THRESHOLD_PCT", "0.003")),
             stuck_position_minutes=int(os.getenv("STUCK_POSITION_MINUTES", "60")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
-            paper_start_balance_usd=float(os.getenv("PAPER_START_BALANCE_USD", "500")),
-            fill_model=os.getenv("FILL_MODEL", "conservative").lower(),
             soft_exposure_cap_pct=float(os.getenv("SOFT_EXPOSURE_CAP_PCT", "0.6")),
             hard_exposure_cap_pct=float(os.getenv("HARD_EXPOSURE_CAP_PCT", "0.8")),
             absolute_exposure_cap_pct=float(os.getenv("ABSOLUTE_EXPOSURE_CAP_PCT", "1.0")),

@@ -11,9 +11,9 @@ MICRO_LIVE_MAX_POSITION_NOTIONAL_USD = 50
 
 
 def validate_live_execution_gate(config: BotConfig, client: HyperliquidClient | None = None) -> None:
-    """Fail fast before a non-paper bot can run simulated fills as live trades."""
+    """Fail fast unless the bot is configured for live-only Hyperliquid execution."""
     if config.paper_mode:
-        return
+        raise RuntimeError("live_only_mode_required: PAPER_MODE must be false; paper trading architecture is retired")
     if not config.enable_live_trading:
         raise RuntimeError("live_execution_disabled: ENABLE_LIVE_TRADING must be true when PAPER_MODE=false")
     if not config.live_execution_enabled:
@@ -24,8 +24,6 @@ def validate_live_execution_gate(config: BotConfig, client: HyperliquidClient | 
 
 
 def _validate_micro_live_limits(config: BotConfig) -> None:
-    if config.paper_mode:
-        return
     if config.max_notional_per_trade_usd > MICRO_LIVE_MAX_NOTIONAL_PER_TRADE_USD:
         raise ValueError(
             f"micro_live_limit: MAX_NOTIONAL_PER_TRADE_USD must be <= {MICRO_LIVE_MAX_NOTIONAL_PER_TRADE_USD}"
@@ -67,7 +65,7 @@ def run_startup_validation(config: BotConfig) -> dict:
         "grid_spacing_pct": config.grid_spacing_pct,
         "max_trade_notional_usd": config.max_notional_per_trade_usd,
         "max_position_notional_usd": config.max_position_notional_usd,
-        "paper_mode": config.paper_mode,
+        "execution_mode": "live_only",
         "enable_live_trading": config.enable_live_trading,
         "live_execution_enabled": config.live_execution_enabled,
         "warnings": warnings,

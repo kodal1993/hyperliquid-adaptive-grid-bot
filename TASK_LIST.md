@@ -1,5 +1,5 @@
 TASK: Hozd létre az új Hyperliquid Adaptive Futures Grid Bot projektetProjekt név javaslat: hyperliquid-adaptive-grid-botCél:
-Átalakítani a meglévő Uniswap V3 market maker bot logikáját egy könnyen kezelhető, robusztus, adaptív Futures Grid Bot-tá Hyperliquid perpetual kereskedésre. Fő hangsúly a modularitáson, erős risk managementen, Telegram monitorozáson és paper trading támogatáson.Projekt KövetelményekTechnikai stack:Python 3.11+
+Átalakítani a meglévő Uniswap V3 market maker bot logikáját egy könnyen kezelhető, robusztus, adaptív Futures Grid Bot-tá Hyperliquid perpetual kereskedésre. Fő hangsúly a modularitáson, erős risk managementen, Telegram monitorozáson és live-only Hyperliquid végrehajtáson.Projekt KövetelményekTechnikai stack:Python 3.11+
 Hivatalos Hyperliquid Python SDK (hyperliquid-python-sdk)
 python-dotenv, ccxt (opcionális fallback), pandas, numpy
 Telegram bot integráció (python-telegram-bot vagy requests)
@@ -13,7 +13,7 @@ Automatikus grid újragenerálás és pozíció menedzsment
 
 Task Lista (lépésről lépésre)Projekt inicializálásHozz létre tiszta új repository struktúrát
 requirements.txt fájl létrehozása (hyperliquid-python-sdk, python-dotenv, pandas, numpy, requests, python-telegram-bot stb.)
-.env.example és több profil (paper, conservative, aggressive)
+.env.example és több profil (live, conservative, aggressive)
 README.md részletesen (telepítés, konfiguráció, figyelmeztetések)
 
 Konfiguráció és Hyperliquid integráció.env támogatás: private_key, account_address, TESTNET/MAINNET kapcsoló
@@ -46,6 +46,6 @@ Backtesting és Paper TradingPaper trading mód (szimulált egyenleg + szimulál
 Egyszerű historikus backtester keret (BTC és ETH perpetual adatokkal)
 
 Futtatás és Monitorozásmain.py – fő loop (5-15 másodpercenként tick)
-start_hyperliquid_paper.sh és production script
+start_hyperliquid_production.sh live-only production script
 Részletes logging + állapot mentés (JSON)
 
