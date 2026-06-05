@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from datetime import datetime, timezone
 import pandas as pd
@@ -24,16 +25,19 @@ class StrategyOrchestrator:
         self.grid_manager = GridManager()
         self.last_recenter_ts: datetime | None = None
         self.last_trend_regime: MarketRegime | None = None
+        self.pending_regime_flip: MarketRegime | None = None
+        self.pending_regime_flip_bars = 0
         self.trend_flip_cooldown_remaining = 0
-        self.trend_flip_cooldown_ticks = 6
+        self.trend_flip_cooldown_ticks = max(1, math.ceil((config.regime_flip_cooldown_minutes * 60) / max(config.tick_seconds, 1)))
         self.wrong_way_exit_loss_pct = 0.0035
         self.orphan_order_cleanup_count = 0
         self.stale_order_cleanup_count = 0
 
     def on_tick(self, candles: pd.DataFrame, equity: float, daily_pnl_pct: float, symbol: str, position_notional: float = 0.0) -> dict:
         regime_signal = self.detector.detect_signal(candles, trend_lookback_candles=self.config.trend_lookback_candles, trend_move_threshold_pct=self.config.trend_move_threshold_pct, ema_slope_threshold_pct=self.config.ema_slope_threshold_pct)
-        regime = regime_signal.regime
+        raw_regime = regime_signal.regime
         regime_confidence = regime_signal.confidence
+        regime, flip_context = self._apply_regime_flip_protection(raw_regime, regime_confidence)
         price = float(candles["close"].iloc[-1])
         account_state = self.execution_engine.account_state(symbol, price)
         logger.info("execution_state state_source=%s equity=%.4f position_size=%.8f position_notional=%.4f", account_state.state_source, account_state.equity, account_state.position_size, account_state.position_notional)
@@ -95,19 +99,6 @@ class StrategyOrchestrator:
                 "position_management_action": "flatten_dust",
                 **dust_context,
             }
-
-        trend_flip_detected = False
-        if regime in {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN}:
-            if self.last_trend_regime in {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN} and self.last_trend_regime != regime:
-                trend_flip_detected = True
-                self.trend_flip_cooldown_remaining = self.trend_flip_cooldown_ticks
-                logger.info(
-                    "trend_flip_detected previous=%s current=%s cooldown_ticks=%s",
-                    self.last_trend_regime.value,
-                    regime.value,
-                    self.trend_flip_cooldown_remaining,
-                )
-            self.last_trend_regime = regime
 
         vol = float(candles["close"].pct_change().std() or 0.0)
         atr_pct = regime_signal.atr_pct or calculate_atr_pct(candles, period=14)
@@ -202,6 +193,17 @@ class StrategyOrchestrator:
         if regime == MarketRegime.TREND_DOWN and mode == GridMode.SHORT_BIASED and not force_reduce_only:
             allow_sells = effective_position_side != "SHORT" and short_exposure < threshold
             allow_buys = effective_position_side == "SHORT"
+
+        if flip_context["regime_flip_pending"] and not force_reduce_only:
+            if effective_position_side == "LONG":
+                allow_buys = False
+                allow_sells = True
+            elif effective_position_side == "SHORT":
+                allow_sells = False
+                allow_buys = True
+            else:
+                allow_buys = False
+                allow_sells = False
 
         flip_cooldown_active = self.trend_flip_cooldown_remaining > 0
         if flip_cooldown_active and not force_reduce_only:
@@ -401,6 +403,7 @@ class StrategyOrchestrator:
             "in_position_for_recenter": in_position,
             "trend_flip_cooldown_remaining": self.trend_flip_cooldown_remaining,
             "wrong_way_loss_pct": wrong_way_loss_pct,
+            **flip_context,
         }
 
         if order_notional + 1e-9 < self.config.min_notional_usd:
@@ -419,17 +422,116 @@ class StrategyOrchestrator:
             result = self.execution_engine.cancel_replace_grid(symbol, plan)
         except Exception as exc:
             logger.warning("state_uncertain_skip_cycle reason=grid_rebuild_api_error error=%s", exc)
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "allowed_to_trade": False, "allowed_to_reduce": False, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "allowed_to_trade": False, "allowed_to_reduce": False, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "raw_regime": raw_regime.value, **flip_context, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
         if result.get("error"):
             logger.warning("state_uncertain_skip_cycle reason=%s", result.get("error"))
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "orders": result, "allowed_to_trade": False, "allowed_to_reduce": False, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "orders": result, "allowed_to_trade": False, "allowed_to_reduce": False, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "raw_regime": raw_regime.value, **flip_context, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
         logger.info("grid_state regime=%s mode=%s position_side=%s open_orders_before=%s buy_before=%s sell_before=%s allow_buys=%s allow_sells=%s placed=%s canceled=%s order_notional=%.4f spacing_source=%s atr_pct=%.6f final_spacing_pct=%.6f state_source=%s", regime.value, mode.value, effective_position_side, len(open_orders), buy_order_count, sell_order_count, allow_buys, allow_sells, result.get("placed", 0), result.get("canceled", 0), order_notional, spacing_source, atr_pct, final_spacing_pct, account_state.state_source)
         if neutral_entries_blocked and abs(effective_position_size) > 1e-12:
-            return {"status": "managing_position", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": False, "allowed_to_reduce": True, "reason": "neutral_entries_blocked_in_trend", "position_management_action": "reduce_only_grid", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
+            return {"status": "managing_position", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": False, "allowed_to_reduce": True, "reason": "neutral_entries_blocked_in_trend", "position_management_action": "reduce_only_grid", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "raw_regime": raw_regime.value, **flip_context, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
         if neutral_entries_blocked:
             canceled = self.execution_engine.cancel_all_orders(symbol)
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
-        return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "raw_regime": raw_regime.value, **flip_context, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
+        return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "raw_regime": raw_regime.value, **flip_context, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
+
+
+    def _apply_regime_flip_protection(self, raw_regime: MarketRegime, confidence: float) -> tuple[MarketRegime, dict]:
+        trend_regimes = {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN}
+        confirm_bars = max(int(self.config.regime_flip_confirm_bars), 1)
+        min_confidence = max(0.0, min(float(self.config.regime_flip_min_confidence), 1.0))
+        context = {
+            "raw_regime": raw_regime.value,
+            "regime_flip_pending": False,
+            "regime_flip_candidate": self.pending_regime_flip.value if self.pending_regime_flip else None,
+            "regime_flip_confirmation_bars": self.pending_regime_flip_bars,
+            "regime_flip_confirm_bars_required": confirm_bars,
+            "regime_flip_min_confidence": min_confidence,
+            "regime_flip_cooldown_ticks": self.trend_flip_cooldown_ticks,
+            "regime_flip_confirmed": False,
+            "regime_flip_block_reason": "",
+        }
+
+        if raw_regime not in trend_regimes:
+            self.pending_regime_flip = None
+            self.pending_regime_flip_bars = 0
+            return raw_regime, context
+
+        if self.last_trend_regime not in trend_regimes:
+            self.last_trend_regime = raw_regime
+            return raw_regime, context
+
+        if raw_regime == self.last_trend_regime:
+            self.pending_regime_flip = None
+            self.pending_regime_flip_bars = 0
+            return raw_regime, context
+
+        if confidence < min_confidence:
+            self.pending_regime_flip = raw_regime
+            self.pending_regime_flip_bars = 0
+            context.update(
+                {
+                    "regime_flip_pending": True,
+                    "regime_flip_candidate": raw_regime.value,
+                    "regime_flip_confirmation_bars": 0,
+                    "regime_flip_block_reason": "below_min_confidence",
+                }
+            )
+            logger.info(
+                "regime_flip_blocked previous=%s candidate=%s confidence=%.3f min_confidence=%.3f reason=below_min_confidence",
+                self.last_trend_regime.value,
+                raw_regime.value,
+                confidence,
+                min_confidence,
+            )
+            return MarketRegime.RANGE, context
+
+        if self.pending_regime_flip != raw_regime:
+            self.pending_regime_flip = raw_regime
+            self.pending_regime_flip_bars = 1
+        else:
+            self.pending_regime_flip_bars += 1
+
+        context.update(
+            {
+                "regime_flip_pending": True,
+                "regime_flip_candidate": raw_regime.value,
+                "regime_flip_confirmation_bars": self.pending_regime_flip_bars,
+            }
+        )
+        if self.pending_regime_flip_bars < confirm_bars:
+            context["regime_flip_block_reason"] = "awaiting_confirmation"
+            logger.info(
+                "regime_flip_pending previous=%s candidate=%s bars=%s required=%s confidence=%.3f",
+                self.last_trend_regime.value,
+                raw_regime.value,
+                self.pending_regime_flip_bars,
+                confirm_bars,
+                confidence,
+            )
+            return MarketRegime.RANGE, context
+
+        previous = self.last_trend_regime
+        self.last_trend_regime = raw_regime
+        self.pending_regime_flip = None
+        self.pending_regime_flip_bars = 0
+        self.trend_flip_cooldown_remaining = self.trend_flip_cooldown_ticks
+        context.update(
+            {
+                "regime_flip_pending": False,
+                "regime_flip_candidate": None,
+                "regime_flip_confirmation_bars": 0,
+                "regime_flip_confirmed": True,
+                "regime_flip_block_reason": "",
+            }
+        )
+        logger.info(
+            "regime_flip_confirmed previous=%s current=%s confidence=%.3f cooldown_ticks=%s",
+            previous.value,
+            raw_regime.value,
+            confidence,
+            self.trend_flip_cooldown_remaining,
+        )
+        return raw_regime, context
 
 
     def _apply_minimum_expected_edge_filter(self, plan: GridPlan, *, mid_price: float, position_size: float) -> dict:

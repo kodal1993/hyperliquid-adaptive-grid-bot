@@ -230,6 +230,11 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV) -
         "fee_gross_profit_ratio": 0.0,
         "average_holding_time_seconds": 0.0,
         "pnl_by_regime": {},
+        "pnl_by_direction": {"Long": 0.0, "Short": 0.0},
+        "pnl_by_trade_category": {"Close Long": 0.0, "Close Short": 0.0, "Long > Short": 0.0, "Short > Long": 0.0},
+        "flip_trades_today": 0,
+        "flip_trade_pnl_today": 0.0,
+        "flip_trade_pnl": 0.0,
         "pnl_long_trades": 0.0,
         "pnl_short_trades": 0.0,
     }
@@ -244,6 +249,9 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV) -
     net_pnl = 0.0
     trade_count = 0
     pnl_by_regime: Counter[str] = Counter()
+    pnl_by_direction: Counter[str] = Counter()
+    pnl_by_trade_category: Counter[str] = Counter({"Close Long": 0.0, "Close Short": 0.0, "Long > Short": 0.0, "Short > Long": 0.0})
+    today = datetime.now(timezone.utc).date()
     holding_times: list[float] = []
     open_position_started_at: datetime | None = None
     previous_position_size = 0.0
@@ -261,11 +269,24 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV) -
             trade_count += 1
             regime = str(row.get("regime") or "unknown")
             pnl_by_regime[regime] += net
-            side = str(row.get("side", "")).lower()
-            if side == "buy":
-                analytics["pnl_long_trades"] += net
-            elif side == "sell":
-                analytics["pnl_short_trades"] += net
+            position_before = _safe_float(row.get("position_before"))
+            if position_before is None:
+                position_before = previous_position_size
+            position_after = _safe_float(row.get("position_after"))
+            if position_after is None:
+                position_after = _safe_float(row.get("position_size"))
+            trade_category = str(row.get("trade_category") or _classify_trade_category(position_before, position_after)).strip()
+            if trade_category in pnl_by_trade_category:
+                pnl_by_trade_category[trade_category] += net
+                if trade_category in {"Long > Short", "Short > Long"}:
+                    analytics["flip_trade_pnl"] += net
+                    if ts is not None and ts.date() == today:
+                        analytics["flip_trades_today"] += 1
+                        analytics["flip_trade_pnl_today"] += net
+                if trade_category in {"Close Long", "Long > Short"}:
+                    pnl_by_direction["Long"] += net
+                elif trade_category in {"Close Short", "Short > Long"}:
+                    pnl_by_direction["Short"] += net
             if realized > 0:
                 winners.append(realized)
                 gross_profit += realized
@@ -291,7 +312,25 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV) -
     analytics["fee_gross_profit_ratio"] = total_fees / gross_profit if gross_profit > 1e-12 else 0.0
     analytics["average_holding_time_seconds"] = sum(holding_times) / len(holding_times) if holding_times else 0.0
     analytics["pnl_by_regime"] = dict(pnl_by_regime)
+    analytics["pnl_by_direction"] = dict(pnl_by_direction)
+    analytics["pnl_by_trade_category"] = dict(pnl_by_trade_category)
+    analytics["pnl_long_trades"] = analytics["pnl_by_direction"].get("Long", 0.0)
+    analytics["pnl_short_trades"] = analytics["pnl_by_direction"].get("Short", 0.0)
     return analytics
+
+
+def _classify_trade_category(position_before: float | None, position_after: float | None) -> str:
+    if position_before is None or position_after is None:
+        return ""
+    if position_before > 1e-12 and position_after < -1e-12:
+        return "Long > Short"
+    if position_before < -1e-12 and position_after > 1e-12:
+        return "Short > Long"
+    if position_before > 1e-12 and position_after < position_before - 1e-12:
+        return "Close Long"
+    if position_before < -1e-12 and position_after > position_before + 1e-12:
+        return "Close Short"
+    return ""
 
 
 def _parse_iso_utc(ts_raw: str) -> datetime | None:
@@ -532,6 +571,15 @@ def run() -> None:
                 "grid_levels": status.get("grid_levels"),
                 "volatility_grid_levels": status.get("volatility_grid_levels"),
                 "regime_confidence": status.get("regime_confidence"),
+                "raw_regime": status.get("raw_regime"),
+                "regime_flip_pending": bool(status.get("regime_flip_pending", False)),
+                "regime_flip_candidate": status.get("regime_flip_candidate"),
+                "regime_flip_confirmation_bars": status.get("regime_flip_confirmation_bars", 0),
+                "regime_flip_confirm_bars_required": status.get("regime_flip_confirm_bars_required"),
+                "regime_flip_min_confidence": status.get("regime_flip_min_confidence"),
+                "regime_flip_cooldown_ticks": status.get("regime_flip_cooldown_ticks"),
+                "regime_flip_confirmed": bool(status.get("regime_flip_confirmed", False)),
+                "regime_flip_block_reason": status.get("regime_flip_block_reason"),
                 "trend_bias": status.get("trend_bias"),
                 "mark_price": latest_close,
                 "last_trade_price": _safe_float(last_trade.get("price")),
@@ -582,6 +630,11 @@ def run() -> None:
                 "fee_gross_profit_ratio": trade_analytics["fee_gross_profit_ratio"],
                 "average_holding_time_seconds": trade_analytics["average_holding_time_seconds"],
                 "pnl_by_regime": trade_analytics["pnl_by_regime"],
+                "pnl_by_direction": trade_analytics["pnl_by_direction"],
+                "pnl_by_trade_category": trade_analytics["pnl_by_trade_category"],
+                "flip_trades_today": trade_analytics["flip_trades_today"],
+                "flip_trade_pnl_today": trade_analytics["flip_trade_pnl_today"],
+                "flip_trade_pnl": trade_analytics["flip_trade_pnl"],
                 "pnl_long_trades": trade_analytics["pnl_long_trades"],
                 "pnl_short_trades": trade_analytics["pnl_short_trades"],
                 "edge_filter_skipped_orders": status.get("edge_filter_skipped_orders", 0),

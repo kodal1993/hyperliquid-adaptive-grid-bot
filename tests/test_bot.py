@@ -1775,3 +1775,55 @@ def test_trade_analytics_report_calculates_profitability_metrics(tmp_path):
     assert report["average_holding_time_seconds"] == pytest.approx(600.0)
     assert report["pnl_by_regime"]["RANGE"] == pytest.approx(0.92)
     assert report["pnl_by_regime"]["TREND_DOWN"] == pytest.approx(-1.08)
+
+
+def test_regime_flip_protection_requires_confidence_and_confirmation(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.regime_flip_confirm_bars = 3
+    cfg.regime_flip_min_confidence = 0.65
+    cfg.regime_flip_cooldown_minutes = 30
+    cfg.tick_seconds = 10
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "regime_flip_state.json", paper_mode=True, enable_live_trading=False))
+
+    regime, ctx = orch._apply_regime_flip_protection(MarketRegime.TREND_UP, 0.9)
+    assert regime == MarketRegime.TREND_UP
+
+    regime, ctx = orch._apply_regime_flip_protection(MarketRegime.TREND_DOWN, 0.6)
+    assert regime == MarketRegime.RANGE
+    assert ctx["regime_flip_pending"] is True
+    assert ctx["regime_flip_block_reason"] == "below_min_confidence"
+
+    for bars in (1, 2):
+        regime, ctx = orch._apply_regime_flip_protection(MarketRegime.TREND_DOWN, 0.8)
+        assert regime == MarketRegime.RANGE
+        assert ctx["regime_flip_confirmation_bars"] == bars
+        assert ctx["regime_flip_block_reason"] == "awaiting_confirmation"
+
+    regime, ctx = orch._apply_regime_flip_protection(MarketRegime.TREND_DOWN, 0.8)
+    assert regime == MarketRegime.TREND_DOWN
+    assert ctx["regime_flip_confirmed"] is True
+    assert orch.trend_flip_cooldown_remaining == 180
+
+
+def test_trade_analytics_reports_close_and_flip_pnl(tmp_path):
+    from src.main import _trade_analytics_report
+
+    csv_path = tmp_path / "trades.csv"
+    today = datetime.now(timezone.utc).isoformat()
+    csv_path.write_text(
+        "timestamp,symbol,side,price,qty,notional,fee,realized_pnl_delta,realized_pnl_total,cash,equity,position_before,position_after,trade_category,is_flip_trade,position_size,position_notional,regime,mode,risk_state,pause_reason,reason\n"
+        f"{today},ETH,sell,110,1,110,0.10,10,10,0,0,1,0,Close Long,False,0,0,TREND_UP,long_biased,OK,,grid_fill\n"
+        f"{today},ETH,sell,90,2,180,0.20,-10,0,0,0,1,-1,Long > Short,True,-1,90,TREND_DOWN,short_biased,OK,,grid_fill\n"
+        f"{today},ETH,buy,80,1,80,0.10,10,10,0,0,-1,0,Close Short,False,0,0,TREND_DOWN,short_biased,OK,,grid_fill\n",
+        encoding="utf-8",
+    )
+
+    analytics = _trade_analytics_report("ETH", csv_path=csv_path)
+
+    assert analytics["pnl_by_trade_category"]["Close Long"] == pytest.approx(9.9)
+    assert analytics["pnl_by_trade_category"]["Long > Short"] == pytest.approx(-10.2)
+    assert analytics["pnl_by_trade_category"]["Close Short"] == pytest.approx(9.9)
+    assert analytics["flip_trades_today"] == 1
+    assert analytics["flip_trade_pnl_today"] == pytest.approx(-10.2)
+    assert analytics["pnl_by_direction"]["Long"] == pytest.approx(-0.3)
+    assert analytics["pnl_by_direction"]["Short"] == pytest.approx(9.9)

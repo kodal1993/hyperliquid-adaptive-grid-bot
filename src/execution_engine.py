@@ -66,6 +66,21 @@ def classify_exposure_action(position_size: float, side: str, qty: float) -> str
     return "reducing"
 
 
+def classify_trade_category(position_before: float, position_after: float) -> str:
+    if position_before > 1e-12 and position_after < -1e-12:
+        return "Long > Short"
+    if position_before < -1e-12 and position_after > 1e-12:
+        return "Short > Long"
+    if position_before > 1e-12 and position_after <= position_before + 1e-12 and position_after <= 1e-12:
+        return "Close Long"
+    if position_before < -1e-12 and position_after >= position_before - 1e-12 and position_after >= -1e-12:
+        return "Close Short"
+    if position_before > 1e-12 and position_after < position_before - 1e-12:
+        return "Close Long"
+    if position_before < -1e-12 and position_after > position_before + 1e-12:
+        return "Close Short"
+    return ""
+
 def would_increase_exposure(position_size: float, side: str, qty: float) -> bool:
     return classify_exposure_action(position_size, side, qty) == "increasing"
 
@@ -327,6 +342,8 @@ class PaperExecutionEngine:
             self.paper.avg_entry = 0.0
 
         realized_delta = self.paper.realized_pnl - realized_before
+        position_after = self.paper.position_size
+        trade_category = classify_trade_category(position_before, position_after)
         position_notional = abs(self.paper.position_size * price)
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -341,7 +358,9 @@ class PaperExecutionEngine:
             "cash": self.paper.cash,
             "equity": self.equity(price),
             "position_before": position_before,
-            "position_after": self.paper.position_size,
+            "position_after": position_after,
+            "trade_category": trade_category,
+            "is_flip_trade": trade_category in {"Long > Short", "Short > Long"},
             "position_size": self.paper.position_size,
             "position_notional": position_notional,
             "regime": regime,
@@ -415,7 +434,7 @@ class PaperExecutionEngine:
 
     def _append_trade_ledger(self, entry: dict) -> None:
         self.trade_ledger_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_size", "position_notional", "regime", "mode", "risk_state", "pause_reason", "reason"]
+        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "trade_category", "is_flip_trade", "position_size", "position_notional", "regime", "mode", "risk_state", "pause_reason", "reason"]
         write_header = not self.trade_ledger_csv.exists()
         with self.trade_ledger_csv.open("a", encoding="utf-8") as f:
             if write_header:
@@ -715,6 +734,7 @@ class LiveExecutionEngine(PaperExecutionEngine):
             timestamp = datetime.fromtimestamp(float(ts_raw) / 1000, tz=timezone.utc).isoformat()
         else:
             timestamp = datetime.now(timezone.utc).isoformat()
+        position_after = self.paper.position_size
         position_notional = abs(self.paper.position_size * price)
         return {
             "timestamp": timestamp,
@@ -728,6 +748,10 @@ class LiveExecutionEngine(PaperExecutionEngine):
             "realized_pnl_total": self.paper.realized_pnl + realized_delta,
             "cash": self.paper.cash,
             "equity": self.paper.cash,
+            "position_before": "",
+            "position_after": position_after,
+            "trade_category": "",
+            "is_flip_trade": False,
             "position_size": self.paper.position_size,
             "position_notional": position_notional,
             "regime": regime,

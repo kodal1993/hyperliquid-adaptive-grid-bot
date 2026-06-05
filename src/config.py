@@ -91,6 +91,9 @@ class BotConfig:
     recenter_cooldown_seconds: int
     position_recenter_cooldown_seconds: int
     stale_order_max_age_sec: int
+    regime_flip_confirm_bars: int
+    regime_flip_min_confidence: float
+    regime_flip_cooldown_minutes: int
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -196,4 +199,7 @@ class BotConfig:
             recenter_cooldown_seconds=int(os.getenv("RECENTER_COOLDOWN_SECONDS", "600")),
             position_recenter_cooldown_seconds=int(os.getenv("POSITION_RECENTER_COOLDOWN_SECONDS", "900")),
             stale_order_max_age_sec=int(os.getenv("STALE_ORDER_MAX_AGE_SEC", "1800")),
+            regime_flip_confirm_bars=int(os.getenv("REGIME_FLIP_CONFIRM_BARS", "3")),
+            regime_flip_min_confidence=float(os.getenv("REGIME_FLIP_MIN_CONFIDENCE", "0.65")),
+            regime_flip_cooldown_minutes=int(os.getenv("REGIME_FLIP_COOLDOWN_MINUTES", "30")),
         )
