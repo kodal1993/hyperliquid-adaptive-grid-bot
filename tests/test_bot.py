@@ -1869,3 +1869,155 @@ def test_live_execution_account_state_uses_unified_execution_state(tmp_path):
     assert state.equity == pytest.approx(1234.0)
     assert state.position_size == pytest.approx(0.02)
     assert engine.state.position_size == pytest.approx(0.02)
+
+from src.market_stress import OpportunityMode, VolatilityMode, decide_market_stress
+
+
+def _stress_cfg():
+    cfg = BotConfig.from_env()
+    cfg.enable_market_stress_filter = True
+    cfg.high_vol_atr_pct = 0.006
+    cfg.extreme_vol_atr_pct = 0.010
+    cfg.btc_5m_shock_pct = 0.008
+    cfg.btc_1h_shock_pct = 0.025
+    cfg.trend_strong_confidence = 0.75
+    cfg.trend_weak_confidence = 0.45
+    cfg.panic_score_threshold = 0.80
+    cfg.market_stress_extreme_flat = False
+    cfg.grid_levels = 3
+    cfg.min_notional_usd = 1.0
+    cfg.order_notional_usd = 10
+    cfg.max_notional_per_trade_usd = 10
+    cfg.max_active_exposure_usd = 50
+    cfg.max_position_notional_usd = 50
+    cfg.max_directional_exposure_pct = 1.0
+    return cfg
+
+
+def _stress_candles(last_move: float = 0.009, periods: int = 80):
+    closes = [100.0 for _ in range(periods - 1)] + [100.0 * (1 + last_move)]
+    return pd.DataFrame({"close": closes, "high": [c * 1.006 for c in closes], "low": [c * 0.994 for c in closes]})
+
+
+def test_market_stress_high_vol_strong_trend_down_from_flat_allows_sells_blocks_buys():
+    decision = decide_market_stress(
+        candles=_stress_candles(-0.009), raw_regime=MarketRegime.TREND_DOWN, confirmed_regime=MarketRegime.TREND_DOWN,
+        regime_confidence=0.80, atr_pct=0.007, position_side="FLAT", position_notional=0.0, config=_stress_cfg(),
+        allow_buys=True, allow_sells=True, current_levels=3,
+    )
+    assert decision.opportunity_mode == OpportunityMode.TREND_FOLLOW_SHORT
+    assert decision.allow_sells is True
+    assert decision.allow_buys is False
+    assert decision.grid_levels == 2
+
+
+def test_market_stress_high_vol_strong_trend_up_from_flat_allows_buys_blocks_sells():
+    decision = decide_market_stress(
+        candles=_stress_candles(0.009), raw_regime=MarketRegime.TREND_UP, confirmed_regime=MarketRegime.TREND_UP,
+        regime_confidence=0.80, atr_pct=0.007, position_side="FLAT", position_notional=0.0, config=_stress_cfg(),
+        allow_buys=True, allow_sells=True, current_levels=3,
+    )
+    assert decision.opportunity_mode == OpportunityMode.TREND_FOLLOW_LONG
+    assert decision.allow_buys is True
+    assert decision.allow_sells is False
+    assert decision.grid_levels == 2
+
+
+def test_market_stress_high_vol_weak_range_from_flat_blocks_new_exposure():
+    decision = decide_market_stress(
+        candles=_stress_candles(0.009), raw_regime=MarketRegime.RANGE, confirmed_regime=MarketRegime.RANGE,
+        regime_confidence=0.30, atr_pct=0.007, position_side="FLAT", position_notional=0.0, config=_stress_cfg(),
+        allow_buys=True, allow_sells=True, current_levels=3,
+    )
+    assert decision.opportunity_mode == OpportunityMode.NO_NEW_EXPOSURE
+    assert decision.allow_buys is False
+    assert decision.allow_sells is False
+
+
+def test_market_stress_high_vol_existing_short_allows_buy_reduce():
+    decision = decide_market_stress(
+        candles=_stress_candles(0.009), raw_regime=MarketRegime.RANGE, confirmed_regime=MarketRegime.RANGE,
+        regime_confidence=0.30, atr_pct=0.007, position_side="SHORT", position_notional=25.0, config=_stress_cfg(),
+        allow_buys=False, allow_sells=True, current_levels=3,
+    )
+    assert decision.opportunity_mode == OpportunityMode.NO_NEW_EXPOSURE
+    assert decision.allow_buys is True
+    assert decision.allow_sells is False
+
+
+def test_market_stress_high_vol_existing_long_allows_sell_reduce():
+    decision = decide_market_stress(
+        candles=_stress_candles(-0.009), raw_regime=MarketRegime.RANGE, confirmed_regime=MarketRegime.RANGE,
+        regime_confidence=0.30, atr_pct=0.007, position_side="LONG", position_notional=25.0, config=_stress_cfg(),
+        allow_buys=True, allow_sells=False, current_levels=3,
+    )
+    assert decision.opportunity_mode == OpportunityMode.NO_NEW_EXPOSURE
+    assert decision.allow_buys is False
+    assert decision.allow_sells is True
+
+
+def test_market_stress_extreme_vol_weak_trend_reduce_only():
+    decision = decide_market_stress(
+        candles=_stress_candles(0.02), raw_regime=MarketRegime.RANGE, confirmed_regime=MarketRegime.RANGE,
+        regime_confidence=0.30, atr_pct=0.011, position_side="LONG", position_notional=25.0, config=_stress_cfg(),
+        allow_buys=True, allow_sells=True, current_levels=3,
+    )
+    assert decision.volatility_mode == VolatilityMode.EXTREME
+    assert decision.opportunity_mode == OpportunityMode.REDUCE_ONLY
+    assert decision.reduce_only is True
+    assert decision.allow_sells is True
+    assert decision.allow_buys is False
+
+
+def test_market_stress_emergency_flat_only_when_enabled():
+    cfg = _stress_cfg()
+    cfg.market_stress_extreme_flat = False
+    disabled = decide_market_stress(
+        candles=_stress_candles(0.02), raw_regime=MarketRegime.RANGE, confirmed_regime=MarketRegime.RANGE,
+        regime_confidence=0.30, atr_pct=0.011, position_side="LONG", position_notional=25.0, config=cfg,
+        allow_buys=True, allow_sells=True, current_levels=3,
+    )
+    cfg.market_stress_extreme_flat = True
+    enabled = decide_market_stress(
+        candles=_stress_candles(0.02), raw_regime=MarketRegime.RANGE, confirmed_regime=MarketRegime.RANGE,
+        regime_confidence=0.30, atr_pct=0.011, position_side="LONG", position_notional=25.0, config=cfg,
+        allow_buys=True, allow_sells=True, current_levels=3,
+    )
+    assert disabled.opportunity_mode == OpportunityMode.REDUCE_ONLY
+    assert disabled.emergency_flat is False
+    assert enabled.opportunity_mode == OpportunityMode.EMERGENCY_FLAT
+    assert enabled.emergency_flat is True
+
+
+def test_market_stress_normal_range_unchanged_behavior():
+    decision = decide_market_stress(
+        candles=_stress_candles(0.001), raw_regime=MarketRegime.RANGE, confirmed_regime=MarketRegime.RANGE,
+        regime_confidence=0.30, atr_pct=0.003, position_side="FLAT", position_notional=0.0, config=_stress_cfg(),
+        allow_buys=True, allow_sells=True, current_levels=3,
+    )
+    assert decision.opportunity_mode == OpportunityMode.NORMAL_GRID
+    assert decision.allow_buys is True
+    assert decision.allow_sells is True
+    assert decision.grid_levels == 3
+    assert decision.spacing_multiplier == 1.0
+
+
+def test_market_stress_fields_appear_in_status_payload(tmp_path):
+    cfg = _stress_cfg()
+    engine = make_test_engine(tmp_path, "market_stress_status.json", paper_mode=True, enable_live_trading=False)
+    orch = StrategyOrchestrator(cfg, engine)
+    candles = pd.DataFrame({"close": [100 for _ in range(80)], "high": [100.2 for _ in range(80)], "low": [99.8 for _ in range(80)]})
+    status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+    for field in ["market_stress_enabled", "volatility_mode", "market_stress_score", "trend_strength_score", "opportunity_mode", "btc_5m_return_pct", "btc_1h_return_pct", "market_stress_reason"]:
+        assert field in status
+
+
+def test_market_stress_missing_or_short_candle_data_does_not_crash():
+    decision = decide_market_stress(
+        candles=pd.DataFrame({"close": [100.0]}), raw_regime=MarketRegime.RANGE, confirmed_regime=MarketRegime.RANGE,
+        regime_confidence=0.0, atr_pct=0.0, position_side="FLAT", position_notional=0.0, config=_stress_cfg(),
+        allow_buys=True, allow_sells=True, current_levels=3,
+    )
+    assert decision.opportunity_mode == OpportunityMode.NORMAL_GRID
+    assert decision.allow_buys is True
+    assert decision.allow_sells is True

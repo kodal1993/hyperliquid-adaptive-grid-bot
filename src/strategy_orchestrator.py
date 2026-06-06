@@ -9,6 +9,7 @@ import pandas as pd
 
 from .config import BotConfig
 from .grid_manager import GridManager, GridPlan
+from .market_stress import OpportunityMode, decide_market_stress
 from .regime_detector import RegimeDetector, calculate_atr_pct
 from .risk_manager import RiskManager
 from .types import GridMode, MarketRegime
@@ -239,6 +240,78 @@ class StrategyOrchestrator:
             allow_buys = True
             allow_sells = True
 
+        allow_buys_before_stress = allow_buys
+        allow_sells_before_stress = allow_sells
+        grid_levels_before_stress = volatility_grid_levels
+        spacing_before_stress = final_spacing_pct
+        market_stress = decide_market_stress(
+            candles=candles,
+            raw_regime=raw_regime,
+            confirmed_regime=regime,
+            regime_confidence=regime_confidence,
+            atr_pct=atr_pct,
+            position_side=effective_position_side,
+            position_notional=effective_position_notional,
+            config=self.config,
+            allow_buys=allow_buys,
+            allow_sells=allow_sells,
+            current_levels=volatility_grid_levels,
+        )
+        allow_buys = market_stress.allow_buys
+        allow_sells = market_stress.allow_sells
+        volatility_grid_levels = market_stress.grid_levels
+        final_spacing_pct *= market_stress.spacing_multiplier
+        market_stress_context = market_stress.telemetry()
+        logger.info(
+            "market_stress_decision volatility_mode=%s market_stress_score=%.3f trend_strength_score=%.3f opportunity_mode=%s allow_buys_before=%s allow_buys_after=%s allow_sells_before=%s allow_sells_after=%s grid_levels_before=%s grid_levels_after=%s spacing_before=%.6f spacing_after=%.6f reason=%s",
+            market_stress.volatility_mode.value,
+            market_stress.market_stress_score,
+            market_stress.trend_strength_score,
+            market_stress.opportunity_mode.value,
+            allow_buys_before_stress,
+            allow_buys,
+            allow_sells_before_stress,
+            allow_sells,
+            grid_levels_before_stress,
+            volatility_grid_levels,
+            spacing_before_stress,
+            final_spacing_pct,
+            market_stress.reason,
+        )
+        if market_stress.emergency_flat:
+            canceled = self.execution_engine.cancel_all_orders(symbol)
+            flattened = self.execution_engine.flatten_position(symbol, price)
+            logger.warning(
+                "market_stress_emergency_flat symbol=%s position_side=%s position_notional=%.4f canceled=%s flattened=%s reason=%s",
+                symbol,
+                effective_position_side,
+                effective_position_notional,
+                canceled,
+                flattened,
+                market_stress.reason,
+            )
+            return {
+                "status": "managing_position",
+                "regime": regime.value,
+                "risk": None,
+                "mode": mode.value,
+                "reason": "market_stress_emergency_flat",
+                "allowed_to_trade": False,
+                "allowed_to_reduce": True,
+                "canceled_orders": canceled,
+                "flattened": flattened,
+                "position_management_action": "market_stress_emergency_flat",
+                "regime_confidence": regime_confidence,
+                "grid_spacing_pct": final_spacing_pct,
+                "spacing_source": spacing_source,
+                "atr_pct": atr_pct,
+                "grid_levels": volatility_grid_levels,
+                "volatility_grid_levels": volatility_grid_levels,
+                "trend_bias": trend_bias,
+                **dust_context,
+                **market_stress_context,
+            }
+
         attempted_side = "both" if (allow_buys and allow_sells) else ("buy" if allow_buys else ("sell" if allow_sells else "none"))
         would_increase_exposure = (effective_position_side == "LONG" and attempted_side in {"buy", "both"}) or (effective_position_side == "SHORT" and attempted_side in {"sell", "both"})
 
@@ -271,7 +344,7 @@ class StrategyOrchestrator:
             flattened = False
             reduce_only_placed = self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, order_size)
             logger.warning("reduce_only_requested symbol=%s reason=max_position_notional canceled=%s reduce_only_placed=%s", symbol, canceled, reduce_only_placed)
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled, "reduce_only_placed": reduce_only_placed, "flattened": flattened, "state_source": account_state.state_source, **dust_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled, "reduce_only_placed": reduce_only_placed, "flattened": flattened, "state_source": account_state.state_source, **dust_context, **market_stress_context}
 
         if not risk_state.can_trade or regime == MarketRegime.RISK_OFF:
             if risk_state.reason == "max_position_notional":
@@ -279,8 +352,39 @@ class StrategyOrchestrator:
                 flattened = False
                 reduce_only_placed = self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, self._calculate_order_size(price))
                 logger.warning("reduce_only_requested symbol=%s reason=%s canceled=%s reduce_only_placed=%s", symbol, risk_state.reason, canceled, reduce_only_placed)
-                return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled, "reduce_only_placed": reduce_only_placed, "flattened": flattened, "state_source": account_state.state_source, **dust_context}
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": False, **dust_context}
+                return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled, "reduce_only_placed": reduce_only_placed, "flattened": flattened, "state_source": account_state.state_source, **dust_context, **market_stress_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": False, **dust_context, **market_stress_context}
+
+        if market_stress.opportunity_mode in {OpportunityMode.NO_NEW_EXPOSURE, OpportunityMode.REDUCE_ONLY} and effective_position_side == "FLAT":
+            canceled = self.execution_engine.cancel_all_orders(symbol)
+            logger.warning(
+                "market_stress_no_new_exposure symbol=%s opportunity_mode=%s canceled=%s reason=%s",
+                symbol,
+                market_stress.opportunity_mode.value,
+                canceled,
+                market_stress.reason,
+            )
+            return {
+                "status": "paused",
+                "regime": regime.value,
+                "risk": risk_state,
+                "mode": mode.value,
+                "reason": "market_stress_no_new_exposure" if market_stress.opportunity_mode == OpportunityMode.NO_NEW_EXPOSURE else "market_stress_reduce_only_flat",
+                "canceled_orders": canceled,
+                "allowed_to_trade": False,
+                "allowed_to_reduce": False,
+                "position_management_action": "none",
+                "state_source": account_state.state_source,
+                "regime_confidence": regime_confidence,
+                "grid_spacing_pct": final_spacing_pct,
+                "spacing_source": spacing_source,
+                "atr_pct": atr_pct,
+                "grid_levels": volatility_grid_levels,
+                "volatility_grid_levels": volatility_grid_levels,
+                "trend_bias": trend_bias,
+                **dust_context,
+                **market_stress_context,
+            }
 
         no_fill_cycles = self.execution_engine.no_fill_cycles
         last_trade_age_hours = 0.0
@@ -439,17 +543,17 @@ class StrategyOrchestrator:
             result = self.execution_engine.cancel_replace_grid(symbol, plan)
         except Exception as exc:
             logger.warning("state_uncertain_skip_cycle reason=grid_rebuild_api_error error=%s", exc)
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "allowed_to_trade": False, "allowed_to_reduce": False, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "allowed_to_trade": False, "allowed_to_reduce": False, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **market_stress_context, **recenter_context, **edge_context}
         if result.get("error"):
             logger.warning("state_uncertain_skip_cycle reason=%s", result.get("error"))
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "orders": result, "allowed_to_trade": False, "allowed_to_reduce": False, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "mode": mode.value, "reason": "state_uncertain_skip_cycle", "orders": result, "allowed_to_trade": False, "allowed_to_reduce": False, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **market_stress_context, **recenter_context, **edge_context}
         logger.info("grid_state regime=%s mode=%s position_side=%s open_orders_before=%s buy_before=%s sell_before=%s allow_buys=%s allow_sells=%s placed=%s canceled=%s order_notional=%.4f spacing_source=%s atr_pct=%.6f final_spacing_pct=%.6f state_source=%s", regime.value, mode.value, effective_position_side, len(open_orders), buy_order_count, sell_order_count, allow_buys, allow_sells, result.get("placed", 0), result.get("canceled", 0), order_notional, spacing_source, atr_pct, final_spacing_pct, account_state.state_source)
         if neutral_entries_blocked and abs(effective_position_size) > 1e-12:
-            return {"status": "managing_position", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": False, "allowed_to_reduce": True, "reason": "neutral_entries_blocked_in_trend", "position_management_action": "reduce_only_grid", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
+            return {"status": "managing_position", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": False, "allowed_to_reduce": True, "reason": "neutral_entries_blocked_in_trend", "position_management_action": "reduce_only_grid", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **market_stress_context, **recenter_context, **edge_context}
         if neutral_entries_blocked:
             canceled = self.execution_engine.cancel_all_orders(symbol)
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
-        return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **recenter_context, **edge_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **market_stress_context, **recenter_context, **edge_context}
+        return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **market_stress_context, **recenter_context, **edge_context}
 
     def _confirmed_regime(self, raw_regime: MarketRegime, confidence: float) -> MarketRegime:
         """Require configured confirmation and confidence before acting on trend regimes."""
