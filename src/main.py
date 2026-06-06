@@ -202,7 +202,7 @@ def _risk_block_stats_window(now_ts: float, window_seconds: int = 3600) -> tuple
 
 
 def _trade_stats_window(now_ts: float, expected_symbol: str, window_seconds: int = 3600) -> dict:
-    stats = {"trades_count": 0, "buy_count": 0, "sell_count": 0, "volume_usd": 0.0, "fees": 0.0, "realized_pnl_delta": 0.0, "last_trade_ts": "", "candidate_fills_count": 0, "no_orders_touched_count": 0}
+    stats = {"trades_count": 0, "buy_count": 0, "sell_count": 0, "volume_usd": 0.0, "fees": 0.0, "realized_pnl_delta": 0.0, "last_trade_ts": "", "candidate_fills_count": 0, "no_orders_touched_count": 0, "maker_trades": 0, "taker_trades": 0, "maker_fee_total": 0.0, "taker_fee_total": 0.0, "dust_trade_count": 0, "dust_volume": 0.0}
     if TRADES_CSV.exists():
         window_start = now_ts - window_seconds
         with TRADES_CSV.open(encoding="utf-8") as f:
@@ -221,16 +221,40 @@ def _trade_stats_window(now_ts: float, expected_symbol: str, window_seconds: int
                     stats["buy_count"] += 1
                 elif side == "sell":
                     stats["sell_count"] += 1
-                stats["volume_usd"] += _safe_float(row.get("notional")) or 0.0
-                stats["fees"] += _safe_float(row.get("fee")) or 0.0
+                notional = _safe_float(row.get("notional")) or 0.0
+                fee = _safe_float(row.get("fee")) or 0.0
+                stats["volume_usd"] += notional
+                stats["fees"] += fee
                 stats["realized_pnl_delta"] += _safe_float(row.get("realized_pnl_delta")) or 0.0
+                liquidity = str(row.get("fill_liquidity") or "maker").lower()
+                if liquidity == "taker":
+                    stats["taker_trades"] += 1
+                    stats["taker_fee_total"] += fee
+                else:
+                    stats["maker_trades"] += 1
+                    stats["maker_fee_total"] += fee
+                if _is_truthy(row.get("dust_fill")) or (0.0 < notional < 1.0):
+                    stats["dust_trade_count"] += 1
+                    stats["dust_volume"] += notional
                 stats["last_trade_ts"] = row.get("timestamp", "")
     return stats
 
 
 
-def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV) -> dict:
+def _is_truthy(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _empty_regime_stats() -> dict:
+    return {"trades": 0, "wins": 0, "losses": 0, "winrate_pct": 0.0, "pnl": 0.0, "gross_profit": 0.0, "gross_loss": 0.0, "profit_factor": 0.0}
+
+
+def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *, exclude_dust: bool = True) -> dict:
     analytics = {
+        "avg_profit_per_trade": 0.0,
+        "avg_profit_per_winner": 0.0,
+        "avg_loss_per_loser": 0.0,
+        "trades_per_day": 0.0,
         "avg_winner": 0.0,
         "avg_loser": 0.0,
         "profit_factor": 0.0,
@@ -238,11 +262,30 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV) -
         "fee_gross_profit_ratio": 0.0,
         "average_holding_time_seconds": 0.0,
         "pnl_by_regime": {},
+        "trades_by_regime": {},
+        "winrate_by_regime": {},
+        "profit_factor_by_regime": {},
+        "regime_performance": {},
         "pnl_by_trade_category": {},
         "flip_trade_count": 0,
         "flip_trade_pnl": 0.0,
         "pnl_long_trades": 0.0,
         "pnl_short_trades": 0.0,
+        "long_trades": 0,
+        "short_trades": 0,
+        "long_winrate_pct": 0.0,
+        "short_winrate_pct": 0.0,
+        "maker_trades": 0,
+        "taker_trades": 0,
+        "maker_fee_total": 0.0,
+        "taker_fee_total": 0.0,
+        "maker_ratio_pct": 0.0,
+        "taker_ratio_pct": 0.0,
+        "dust_trade_count": 0,
+        "dust_volume": 0.0,
+        "exclude_dust_from_performance_stats": exclude_dust,
+        "avg_winner_before": 0.0,
+        "avg_winner_after": 0.0,
     }
     if not csv_path.exists():
         return analytics
@@ -255,7 +298,15 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV) -
     net_pnl = 0.0
     trade_count = 0
     pnl_by_regime: Counter[str] = Counter()
+    regime_stats: dict[str, dict] = {}
     pnl_by_trade_category: Counter[str] = Counter()
+    long_outcomes: list[float] = []
+    short_outcomes: list[float] = []
+    first_ts: datetime | None = None
+    last_ts: datetime | None = None
+    winner_before_cutover: list[float] = []
+    winner_after_cutover: list[float] = []
+    cutover_ts = datetime.now(timezone.utc)
     holding_times: list[float] = []
     open_position_started_at: datetime | None = None
     previous_position_size = 0.0
@@ -266,13 +317,39 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV) -
                 continue
             ts = _parse_iso_utc(str(row.get("timestamp", "")))
             fee = _safe_float(row.get("fee")) or 0.0
+            notional = _safe_float(row.get("notional")) or 0.0
+            is_dust = _is_truthy(row.get("dust_fill")) or (0.0 < notional < 1.0)
+            if is_dust:
+                analytics["dust_trade_count"] += 1
+                analytics["dust_volume"] += notional
+            if exclude_dust and is_dust:
+                continue
             realized = _safe_float(row.get("realized_pnl_delta")) or 0.0
             net = realized - fee
             total_fees += fee
             net_pnl += net
             trade_count += 1
+            if ts is not None:
+                first_ts = ts if first_ts is None or ts < first_ts else first_ts
+                last_ts = ts if last_ts is None or ts > last_ts else last_ts
+            liquidity = str(row.get("fill_liquidity") or "maker").lower()
+            if liquidity == "taker":
+                analytics["taker_trades"] += 1
+                analytics["taker_fee_total"] += fee
+            else:
+                analytics["maker_trades"] += 1
+                analytics["maker_fee_total"] += fee
             regime = str(row.get("regime") or "unknown")
             pnl_by_regime[regime] += net
+            rstats = regime_stats.setdefault(regime, _empty_regime_stats())
+            rstats["trades"] += 1
+            rstats["pnl"] += net
+            if net > 0:
+                rstats["wins"] += 1
+                rstats["gross_profit"] += net
+            elif net < 0:
+                rstats["losses"] += 1
+                rstats["gross_loss"] += abs(net)
             trade_category = str(row.get("trade_category") or "unknown")
             pnl_by_trade_category[trade_category] += net
             is_flip_trade = str(row.get("is_flip_trade", "")).lower() == "true" or trade_category == "flip"
@@ -281,11 +358,19 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV) -
                 analytics["flip_trade_pnl"] += net
             side = str(row.get("side", "")).lower()
             if side == "buy":
+                analytics["long_trades"] += 1
                 analytics["pnl_long_trades"] += net
+                long_outcomes.append(net)
             elif side == "sell":
+                analytics["short_trades"] += 1
                 analytics["pnl_short_trades"] += net
+                short_outcomes.append(net)
             if realized > 0:
                 winners.append(realized)
+                if ts is not None and ts < cutover_ts:
+                    winner_before_cutover.append(realized)
+                else:
+                    winner_after_cutover.append(realized)
                 gross_profit += realized
             elif realized < 0:
                 losers.append(realized)
@@ -304,12 +389,32 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV) -
 
     analytics["avg_winner"] = sum(winners) / len(winners) if winners else 0.0
     analytics["avg_loser"] = sum(losers) / len(losers) if losers else 0.0
+    analytics["avg_profit_per_trade"] = net_pnl / trade_count if trade_count else 0.0
+    analytics["avg_profit_per_winner"] = analytics["avg_winner"]
+    analytics["avg_loss_per_loser"] = analytics["avg_loser"]
     analytics["profit_factor"] = gross_profit / gross_loss if gross_loss > 1e-12 else (gross_profit if gross_profit > 0 else 0.0)
     analytics["expectancy"] = net_pnl / trade_count if trade_count else 0.0
     analytics["fee_gross_profit_ratio"] = total_fees / gross_profit if gross_profit > 1e-12 else 0.0
     analytics["average_holding_time_seconds"] = sum(holding_times) / len(holding_times) if holding_times else 0.0
     analytics["pnl_by_regime"] = dict(pnl_by_regime)
+    for stats in regime_stats.values():
+        stats["winrate_pct"] = (stats["wins"] / stats["trades"] * 100.0) if stats["trades"] else 0.0
+        stats["profit_factor"] = stats["gross_profit"] / stats["gross_loss"] if stats["gross_loss"] > 1e-12 else (stats["gross_profit"] if stats["gross_profit"] > 0 else 0.0)
+    analytics["regime_performance"] = regime_stats
+    analytics["trades_by_regime"] = {k: v["trades"] for k, v in regime_stats.items()}
+    analytics["winrate_by_regime"] = {k: v["winrate_pct"] for k, v in regime_stats.items()}
+    analytics["profit_factor_by_regime"] = {k: v["profit_factor"] for k, v in regime_stats.items()}
     analytics["pnl_by_trade_category"] = dict(pnl_by_trade_category)
+    analytics["long_winrate_pct"] = (sum(1 for x in long_outcomes if x > 0) / len(long_outcomes) * 100.0) if long_outcomes else 0.0
+    analytics["short_winrate_pct"] = (sum(1 for x in short_outcomes if x > 0) / len(short_outcomes) * 100.0) if short_outcomes else 0.0
+    total_liquidity_trades = analytics["maker_trades"] + analytics["taker_trades"]
+    analytics["maker_ratio_pct"] = analytics["maker_trades"] / total_liquidity_trades * 100.0 if total_liquidity_trades else 0.0
+    analytics["taker_ratio_pct"] = analytics["taker_trades"] / total_liquidity_trades * 100.0 if total_liquidity_trades else 0.0
+    if first_ts is not None and last_ts is not None:
+        days = max((last_ts - first_ts).total_seconds() / 86400.0, 1.0)
+        analytics["trades_per_day"] = trade_count / days
+    analytics["avg_winner_before"] = sum(winner_before_cutover) / len(winner_before_cutover) if winner_before_cutover else 0.0
+    analytics["avg_winner_after"] = sum(winner_after_cutover) / len(winner_after_cutover) if winner_after_cutover else analytics["avg_winner"]
     return analytics
 
 
@@ -512,7 +617,7 @@ def run() -> None:
             logger.exception("last_100_real_trades_export_failed")
         blocked_1h, blocked_by_reason_1h, last_block_reason = _risk_block_stats_window(now_ts=time.time())
         trade_stats_1h = _trade_stats_window(now_ts=time.time(), expected_symbol=cfg.default_symbol)
-        trade_analytics = _trade_analytics_report(cfg.default_symbol)
+        trade_analytics = _trade_analytics_report(cfg.default_symbol, exclude_dust=cfg.exclude_dust_from_performance_stats)
         position_side = "FLAT"
         if account_state.position_size > 0:
             position_side = "LONG"
@@ -588,6 +693,12 @@ def run() -> None:
                 "volume_usd_1h": trade_stats_1h["volume_usd"],
                 "fees_1h": trade_stats_1h["fees"],
                 "realized_pnl_delta_1h": trade_stats_1h["realized_pnl_delta"],
+                "maker_trades_1h": trade_stats_1h["maker_trades"],
+                "taker_trades_1h": trade_stats_1h["taker_trades"],
+                "maker_fee_total_1h": trade_stats_1h["maker_fee_total"],
+                "taker_fee_total_1h": trade_stats_1h["taker_fee_total"],
+                "dust_trade_count_1h": trade_stats_1h["dust_trade_count"],
+                "dust_volume_1h": trade_stats_1h["dust_volume"],
                 "trades_30m": trade_stats_1h["trades_count"],
                 "buy_count_30m": trade_stats_1h["buy_count"],
                 "sell_count_30m": trade_stats_1h["sell_count"],
@@ -595,6 +706,10 @@ def run() -> None:
                 "fees_30m": trade_stats_1h["fees"],
                 "realized_pnl_delta_30m": trade_stats_1h["realized_pnl_delta"],
                 "no_fill_cycles": engine.no_fill_cycles,
+                "avg_profit_per_trade": trade_analytics["avg_profit_per_trade"],
+                "avg_profit_per_winner": trade_analytics["avg_profit_per_winner"],
+                "avg_loss_per_loser": trade_analytics["avg_loss_per_loser"],
+                "trades_per_day": trade_analytics["trades_per_day"],
                 "avg_winner": trade_analytics["avg_winner"],
                 "avg_loser": trade_analytics["avg_loser"],
                 "profit_factor": trade_analytics["profit_factor"],
@@ -602,11 +717,30 @@ def run() -> None:
                 "fee_gross_profit_ratio": trade_analytics["fee_gross_profit_ratio"],
                 "average_holding_time_seconds": trade_analytics["average_holding_time_seconds"],
                 "pnl_by_regime": trade_analytics["pnl_by_regime"],
+                "trades_by_regime": trade_analytics["trades_by_regime"],
+                "winrate_by_regime": trade_analytics["winrate_by_regime"],
+                "profit_factor_by_regime": trade_analytics["profit_factor_by_regime"],
+                "regime_performance": trade_analytics["regime_performance"],
                 "pnl_by_trade_category": trade_analytics["pnl_by_trade_category"],
                 "flip_trade_count": trade_analytics["flip_trade_count"],
                 "flip_trade_pnl": trade_analytics["flip_trade_pnl"],
                 "pnl_long_trades": trade_analytics["pnl_long_trades"],
                 "pnl_short_trades": trade_analytics["pnl_short_trades"],
+                "long_trades": trade_analytics["long_trades"],
+                "short_trades": trade_analytics["short_trades"],
+                "long_winrate_pct": trade_analytics["long_winrate_pct"],
+                "short_winrate_pct": trade_analytics["short_winrate_pct"],
+                "maker_trades": trade_analytics["maker_trades"],
+                "taker_trades": trade_analytics["taker_trades"],
+                "maker_fee_total": trade_analytics["maker_fee_total"],
+                "taker_fee_total": trade_analytics["taker_fee_total"],
+                "maker_ratio_pct": trade_analytics["maker_ratio_pct"],
+                "taker_ratio_pct": trade_analytics["taker_ratio_pct"],
+                "dust_trade_count": trade_analytics["dust_trade_count"],
+                "dust_volume": trade_analytics["dust_volume"],
+                "exclude_dust_from_performance_stats": trade_analytics["exclude_dust_from_performance_stats"],
+                "avg_winner_before": trade_analytics["avg_winner_before"],
+                "avg_winner_after": trade_analytics["avg_winner_after"],
                 "edge_filter_skipped_orders": status.get("edge_filter_skipped_orders", 0),
                 "edge_filter_skipped_by_reason": status.get("edge_filter_skipped_by_reason", {}),
                 "expected_move_pct": status.get("expected_move_pct"),
