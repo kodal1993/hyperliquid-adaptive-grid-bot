@@ -23,6 +23,7 @@ class BotConfig:
     grid_levels: int
     grid_spacing_pct: float
     grid_spacing_vol_multiplier: float
+    grid_spacing_multiplier: float
     grid_spacing_min_pct: float
     grid_spacing_max_pct: float
     min_grid_levels: int
@@ -86,6 +87,7 @@ class BotConfig:
     min_residual_notional_usd: float
     dust_position_notional_usd: float
     auto_dust_cleanup_usd: float
+    exclude_dust_from_performance_stats: bool
     no_fill_cycles_before_recenter: int
     grid_stale_max_hours: float
     recenter_cooldown_seconds: int
@@ -137,7 +139,8 @@ class BotConfig:
             grid_levels=int(os.getenv("GRID_LEVELS", "3")),
             grid_spacing_pct=float(os.getenv("GRID_SPACING_PCT", "0.003")),
             grid_spacing_vol_multiplier=float(os.getenv("GRID_SPACING_VOL_MULTIPLIER", "1.2")),
-            grid_spacing_min_pct=float(os.getenv("GRID_SPACING_MIN_PCT", "0.0015")),
+            grid_spacing_multiplier=float(os.getenv("GRID_SPACING_MULTIPLIER", "1.20")),
+            grid_spacing_min_pct=float(os.getenv("GRID_SPACING_MIN_PCT", "0.0018")),
             grid_spacing_max_pct=float(os.getenv("GRID_SPACING_MAX_PCT", "0.012")),
             min_grid_levels=int(os.getenv("MIN_GRID_LEVELS", "2")),
             max_grid_levels=int(os.getenv("MAX_GRID_LEVELS", "4")),
@@ -200,6 +203,7 @@ class BotConfig:
             min_residual_notional_usd=float(os.getenv("MIN_RESIDUAL_NOTIONAL_USD", "10")),
             dust_position_notional_usd=float(os.getenv("DUST_POSITION_NOTIONAL_USD", "1")),
             auto_dust_cleanup_usd=float(os.getenv("AUTO_DUST_CLEANUP_USD", "5")),
+            exclude_dust_from_performance_stats=os.getenv("EXCLUDE_DUST_FROM_PERFORMANCE_STATS", "true").lower() == "true",
             no_fill_cycles_before_recenter=int(os.getenv("NO_FILL_CYCLES_BEFORE_RECENTER", "360")),
             grid_stale_max_hours=float(os.getenv("GRID_STALE_MAX_HOURS", "2")),
             recenter_cooldown_seconds=int(os.getenv("RECENTER_COOLDOWN_SECONDS", "600")),

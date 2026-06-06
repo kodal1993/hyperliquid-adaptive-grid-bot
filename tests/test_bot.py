@@ -2021,3 +2021,42 @@ def test_market_stress_missing_or_short_candle_data_does_not_crash():
     assert decision.opportunity_mode == OpportunityMode.NORMAL_GRID
     assert decision.allow_buys is True
     assert decision.allow_sells is True
+
+
+def test_spacing_multiplier_and_floor_reduce_grid_density(tmp_path, monkeypatch):
+    monkeypatch.setenv("GRID_SPACING_MULTIPLIER", "1.20")
+    monkeypatch.setenv("GRID_SPACING_MIN_PCT", "0.0018")
+    cfg = BotConfig.from_env()
+    cfg.grid_spacing_pct = 0.003
+    cfg.grid_spacing_vol_multiplier = 1.2
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "spacing_multiplier.json", paper_mode=True, enable_live_trading=False))
+
+    spacing, source = orch._calculate_spacing_pct(atr_pct=0.002, return_vol_pct=0.001)
+
+    assert spacing == pytest.approx(0.0036)
+    assert source == "base_floor_x1.20"
+    assert cfg.grid_spacing_min_pct == pytest.approx(0.0018)
+
+
+def test_trade_analytics_tracks_fee_regime_dust_and_direction(tmp_path):
+    from src.main import _trade_analytics_report
+
+    csv_path = tmp_path / "trades.csv"
+    csv_path.write_text(
+        "timestamp,symbol,side,price,qty,notional,fee,fill_liquidity,dust_fill,realized_pnl_delta,position_size,trade_category,regime\n"
+        "2026-06-01T00:00:00+00:00,BTC,buy,10000,0.01,100,0.010,maker,false,0.050,1,entry,RANGE\n"
+        "2026-06-01T01:00:00+00:00,BTC,sell,10100,0.01,101,0.030,taker,false,-0.020,0,close,TREND_DOWN\n"
+        "2026-06-01T02:00:00+00:00,BTC,buy,10000,0.00001,0.1,0.001,maker,true,0.010,0,entry,RANGE\n",
+        encoding="utf-8",
+    )
+
+    report = _trade_analytics_report("BTC", csv_path, exclude_dust=True)
+
+    assert report["dust_trade_count"] == 1
+    assert report["maker_trades"] == 1
+    assert report["taker_trades"] == 1
+    assert report["maker_fee_total"] == pytest.approx(0.010)
+    assert report["taker_fee_total"] == pytest.approx(0.030)
+    assert report["trades_by_regime"] == {"RANGE": 1, "TREND_DOWN": 1}
+    assert report["pnl_long_trades"] == pytest.approx(0.040)
+    assert report["pnl_short_trades"] == pytest.approx(-0.050)

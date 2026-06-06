@@ -775,9 +775,10 @@ class StrategyOrchestrator:
         return self.config.trend_bias_base
 
     def _calculate_spacing_pct(self, atr_pct: float, return_vol_pct: float) -> tuple[float, str]:
+        spacing_multiplier = max(float(getattr(self.config, "grid_spacing_multiplier", 1.0)), 0.0)
         atr_component = atr_pct * self.config.grid_spacing_vol_multiplier
         vol_component = return_vol_pct * self.config.grid_spacing_vol_multiplier
-        raw_spacing = max(self.config.grid_spacing_pct, atr_component, vol_component)
+        raw_spacing = max(self.config.grid_spacing_pct, atr_component, vol_component) * spacing_multiplier
         final_spacing = min(max(raw_spacing, self.config.grid_spacing_min_pct), self.config.grid_spacing_max_pct)
         if atr_component >= self.config.grid_spacing_pct and atr_component >= vol_component:
             source = "atr14"
@@ -785,6 +786,8 @@ class StrategyOrchestrator:
             source = "return_volatility"
         else:
             source = "base_floor"
+        if abs(spacing_multiplier - 1.0) > 1e-12:
+            source = f"{source}_x{spacing_multiplier:.2f}"
         if final_spacing == self.config.grid_spacing_min_pct and raw_spacing < final_spacing:
             source = f"{source}_min_floor"
         elif final_spacing == self.config.grid_spacing_max_pct and raw_spacing > final_spacing:

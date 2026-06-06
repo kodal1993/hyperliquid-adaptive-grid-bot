@@ -55,6 +55,25 @@ def _signed_order_size(side: str, qty: float) -> float:
     return qty if side.lower() == "buy" else -qty
 
 
+def _classify_fill_liquidity(raw: dict | None = None, *, default: str = "maker") -> str:
+    """Classify a fill as maker or taker from exchange metadata when available."""
+    raw = raw or {}
+    for key in ("liquidity", "liquidityType", "liquidity_type", "fillType", "fill_type"):
+        value = str(raw.get(key, "")).lower()
+        if "maker" in value or value in {"m", "add", "added"}:
+            return "maker"
+        if "taker" in value or value in {"t", "remove", "removed"}:
+            return "taker"
+    for key in ("maker", "isMaker", "is_maker"):
+        if key in raw:
+            return "maker" if bool(raw.get(key)) else "taker"
+    return default if default in {"maker", "taker"} else "unknown"
+
+
+def _is_dust_notional(notional: float, threshold_usd: float = 1.0) -> bool:
+    return 0.0 < abs(notional) < threshold_usd
+
+
 def classify_exposure_action(position_size: float, side: str, qty: float) -> str:
     side = side.lower()
     qty = abs(qty)
@@ -330,7 +349,10 @@ class PaperExecutionEngine:
         trade_category = trade_category_for_action(exposure_action)
         is_flip_trade = exposure_action == "flipping"
         signed = size if fill["side"] == "buy" else -size
-        fee = abs(price * size) * self.fee_rate
+        notional = abs(price * size)
+        fee = notional * self.fee_rate
+        fill_liquidity = _classify_fill_liquidity(fill, default="maker")
+        is_dust_fill = _is_dust_notional(notional)
         self.paper.fees_paid += fee
         self.paper.cash -= fee
         new_pos = self.paper.position_size + signed
@@ -361,8 +383,12 @@ class PaperExecutionEngine:
             "side": fill["side"],
             "price": price,
             "qty": size,
-            "notional": abs(price * size),
+            "notional": notional,
             "fee": fee,
+            "fill_liquidity": fill_liquidity,
+            "is_maker_fill": fill_liquidity == "maker",
+            "is_taker_fill": fill_liquidity == "taker",
+            "dust_fill": is_dust_fill,
             "realized_pnl_delta": realized_delta,
             "realized_pnl_total": self.paper.realized_pnl,
             "cash": self.paper.cash,
@@ -448,7 +474,7 @@ class PaperExecutionEngine:
 
     def _append_trade_ledger(self, entry: dict) -> None:
         self.trade_ledger_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason"]
+        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "fill_liquidity", "is_maker_fill", "is_taker_fill", "dust_fill", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason"]
         write_header = not self.trade_ledger_csv.exists()
         with self.trade_ledger_csv.open("a", encoding="utf-8") as f:
             if write_header:
@@ -692,7 +718,7 @@ class LiveExecutionEngine:
 
     def _append_trade_ledger(self, entry: dict) -> None:
         self.trade_ledger_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason"]
+        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "fill_liquidity", "is_maker_fill", "is_taker_fill", "dust_fill", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason"]
         write_header = not self.trade_ledger_csv.exists()
         with self.trade_ledger_csv.open("a", encoding="utf-8") as f:
             if write_header:
@@ -773,7 +799,10 @@ class LiveExecutionEngine:
         size = float(raw.get("sz", raw.get("size", 0.0)) or 0.0)
         side_raw = str(raw.get("side", "")).lower()
         side = "buy" if side_raw in {"b", "buy"} else "sell"
+        notional = abs(price * size)
         fee = abs(float(raw.get("fee", 0.0) or 0.0))
+        fill_liquidity = _classify_fill_liquidity(raw, default="maker")
+        is_dust_fill = _is_dust_notional(notional)
         realized_delta = float(raw.get("closedPnl", raw.get("closed_pnl", 0.0)) or 0.0)
         ts_raw = raw.get("time")
         if ts_raw is not None:
@@ -792,8 +821,12 @@ class LiveExecutionEngine:
             "side": side,
             "price": price,
             "qty": size,
-            "notional": abs(price * size),
+            "notional": notional,
             "fee": fee,
+            "fill_liquidity": fill_liquidity,
+            "is_maker_fill": fill_liquidity == "maker",
+            "is_taker_fill": fill_liquidity == "taker",
+            "dust_fill": is_dust_fill,
             "realized_pnl_delta": realized_delta,
             "realized_pnl_total": self.state.realized_pnl + realized_delta,
             "cash": self.state.cash,
