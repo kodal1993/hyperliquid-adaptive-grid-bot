@@ -91,6 +91,15 @@ class BotConfig:
     recenter_cooldown_seconds: int
     position_recenter_cooldown_seconds: int
     stale_order_max_age_sec: int
+    enable_market_stress_filter: bool
+    high_vol_atr_pct: float
+    extreme_vol_atr_pct: float
+    btc_5m_shock_pct: float
+    btc_1h_shock_pct: float
+    trend_strong_confidence: float
+    trend_weak_confidence: float
+    panic_score_threshold: float
+    market_stress_extreme_flat: bool
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -196,4 +205,13 @@ class BotConfig:
             recenter_cooldown_seconds=int(os.getenv("RECENTER_COOLDOWN_SECONDS", "600")),
             position_recenter_cooldown_seconds=int(os.getenv("POSITION_RECENTER_COOLDOWN_SECONDS", "900")),
             stale_order_max_age_sec=int(os.getenv("STALE_ORDER_MAX_AGE_SEC", "1800")),
+            enable_market_stress_filter=os.getenv("ENABLE_MARKET_STRESS_FILTER", "true").lower() == "true",
+            high_vol_atr_pct=float(os.getenv("HIGH_VOL_ATR_PCT", "0.006")),
+            extreme_vol_atr_pct=float(os.getenv("EXTREME_VOL_ATR_PCT", "0.010")),
+            btc_5m_shock_pct=float(os.getenv("BTC_5M_SHOCK_PCT", "0.008")),
+            btc_1h_shock_pct=float(os.getenv("BTC_1H_SHOCK_PCT", "0.025")),
+            trend_strong_confidence=float(os.getenv("TREND_STRONG_CONFIDENCE", "0.75")),
+            trend_weak_confidence=float(os.getenv("TREND_WEAK_CONFIDENCE", "0.45")),
+            panic_score_threshold=float(os.getenv("PANIC_SCORE_THRESHOLD", "0.80")),
+            market_stress_extreme_flat=os.getenv("MARKET_STRESS_EXTREME_FLAT", "false").lower() == "true",
         )
