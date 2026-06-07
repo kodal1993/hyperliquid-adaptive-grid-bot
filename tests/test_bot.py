@@ -1753,6 +1753,48 @@ def test_volatility_adjusted_grid_levels(tmp_path):
     assert orch._volatility_adjusted_grid_levels(cfg.vol_extreme_threshold * 1.1) == 1
 
 
+def test_final_effective_grid_levels_flat_floor_prevents_collapse(tmp_path):
+    cfg = BotConfig.from_env()
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "flat_floor.json", paper_mode=True, enable_live_trading=False))
+
+    levels, reason = orch._final_effective_grid_levels(
+        configured_levels=4,
+        volatility_grid_levels=1,
+        risk_adjusted_levels=1,
+        position_side="FLAT",
+        allow_buys=True,
+        allow_sells=False,
+        order_notional=10.0,
+        threshold=5.0,
+    )
+
+    assert levels == 2
+    assert "flat_min_grid_levels_floor:2" in reason
+    assert "risk_floor_override_while_flat" in reason
+
+
+def test_grid_diagnostic_report_counts_distribution():
+    from src import main
+
+    report = {}
+    status = {
+        "final_effective_levels": 2,
+        "force_recenter": True,
+        "rebuild_reason": "flat_without_orders",
+        "orphan_order_detected": True,
+        "grid_level_reduction_reason": "flat_min_grid_levels_floor:2",
+        "no_grid_orders_generated_reason": "edge_filter_removed_all_orders",
+    }
+
+    updated = main._update_grid_diagnostic_report(report, status, no_grid_orders_generated=True)
+
+    assert updated["cycles"] == 1
+    assert updated["rebuild_count"] == 1
+    assert updated["no_grid_orders_generated_count"] == 1
+    assert updated["orphan_cleanup_count"] == 1
+    assert updated["effective_grid_levels_distribution"] == {"2": 1}
+
+
 def test_atr_spacing_increases_with_volatility(tmp_path):
     cfg = BotConfig.from_env()
     orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "atr_spacing.json", paper_mode=True, enable_live_trading=False))
