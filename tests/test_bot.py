@@ -682,6 +682,50 @@ def test_upward_price_drift_classified_trend_up():
     assert regime == MarketRegime.TREND_UP
 
 
+
+def test_regime_detector_early_trend_up_from_higher_highs_and_lows():
+    first = [100.0 + (i * 0.01) for i in range(30)]
+    second = [100.2 + (i * 0.002) for i in range(30)]
+    closes = first + second
+    highs = [101.0 for _ in first] + [101.6 for _ in second]
+    lows = [99.0 for _ in first] + [99.7 for _ in second]
+    df = pd.DataFrame({"close": closes, "high": highs, "low": lows})
+
+    signal = RegimeDetector().detect_signal(
+        df,
+        trend_lookback_candles=60,
+        trend_move_threshold_pct=0.02,
+        ema_slope_threshold_pct=0.02,
+        trend_strength_threshold=0.4,
+    )
+
+    assert signal.regime == MarketRegime.TREND_UP
+    assert signal.trend_structure_score > 0
+    assert signal.momentum_score > 0
+    assert signal.trend_strength_score > 0.4
+
+
+def test_regime_detector_early_trend_down_from_lower_highs_and_lows():
+    first = [100.0 - (i * 0.01) for i in range(30)]
+    second = [99.8 - (i * 0.002) for i in range(30)]
+    closes = first + second
+    highs = [101.0 for _ in first] + [100.3 for _ in second]
+    lows = [99.0 for _ in first] + [98.4 for _ in second]
+    df = pd.DataFrame({"close": closes, "high": highs, "low": lows})
+
+    signal = RegimeDetector().detect_signal(
+        df,
+        trend_lookback_candles=60,
+        trend_move_threshold_pct=0.02,
+        ema_slope_threshold_pct=0.02,
+        trend_strength_threshold=0.4,
+    )
+
+    assert signal.regime == MarketRegime.TREND_DOWN
+    assert signal.trend_structure_score < 0
+    assert signal.momentum_score < 0
+    assert signal.trend_strength_score > 0.4
+
 def test_neutral_grid_blocked_when_directional_exposure_high(tmp_path):
     cfg = BotConfig.from_env()
     cfg.max_position_notional_usd = 100

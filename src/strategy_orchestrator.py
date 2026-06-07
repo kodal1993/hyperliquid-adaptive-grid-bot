@@ -47,7 +47,7 @@ class StrategyOrchestrator:
         self.stale_order_cleanup_count = 0
 
     def on_tick(self, candles: pd.DataFrame, equity: float, daily_pnl_pct: float, symbol: str, position_notional: float = 0.0) -> dict:
-        regime_signal = self.detector.detect_signal(candles, trend_lookback_candles=self.config.trend_lookback_candles, trend_move_threshold_pct=self.config.trend_move_threshold_pct, ema_slope_threshold_pct=self.config.ema_slope_threshold_pct)
+        regime_signal = self.detector.detect_signal(candles, trend_lookback_candles=self.config.trend_lookback_candles, trend_move_threshold_pct=self.config.trend_move_threshold_pct, ema_slope_threshold_pct=self.config.ema_slope_threshold_pct, trend_strength_threshold=self.config.trend_strength_threshold)
         raw_regime = regime_signal.regime
         raw_regime_confidence = regime_signal.confidence
         regime = self._confirmed_regime(raw_regime, raw_regime_confidence)
@@ -250,6 +250,7 @@ class StrategyOrchestrator:
             confirmed_regime=regime,
             regime_confidence=regime_confidence,
             atr_pct=atr_pct,
+            regime_trend_strength_score=regime_signal.trend_strength_score,
             position_side=effective_position_side,
             position_notional=effective_position_notional,
             config=self.config,
@@ -522,6 +523,9 @@ class StrategyOrchestrator:
             "regime_min_confidence": self.config.regime_min_confidence,
             "raw_regime": raw_regime.value,
             "raw_regime_confidence": raw_regime_confidence,
+            "regime_trend_structure_score": regime_signal.trend_structure_score,
+            "regime_momentum_score": regime_signal.momentum_score,
+            "regime_trend_strength_score": regime_signal.trend_strength_score,
             "pending_regime": self.pending_regime.value if self.pending_regime else None,
             "pending_regime_count": self.pending_regime_count,
             "wrong_way_loss_pct": wrong_way_loss_pct,
