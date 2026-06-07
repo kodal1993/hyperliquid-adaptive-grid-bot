@@ -50,8 +50,10 @@ class StrategyOrchestrator:
         regime_signal = self.detector.detect_signal(candles, trend_lookback_candles=self.config.trend_lookback_candles, trend_move_threshold_pct=self.config.trend_move_threshold_pct, ema_slope_threshold_pct=self.config.ema_slope_threshold_pct, trend_strength_threshold=self.config.trend_strength_threshold)
         raw_regime = regime_signal.regime
         raw_regime_confidence = regime_signal.confidence
-        regime = self._confirmed_regime(raw_regime, raw_regime_confidence)
+        regime = self._confirmed_regime(raw_regime, raw_regime_confidence, regime_signal.transition_confidence)
         regime_confidence = raw_regime_confidence if regime == raw_regime else min(raw_regime_confidence, self.config.trend_confidence_weak)
+        if regime == MarketRegime.RANGE and regime_signal.transition_confidence >= 0.45:
+            regime_confidence *= max(0.25, 1.0 - regime_signal.transition_confidence)
         price = float(candles["close"].iloc[-1])
         account_state = self.execution_engine.account_state(symbol, price)
         logger.info("execution_state state_source=%s equity=%.4f position_size=%.8f position_notional=%.4f", account_state.state_source, account_state.equity, account_state.position_size, account_state.position_notional)
@@ -74,6 +76,14 @@ class StrategyOrchestrator:
             "dust_threshold_usd": dust_threshold_usd,
             "auto_dust_cleanup_usd": auto_dust_cleanup_usd,
             "dust_cleanup_requested": dust_cleanup_requested,
+            "higher_high_sequence_score": regime_signal.higher_high_sequence_score,
+            "higher_low_sequence_score": regime_signal.higher_low_sequence_score,
+            "ema_slope_acceleration_score": regime_signal.ema_slope_acceleration_score,
+            "momentum_acceleration_score": regime_signal.momentum_acceleration_score,
+            "trend_transition_score": regime_signal.trend_transition_score,
+            "transition_direction": regime_signal.transition_direction,
+            "transition_confidence": regime_signal.transition_confidence,
+            "trend_transition_delta": regime_signal.trend_transition_delta,
         }
 
         mode = GridMode.NEUTRAL
@@ -239,6 +249,12 @@ class StrategyOrchestrator:
         if is_dust_position and regime == MarketRegime.RANGE and mode == GridMode.NEUTRAL and not force_reduce_only:
             allow_buys = True
             allow_sells = True
+
+        if regime == MarketRegime.RANGE and not force_reduce_only and regime_signal.transition_confidence >= 0.55:
+            if regime_signal.transition_direction == "UP":
+                allow_sells = effective_position_side == "LONG"
+            elif regime_signal.transition_direction == "DOWN":
+                allow_buys = effective_position_side == "SHORT"
 
         allow_buys_before_stress = allow_buys
         allow_sells_before_stress = allow_sells
@@ -526,6 +542,14 @@ class StrategyOrchestrator:
             "regime_trend_structure_score": regime_signal.trend_structure_score,
             "regime_momentum_score": regime_signal.momentum_score,
             "regime_trend_strength_score": regime_signal.trend_strength_score,
+            "higher_high_sequence_score": regime_signal.higher_high_sequence_score,
+            "higher_low_sequence_score": regime_signal.higher_low_sequence_score,
+            "ema_slope_acceleration_score": regime_signal.ema_slope_acceleration_score,
+            "momentum_acceleration_score": regime_signal.momentum_acceleration_score,
+            "trend_transition_score": regime_signal.trend_transition_score,
+            "transition_direction": regime_signal.transition_direction,
+            "transition_confidence": regime_signal.transition_confidence,
+            "trend_transition_delta": regime_signal.trend_transition_delta,
             "pending_regime": self.pending_regime.value if self.pending_regime else None,
             "pending_regime_count": self.pending_regime_count,
             "wrong_way_loss_pct": wrong_way_loss_pct,
@@ -559,7 +583,7 @@ class StrategyOrchestrator:
             return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **market_stress_context, **recenter_context, **edge_context}
         return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **market_stress_context, **recenter_context, **edge_context}
 
-    def _confirmed_regime(self, raw_regime: MarketRegime, confidence: float) -> MarketRegime:
+    def _confirmed_regime(self, raw_regime: MarketRegime, confidence: float, transition_confidence: float = 0.0) -> MarketRegime:
         """Require configured confirmation and confidence before acting on trend regimes."""
         min_confidence = max(float(getattr(self.config, "regime_min_confidence", 0.0)), 0.0)
         confirmation_bars = max(int(getattr(self.config, "regime_confirmation_bars", 1)), 1)
@@ -570,7 +594,9 @@ class StrategyOrchestrator:
             self.pending_regime_count = 0
             return raw_regime
 
-        if confidence < min_confidence:
+        transition_override = transition_confidence >= 0.70
+
+        if confidence < min_confidence and not transition_override:
             logger.info(
                 "regime_confidence_check_blocked raw_regime=%s confidence=%.3f min_confidence=%.3f",
                 raw_regime.value,
@@ -585,7 +611,7 @@ class StrategyOrchestrator:
             self.pending_regime = raw_regime
             self.pending_regime_count = 1
 
-        if self.pending_regime_count < confirmation_bars:
+        if self.pending_regime_count < confirmation_bars and not transition_override:
             logger.info(
                 "regime_confirmation_pending raw_regime=%s confirmation_count=%s confirmation_bars=%s",
                 raw_regime.value,
