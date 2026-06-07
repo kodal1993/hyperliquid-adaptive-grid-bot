@@ -249,6 +249,41 @@ def _empty_regime_stats() -> dict:
     return {"trades": 0, "wins": 0, "losses": 0, "winrate_pct": 0.0, "pnl": 0.0, "gross_profit": 0.0, "gross_loss": 0.0, "profit_factor": 0.0}
 
 
+def _update_group_stats(groups: dict[str, dict], key: str, pnl: float) -> None:
+    stats = groups.setdefault(key, _empty_regime_stats())
+    stats["trades"] += 1
+    stats["pnl"] += pnl
+    if pnl > 0:
+        stats["wins"] += 1
+        stats["gross_profit"] += pnl
+    elif pnl < 0:
+        stats["losses"] += 1
+        stats["gross_loss"] += abs(pnl)
+
+
+def _finalize_group_stats(groups: dict[str, dict]) -> dict[str, dict]:
+    for stats in groups.values():
+        stats["winrate_pct"] = (stats["wins"] / stats["trades"] * 100.0) if stats["trades"] else 0.0
+        stats["profit_factor"] = stats["gross_profit"] / stats["gross_loss"] if stats["gross_loss"] > 1e-12 else (stats["gross_profit"] if stats["gross_profit"] > 0 else 0.0)
+    return groups
+
+
+def _volatility_bucket_from_row(row: dict) -> str:
+    explicit = str(row.get("volatility_bucket") or row.get("volatility_mode") or "").strip()
+    if explicit:
+        return explicit
+    atr_pct = _safe_float(row.get("atr_pct"))
+    return_vol_pct = _safe_float(row.get("return_vol_pct"))
+    volatility = max(atr_pct or 0.0, return_vol_pct or 0.0)
+    if volatility <= 0:
+        return "unknown"
+    if volatility <= 0.003:
+        return "low"
+    if volatility >= 0.012:
+        return "high"
+    return "normal"
+
+
 def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *, exclude_dust: bool = True) -> dict:
     analytics = {
         "avg_profit_per_trade": 0.0,
@@ -286,6 +321,10 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
         "exclude_dust_from_performance_stats": exclude_dust,
         "avg_winner_before": 0.0,
         "avg_winner_after": 0.0,
+        "performance_by_side": {},
+        "performance_by_regime": {},
+        "performance_by_hour": {},
+        "performance_by_volatility_bucket": {},
     }
     if not csv_path.exists():
         return analytics
@@ -299,6 +338,9 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
     trade_count = 0
     pnl_by_regime: Counter[str] = Counter()
     regime_stats: dict[str, dict] = {}
+    side_stats: dict[str, dict] = {}
+    hour_stats: dict[str, dict] = {}
+    volatility_bucket_stats: dict[str, dict] = {}
     pnl_by_trade_category: Counter[str] = Counter()
     long_outcomes: list[float] = []
     short_outcomes: list[float] = []
@@ -357,6 +399,11 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
                 analytics["flip_trade_count"] += 1
                 analytics["flip_trade_pnl"] += net
             side = str(row.get("side", "")).lower()
+            side_key = side or "unknown"
+            _update_group_stats(side_stats, side_key, net)
+            if ts is not None:
+                _update_group_stats(hour_stats, f"{ts.hour:02d}:00", net)
+            _update_group_stats(volatility_bucket_stats, _volatility_bucket_from_row(row), net)
             if side == "buy":
                 analytics["long_trades"] += 1
                 analytics["pnl_long_trades"] += net
@@ -397,10 +444,12 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
     analytics["fee_gross_profit_ratio"] = total_fees / gross_profit if gross_profit > 1e-12 else 0.0
     analytics["average_holding_time_seconds"] = sum(holding_times) / len(holding_times) if holding_times else 0.0
     analytics["pnl_by_regime"] = dict(pnl_by_regime)
-    for stats in regime_stats.values():
-        stats["winrate_pct"] = (stats["wins"] / stats["trades"] * 100.0) if stats["trades"] else 0.0
-        stats["profit_factor"] = stats["gross_profit"] / stats["gross_loss"] if stats["gross_loss"] > 1e-12 else (stats["gross_profit"] if stats["gross_profit"] > 0 else 0.0)
+    _finalize_group_stats(regime_stats)
     analytics["regime_performance"] = regime_stats
+    analytics["performance_by_regime"] = regime_stats
+    analytics["performance_by_side"] = _finalize_group_stats(side_stats)
+    analytics["performance_by_hour"] = _finalize_group_stats(hour_stats)
+    analytics["performance_by_volatility_bucket"] = _finalize_group_stats(volatility_bucket_stats)
     analytics["trades_by_regime"] = {k: v["trades"] for k, v in regime_stats.items()}
     analytics["winrate_by_regime"] = {k: v["winrate_pct"] for k, v in regime_stats.items()}
     analytics["profit_factor_by_regime"] = {k: v["profit_factor"] for k, v in regime_stats.items()}

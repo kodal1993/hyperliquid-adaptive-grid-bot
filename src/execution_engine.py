@@ -505,6 +505,7 @@ class LiveExecutionEngine:
         max_notional_per_trade_usd: float = 10.0,
         min_notional_usd: float = 10.0,
         leverage: int = 1,
+        fee_rate: float = 0.0004,
         **kwargs,
     ) -> None:
         self.client = client
@@ -526,6 +527,7 @@ class LiveExecutionEngine:
         self.max_notional_per_trade_usd = max_notional_per_trade_usd
         self.min_notional_usd = min_notional_usd
         self.leverage = leverage
+        self.fee_rate = fee_rate
         self._seen_fill_ids: set[str] = set()
         self._load_live_seen_fills()
         self.client.require_live_execution_support()
