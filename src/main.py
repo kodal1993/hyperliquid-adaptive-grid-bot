@@ -519,6 +519,30 @@ def _send_startup_telegram(cfg: BotConfig, tg: TelegramHandler) -> str:
     return "startup_failed"
 
 
+
+def _update_grid_diagnostic_report(report: dict, status: dict, *, no_grid_orders_generated: bool) -> dict:
+    """Update per-process grid diagnostics for live status reporting."""
+    report["cycles"] = int(report.get("cycles", 0)) + 1
+    if status.get("rebuild_reason") and status.get("rebuild_reason") != "none" and status.get("force_recenter"):
+        report["rebuild_count"] = int(report.get("rebuild_count", 0)) + 1
+    if no_grid_orders_generated:
+        report["no_grid_orders_generated_count"] = int(report.get("no_grid_orders_generated_count", 0)) + 1
+    orchestrator_orphan_count = int(status.get("orphan_order_cleanup_count", 0) or 0)
+    if orchestrator_orphan_count:
+        report["orphan_cleanup_count"] = max(int(report.get("orphan_cleanup_count", 0)), orchestrator_orphan_count)
+    elif status.get("orphan_order_detected"):
+        report["orphan_cleanup_count"] = int(report.get("orphan_cleanup_count", 0)) + 1
+    levels = status.get("final_effective_levels", status.get("grid_levels"))
+    if levels is not None:
+        distribution = dict(report.get("effective_grid_levels_distribution", {}))
+        key = str(levels)
+        distribution[key] = int(distribution.get(key, 0)) + 1
+        report["effective_grid_levels_distribution"] = distribution
+    report["last_reduction_reason"] = status.get("grid_level_reduction_reason") or status.get("reduction_reason")
+    report["last_no_grid_orders_generated_reason"] = status.get("no_grid_orders_generated_reason")
+    report["last_rebuild_reason"] = status.get("rebuild_reason")
+    return report
+
 def run() -> None:
     cfg = BotConfig.from_env()
     setup_logging(cfg.log_level)
@@ -560,6 +584,13 @@ def run() -> None:
     last_risk_state_value = ""
     last_hard_risk_alert_ts: dict[str, float] = {}
     last_recovery_alert_ts = 0.0
+    grid_diagnostic_report = {
+        "cycles": 0,
+        "rebuild_count": 0,
+        "no_grid_orders_generated_count": 0,
+        "orphan_cleanup_count": 0,
+        "effective_grid_levels_distribution": {},
+    }
 
     telegram_status = _send_startup_telegram(cfg, tg)
 
@@ -696,7 +727,13 @@ def run() -> None:
                 "spacing_source": status.get("spacing_source"),
                 "atr_pct": status.get("atr_pct"),
                 "grid_levels": status.get("grid_levels"),
+                "configured_levels": status.get("configured_levels", cfg.grid_levels),
                 "volatility_grid_levels": status.get("volatility_grid_levels"),
+                "risk_adjusted_levels": status.get("risk_adjusted_levels"),
+                "final_effective_levels": status.get("final_effective_levels", status.get("grid_levels")),
+                "reduction_reason": status.get("grid_level_reduction_reason", status.get("reduction_reason")),
+                "grid_level_reduction_reason": status.get("grid_level_reduction_reason"),
+                "no_grid_orders_generated_reason": status.get("no_grid_orders_generated_reason"),
                 "regime_confidence": status.get("regime_confidence"),
                 "trend_bias": status.get("trend_bias"),
                 "trend_transition_score": status.get("trend_transition_score"),
@@ -820,8 +857,25 @@ def run() -> None:
         mark_price = latest_close
         buys = sorted([o for o in engine.open_orders if str(o.get("symbol", "")).upper() == cfg.default_symbol.upper() and str(o.get("side", "")).lower() == "buy"], key=lambda x: float(x.get("price", 0.0)), reverse=True)
         sells = sorted([o for o in engine.open_orders if str(o.get("symbol", "")).upper() == cfg.default_symbol.upper() and str(o.get("side", "")).lower() == "sell"], key=lambda x: float(x.get("price", 0.0)))
-        if not buys and not sells:
-            logger.info("no_grid_orders_generated")
+        no_grid_orders_generated = not buys and not sells
+        if no_grid_orders_generated:
+            logger.info(
+                "no_grid_orders_generated reason=%s status=%s pause_reason=%s configured_levels=%s volatility_grid_levels=%s risk_adjusted_levels=%s final_effective_levels=%s reduction_reason=%s allowed_to_trade=%s force_recenter=%s rebuild_reason=%s state_uncertain_skip_cycle=%s",
+                status_payload.get("no_grid_orders_generated_reason") or "no_active_exchange_orders",
+                strategy_status,
+                reason or "none",
+                status_payload.get("configured_levels"),
+                status_payload.get("volatility_grid_levels"),
+                status_payload.get("risk_adjusted_levels"),
+                status_payload.get("final_effective_levels"),
+                status_payload.get("reduction_reason"),
+                status_payload.get("allowed_to_trade"),
+                status_payload.get("force_recenter"),
+                status_payload.get("rebuild_reason"),
+                status_payload.get("state_uncertain_skip_cycle"),
+            )
+        grid_diagnostic_report = _update_grid_diagnostic_report(grid_diagnostic_report, status_payload, no_grid_orders_generated=no_grid_orders_generated)
+        status_payload["grid_diagnostic_report"] = dict(grid_diagnostic_report)
         next_order = None
         if buys:
             next_order = {"side": "buy", "price": float(buys[0]["price"])}
