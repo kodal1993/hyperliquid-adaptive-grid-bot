@@ -481,12 +481,26 @@ class StrategyOrchestrator:
         sell_order_count = sum(1 for o in open_orders if str(o.get("side", "")).lower() == "sell")
         orphan_position_no_orders = in_position and len(open_orders) == 0
         flat_without_orders = effective_position_side == "FLAT" and len(open_orders) == 0
-        orphan_order_detected, orphan_reason = self._detect_flat_orphan_orders(
+        orphan_order_detected, orphan_reason, orphan_decision_context = self._detect_flat_orphan_orders(
             open_orders=open_orders,
             position_side=effective_position_side,
             mode=mode,
             allowed_buys=allow_buys,
             allowed_sells=allow_sells,
+        )
+        logger.info(
+            "orphan_order_decision symbol=%s position_side=%s mode=%s allow_buys=%s allow_sells=%s expected_buy_orders=%s expected_sell_orders=%s actual_buy_orders=%s actual_sell_orders=%s orphan_detected=%s orphan_decision_reason=%s",
+            symbol,
+            effective_position_side,
+            mode.value,
+            allow_buys,
+            allow_sells,
+            orphan_decision_context["expected_buy_orders"],
+            orphan_decision_context["expected_sell_orders"],
+            orphan_decision_context["actual_buy_orders"],
+            orphan_decision_context["actual_sell_orders"],
+            orphan_order_detected,
+            orphan_reason,
         )
         stale_order_detected = self._has_stale_flat_order(open_orders, effective_position_side)
         cleanup_requested = orphan_order_detected or stale_order_detected
@@ -499,7 +513,7 @@ class StrategyOrchestrator:
             if orphan_order_detected:
                 self.orphan_order_cleanup_count += 1
             logger.warning(
-                "%s symbol=%s position_side=%s open_orders=%s buy_orders=%s sell_orders=%s mode=%s reason=%s stale_timeout_sec=%s",
+                "%s symbol=%s position_side=%s open_orders=%s buy_orders=%s sell_orders=%s mode=%s expected_buy_orders=%s expected_sell_orders=%s actual_buy_orders=%s actual_sell_orders=%s orphan_decision_reason=%s reason=%s stale_timeout_sec=%s",
                 cleanup_label,
                 symbol,
                 effective_position_side,
@@ -507,6 +521,11 @@ class StrategyOrchestrator:
                 buy_order_count,
                 sell_order_count,
                 mode.value,
+                orphan_decision_context["expected_buy_orders"],
+                orphan_decision_context["expected_sell_orders"],
+                orphan_decision_context["actual_buy_orders"],
+                orphan_decision_context["actual_sell_orders"],
+                orphan_reason,
                 orphan_reason or ("stale_flat_order" if stale_order_detected else "unknown"),
                 self.config.stale_order_max_age_sec,
             )
@@ -528,6 +547,8 @@ class StrategyOrchestrator:
                     "stale_order_cleanup_count": self.stale_order_cleanup_count,
                     "cleanup_canceled_orders": cleanup_canceled,
                     "state_uncertain_skip_cycle": True,
+                    **orphan_decision_context,
+                    "orphan_decision_reason": orphan_reason,
                     **dust_context,
                 }
             post_cancel_orders = [o for o in getattr(self.execution_engine, "open_orders", []) if str(o.get("symbol", symbol)).upper() == symbol.upper()]
@@ -559,6 +580,8 @@ class StrategyOrchestrator:
                     "stale_order_cleanup_count": self.stale_order_cleanup_count,
                     "cleanup_canceled_orders": cleanup_canceled,
                     "state_uncertain_skip_cycle": state_uncertain_skip_cycle,
+                    **orphan_decision_context,
+                    "orphan_decision_reason": orphan_reason,
                     **dust_context,
                 }
             logger.info(
@@ -607,6 +630,8 @@ class StrategyOrchestrator:
             "pre_rebuild_open_orders": len(open_orders),
             "pre_rebuild_buy_orders": buy_order_count,
             "pre_rebuild_sell_orders": sell_order_count,
+            **orphan_decision_context,
+            "orphan_decision_reason": orphan_reason,
             "in_position_for_recenter": in_position,
             "trend_flip_cooldown_remaining": self.trend_flip_cooldown_remaining,
             "trend_flip_cooldown_ticks": self.trend_flip_cooldown_ticks,
@@ -967,33 +992,36 @@ class StrategyOrchestrator:
             return "increasing"
         return "reducing"
 
-    def _expected_min_entry_levels(self, mode: GridMode, allowed_buys: bool, allowed_sells: bool) -> int:
-        buy_count, sell_count = self.grid_manager._level_counts(self.config.grid_levels, mode)
-        active_side_levels = []
-        if allowed_buys:
-            active_side_levels.append(buy_count)
-        if allowed_sells:
-            active_side_levels.append(sell_count)
-        if not active_side_levels:
-            return 0
-        return min(max(2, min(active_side_levels)), 3)
+    def _expected_active_side_orders(self, mode: GridMode, allowed_buys: bool, allowed_sells: bool) -> tuple[int, int]:
+        buy_levels, sell_levels = self.grid_manager._level_counts(self.config.grid_levels, mode)
+        expected_buy_orders = 1 if allowed_buys and buy_levels > 0 else 0
+        expected_sell_orders = 1 if allowed_sells and sell_levels > 0 else 0
+        return expected_buy_orders, expected_sell_orders
 
-    def _detect_flat_orphan_orders(self, *, open_orders: list[dict], position_side: str, mode: GridMode, allowed_buys: bool, allowed_sells: bool) -> tuple[bool, str]:
-        if position_side != "FLAT" or not open_orders:
-            return False, ""
+    def _detect_flat_orphan_orders(self, *, open_orders: list[dict], position_side: str, mode: GridMode, allowed_buys: bool, allowed_sells: bool) -> tuple[bool, str, dict]:
         buy_count = sum(1 for o in open_orders if str(o.get("side", "")).lower() == "buy")
         sell_count = sum(1 for o in open_orders if str(o.get("side", "")).lower() == "sell")
-        if buy_count and not allowed_buys:
-            return True, "buy_order_not_allowed_by_current_strategy"
-        if sell_count and not allowed_sells:
-            return True, "sell_order_not_allowed_by_current_strategy"
-        one_sided = (buy_count == 0) ^ (sell_count == 0)
-        if one_sided:
-            side_count = buy_count or sell_count
-            expected_min = self._expected_min_entry_levels(mode, allowed_buys, allowed_sells)
-            if side_count < expected_min:
-                return True, f"one_sided_flat_grid_too_small:{side_count}<{expected_min}"
-        return False, ""
+        expected_buy_orders, expected_sell_orders = self._expected_active_side_orders(mode, allowed_buys, allowed_sells)
+        context = {
+            "expected_buy_orders": expected_buy_orders,
+            "expected_sell_orders": expected_sell_orders,
+            "actual_buy_orders": buy_count,
+            "actual_sell_orders": sell_count,
+        }
+        if position_side != "FLAT":
+            return False, "not_flat", context
+        if not open_orders:
+            return False, "no_open_orders", context
+        if expected_buy_orders == 0 and expected_sell_orders == 0:
+            return False, "no_active_sides_expected", context
+        missing_active_sides = []
+        if expected_buy_orders > 0 and buy_count == 0:
+            missing_active_sides.append("buy")
+        if expected_sell_orders > 0 and sell_count == 0:
+            missing_active_sides.append("sell")
+        if missing_active_sides:
+            return True, f"expected_active_side_missing:{','.join(missing_active_sides)}", context
+        return False, "active_allowed_sides_present", context
 
     def _has_stale_flat_order(self, open_orders: list[dict], position_side: str) -> bool:
         if position_side != "FLAT" or self.config.stale_order_max_age_sec <= 0:
