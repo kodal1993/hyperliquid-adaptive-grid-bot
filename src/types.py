@@ -7,7 +7,9 @@ from enum import Enum
 class MarketRegime(str, Enum):
     RANGE = "RANGE"
     TREND_UP = "TREND_UP"
+    TREND_UP_PULLBACK = "TREND_UP_PULLBACK"
     TREND_DOWN = "TREND_DOWN"
+    TREND_DOWN_PULLBACK = "TREND_DOWN_PULLBACK"
     RISK_OFF = "RISK_OFF"
     HIGH_VOL = "HIGH_VOL"
 

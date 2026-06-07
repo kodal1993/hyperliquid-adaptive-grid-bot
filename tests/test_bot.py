@@ -12,7 +12,7 @@ import requests
 from src.config import BotConfig
 from src.grid_manager import GridManager
 from src.hyperliquid_client import HyperliquidClient, normalize_price, normalize_size
-from src.regime_detector import RegimeDetector
+from src.regime_detector import RegimeDetector, RegimeSignal
 from src.risk_manager import RiskManager
 from src.types import MarketRegime, GridMode
 from src.execution_engine import ExecutionEngine, LiveExecutionEngine, PaperExecutionEngine, would_increase_exposure
@@ -2140,3 +2140,94 @@ def test_trade_analytics_tracks_fee_regime_dust_and_direction(tmp_path):
     assert report["trades_by_regime"] == {"RANGE": 1, "TREND_DOWN": 1}
     assert report["pnl_long_trades"] == pytest.approx(0.040)
     assert report["pnl_short_trades"] == pytest.approx(-0.050)
+
+
+def test_regime_hysteresis_turns_fast_uptrend_reversal_into_pullback():
+    detector = RegimeDetector(trend_hold_ticks=4)
+    candles = pd.DataFrame({"close": [100.0 + i for i in range(40)], "high": [101.0 + i for i in range(40)], "low": [99.0 + i for i in range(40)]})
+
+    up_signal = RegimeSignal(
+        MarketRegime.TREND_UP, 0.90, 0.004, 0.004, 0.02, 0.006, 0.005,
+        trend_structure_score=0.8,
+        momentum_score=0.8,
+        trend_strength_score=0.85,
+        higher_high_sequence_score=1.0,
+        higher_low_sequence_score=1.0,
+    )
+    pullback_raw_signal = RegimeSignal(
+        MarketRegime.TREND_DOWN, 0.62, 0.004, 0.004, -0.01, -0.002, 0.001,
+        trend_structure_score=0.2,
+        momentum_score=-0.4,
+        trend_strength_score=0.55,
+        higher_high_sequence_score=0.6,
+        higher_low_sequence_score=0.4,
+    )
+
+    detector._detect_raw_signal = lambda *args, **kwargs: up_signal
+    assert detector.detect_signal(candles, ema_slope_threshold_pct=0.004).regime == MarketRegime.TREND_UP
+
+    detector._detect_raw_signal = lambda *args, **kwargs: pullback_raw_signal
+    signal = detector.detect_signal(candles, ema_slope_threshold_pct=0.004)
+
+    assert signal.regime == MarketRegime.TREND_UP_PULLBACK
+    assert signal.regime_hysteresis_score > 0.0
+    assert signal.confidence <= 0.45
+
+
+def test_regime_hysteresis_allows_confirmed_uptrend_to_downtrend_flip():
+    detector = RegimeDetector(trend_hold_ticks=4)
+    candles = pd.DataFrame({"close": [100.0 + i for i in range(40)], "high": [101.0 + i for i in range(40)], "low": [99.0 + i for i in range(40)]})
+
+    up_signal = RegimeSignal(
+        MarketRegime.TREND_UP, 0.90, 0.004, 0.004, 0.02, 0.006, 0.005,
+        trend_structure_score=0.8,
+        momentum_score=0.8,
+        trend_strength_score=0.85,
+        higher_high_sequence_score=1.0,
+        higher_low_sequence_score=1.0,
+    )
+    reversal_signal = RegimeSignal(
+        MarketRegime.TREND_DOWN, 0.88, 0.004, 0.004, -0.03, -0.008, -0.006,
+        trend_structure_score=-1.0,
+        momentum_score=-0.9,
+        trend_strength_score=0.92,
+        higher_high_sequence_score=-1.0,
+        higher_low_sequence_score=-1.0,
+        trend_transition_score=-0.9,
+        transition_direction="DOWN",
+        transition_confidence=0.85,
+    )
+
+    detector._detect_raw_signal = lambda *args, **kwargs: up_signal
+    assert detector.detect_signal(candles, ema_slope_threshold_pct=0.004).regime == MarketRegime.TREND_UP
+
+    detector._detect_raw_signal = lambda *args, **kwargs: reversal_signal
+    signal = detector.detect_signal(candles, ema_slope_threshold_pct=0.004)
+
+    assert signal.regime == MarketRegime.TREND_DOWN
+    assert signal.regime_hysteresis_score <= -0.35
+
+
+def test_pullback_regime_keeps_trend_biased_grid_mode(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.regime_confirmation_bars = 1
+    cfg.regime_min_confidence = 0.0
+    cfg.allow_long_biased = True
+    eng = make_test_engine(tmp_path, "pullback_mode.json", paper_mode=True, enable_live_trading=False)
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100.0 for _ in range(80)], "high": [101.0 for _ in range(80)], "low": [99.0 for _ in range(80)]})
+    pullback_signal = RegimeSignal(
+        MarketRegime.TREND_UP_PULLBACK, 0.45, 0.004, 0.004, -0.01, -0.002, 0.001,
+        trend_structure_score=0.2,
+        trend_strength_score=0.55,
+        higher_high_sequence_score=0.6,
+        higher_low_sequence_score=0.4,
+        regime_hysteresis_score=0.3,
+    )
+    orch.detector.detect_signal = lambda *args, **kwargs: pullback_signal
+
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC")
+
+    assert status["regime"] == "TREND_UP_PULLBACK"
+    assert status["mode"] == GridMode.LONG_BIASED.value
+    assert status["regime_hysteresis_score"] == 0.3
