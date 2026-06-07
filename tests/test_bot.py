@@ -726,6 +726,42 @@ def test_regime_detector_early_trend_down_from_lower_highs_and_lows():
     assert signal.momentum_score < 0
     assert signal.trend_strength_score > 0.4
 
+
+
+def test_regime_detector_transition_score_accelerating_uptrend():
+    closes = [100.0 if i < 40 else 100.0 + 0.01 * ((i - 39) ** 2) for i in range(80)]
+    highs = [c * (1.001 + 0.00001 * i) for i, c in enumerate(closes)]
+    lows = [c * (0.999 + 0.000005 * i) for i, c in enumerate(closes)]
+    df = pd.DataFrame({"close": closes, "high": highs, "low": lows})
+
+    signal = RegimeDetector().detect_signal(
+        df,
+        trend_lookback_candles=60,
+        trend_move_threshold_pct=0.03,
+        ema_slope_threshold_pct=0.03,
+        trend_strength_threshold=0.8,
+    )
+
+    assert signal.regime == MarketRegime.TREND_UP
+    assert signal.higher_high_sequence_score > 0
+    assert signal.higher_low_sequence_score > 0
+    assert signal.ema_slope_acceleration_score > 0
+    assert signal.momentum_acceleration_score > 0
+    assert signal.trend_transition_score > 0.7
+    assert signal.transition_direction == "UP"
+    assert signal.transition_confidence >= 0.7
+
+
+def test_transition_confidence_accelerates_trend_confirmation(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.regime_confirmation_bars = 3
+    cfg.regime_min_confidence = 0.95
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "transition_confirm.json", paper_mode=True, enable_live_trading=False))
+
+    confirmed = orch._confirmed_regime(MarketRegime.TREND_UP, 0.75, transition_confidence=0.8)
+
+    assert confirmed == MarketRegime.TREND_UP
+
 def test_neutral_grid_blocked_when_directional_exposure_high(tmp_path):
     cfg = BotConfig.from_env()
     cfg.max_position_notional_usd = 100

@@ -94,6 +94,7 @@ class TelegramHandler:
             f"Volatility: {report.get('volatility_mode', 'n/a')}",
             f"Stress score: {num(report.get('market_stress_score'), 3)}",
             f"Trend strength: {num(report.get('trend_strength_score'), 3)}",
+            f"Transition: {num(report.get('trend_transition_score'), 3)} / {report.get('transition_direction', 'NONE')} / conf {num(report.get('transition_confidence'), 3)}",
             f"Opportunity: {report.get('opportunity_mode', 'n/a')}",
             f"BTC 5m / 1h: {pct(report.get('btc_5m_return_pct'))} / {pct(report.get('btc_1h_return_pct'))}",
             f"Reason: {report.get('market_stress_reason') or 'none'}",
