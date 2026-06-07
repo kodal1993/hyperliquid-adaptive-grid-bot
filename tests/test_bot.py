@@ -1568,7 +1568,7 @@ def _cfg_for_grid_tests(monkeypatch):
     return cfg
 
 
-def test_flat_one_sell_order_orphan_cancel_and_grid_rebuild(tmp_path, monkeypatch):
+def test_flat_one_sell_order_valid_when_only_sells_allowed(tmp_path, monkeypatch):
     cfg = _cfg_for_grid_tests(monkeypatch)
     eng = make_test_engine(tmp_path, "orphan_sell.json", paper_mode=True)
     eng.open_orders = [{"symbol": "BTC", "side": "sell", "price": 201.0, "size": 0.01}]
@@ -1577,15 +1577,19 @@ def test_flat_one_sell_order_orphan_cancel_and_grid_rebuild(tmp_path, monkeypatc
 
     status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
 
-    assert status["orphan_order_detected"] is True
-    assert status["orphan_order_cleanup_count"] == 1
-    assert status["cleanup_canceled_orders"] == 1
-    assert status["force_recenter"] is True
-    assert len(eng.open_orders) >= 2
-    assert all(o["side"] == "sell" for o in eng.open_orders)
+    assert status["allow_buys"] is False
+    assert status["allow_sells"] is True
+    assert status["expected_buy_orders"] == 0
+    assert status["expected_sell_orders"] == 1
+    assert status["actual_buy_orders"] == 0
+    assert status["actual_sell_orders"] == 1
+    assert status["orphan_decision_reason"] == "active_allowed_sides_present"
+    assert status["orphan_order_detected"] is False
+    assert status["orphan_order_cleanup_count"] == 0
+    assert status["cleanup_canceled_orders"] == 0
 
 
-def test_flat_one_buy_order_orphan_cancel_and_grid_rebuild(tmp_path, monkeypatch):
+def test_flat_one_buy_order_valid_when_only_buys_allowed(tmp_path, monkeypatch):
     cfg = _cfg_for_grid_tests(monkeypatch)
     eng = make_test_engine(tmp_path, "orphan_buy.json", paper_mode=True)
     eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 0.1}]
@@ -1594,10 +1598,58 @@ def test_flat_one_buy_order_orphan_cancel_and_grid_rebuild(tmp_path, monkeypatch
 
     status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
 
+    assert status["allow_buys"] is True
+    assert status["allow_sells"] is False
+    assert status["expected_buy_orders"] == 1
+    assert status["expected_sell_orders"] == 0
+    assert status["actual_buy_orders"] == 1
+    assert status["actual_sell_orders"] == 0
+    assert status["orphan_decision_reason"] == "active_allowed_sides_present"
+    assert status["orphan_order_detected"] is False
+    assert status["orphan_order_cleanup_count"] == 0
+    assert status["cleanup_canceled_orders"] == 0
+
+
+def test_flat_missing_allowed_sell_side_triggers_orphan_cleanup(tmp_path, monkeypatch):
+    cfg = _cfg_for_grid_tests(monkeypatch)
+    eng = make_test_engine(tmp_path, "orphan_missing_sell.json", paper_mode=True)
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 199.0, "size": 0.01}]
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [200 - i for i in range(80)], "high": [201 - i for i in range(80)], "low": [199 - i for i in range(80)]})
+
+    status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status["allow_buys"] is False
+    assert status["allow_sells"] is True
+    assert status["expected_buy_orders"] == 0
+    assert status["expected_sell_orders"] == 1
+    assert status["actual_buy_orders"] == 1
+    assert status["actual_sell_orders"] == 0
+    assert status["orphan_decision_reason"] == "expected_active_side_missing:sell"
     assert status["orphan_order_detected"] is True
+    assert status["orphan_order_cleanup_count"] == 1
     assert status["cleanup_canceled_orders"] == 1
-    assert len(eng.open_orders) >= 2
-    assert all(o["side"] == "buy" for o in eng.open_orders)
+
+
+def test_flat_missing_allowed_buy_side_triggers_orphan_cleanup(tmp_path, monkeypatch):
+    cfg = _cfg_for_grid_tests(monkeypatch)
+    eng = make_test_engine(tmp_path, "orphan_missing_buy.json", paper_mode=True)
+    eng.open_orders = [{"symbol": "BTC", "side": "sell", "price": 101.0, "size": 0.1}]
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100 + i for i in range(80)], "high": [101 + i for i in range(80)], "low": [99 + i for i in range(80)]})
+
+    status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status["allow_buys"] is True
+    assert status["allow_sells"] is False
+    assert status["expected_buy_orders"] == 1
+    assert status["expected_sell_orders"] == 0
+    assert status["actual_buy_orders"] == 0
+    assert status["actual_sell_orders"] == 1
+    assert status["orphan_decision_reason"] == "expected_active_side_missing:buy"
+    assert status["orphan_order_detected"] is True
+    assert status["orphan_order_cleanup_count"] == 1
+    assert status["cleanup_canceled_orders"] == 1
 
 
 def test_flat_no_orders_rebuilds_grid_even_without_price_recenter(tmp_path, monkeypatch):
