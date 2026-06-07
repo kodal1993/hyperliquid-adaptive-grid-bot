@@ -25,6 +25,7 @@ class RegimeSignal:
     transition_direction: str = "NONE"
     transition_confidence: float = 0.0
     trend_transition_delta: float = 0.0
+    regime_hysteresis_score: float = 0.0
 
 
 class RegimeDetector:
@@ -68,10 +69,10 @@ class RegimeDetector:
             ema_slope_threshold_pct=ema_slope_threshold_pct,
             trend_strength_threshold=trend_strength_threshold,
         )
-        regime = self._apply_hysteresis(raw_signal.regime)
+        regime, regime_hysteresis_score = self._apply_hysteresis(raw_signal, ema_slope_threshold_pct=ema_slope_threshold_pct)
         confidence = raw_signal.confidence
-        if regime != raw_signal.regime and regime in {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN}:
-            confidence = min(confidence, 0.35)
+        if regime != raw_signal.regime and regime in {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN, MarketRegime.TREND_UP_PULLBACK, MarketRegime.TREND_DOWN_PULLBACK}:
+            confidence = min(confidence, 0.45 if regime in {MarketRegime.TREND_UP_PULLBACK, MarketRegime.TREND_DOWN_PULLBACK} else 0.35)
         self.regime_confidence = max(0.0, min(1.0, confidence))
         self.last_signal = RegimeSignal(
             regime=regime,
@@ -92,6 +93,7 @@ class RegimeDetector:
             transition_direction=raw_signal.transition_direction,
             transition_confidence=raw_signal.transition_confidence,
             trend_transition_delta=raw_signal.trend_transition_delta,
+            regime_hysteresis_score=regime_hysteresis_score,
         )
         return self.last_signal
 
@@ -220,28 +222,60 @@ class RegimeDetector:
             transition_confidence, transition_delta,
         )
 
-    def _apply_hysteresis(self, raw_regime: MarketRegime) -> MarketRegime:
+    def _apply_hysteresis(self, raw_signal: RegimeSignal, *, ema_slope_threshold_pct: float) -> tuple[MarketRegime, float]:
+        raw_regime = raw_signal.regime
         if raw_regime in {MarketRegime.RISK_OFF, MarketRegime.HIGH_VOL}:
             self._last_regime = raw_regime
             self._trend_hold_remaining = 0
-            return raw_regime
+            return raw_regime, 0.0
 
-        if raw_regime in {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN}:
+        trend_regimes = {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN}
+        pullback_by_trend = {
+            MarketRegime.TREND_UP: MarketRegime.TREND_UP_PULLBACK,
+            MarketRegime.TREND_DOWN: MarketRegime.TREND_DOWN_PULLBACK,
+        }
+        previous_trend = self._last_regime
+        if previous_trend in pullback_by_trend.values():
+            previous_trend = MarketRegime.TREND_UP if previous_trend == MarketRegime.TREND_UP_PULLBACK else MarketRegime.TREND_DOWN
+
+        hysteresis_score = 0.0
+        if previous_trend in trend_regimes:
+            hysteresis_score = calculate_regime_hysteresis_score(
+                raw_signal,
+                previous_trend=previous_trend,
+                ema_slope_threshold_pct=ema_slope_threshold_pct,
+            )
+
+        if raw_regime in trend_regimes:
+            if previous_trend in trend_regimes and raw_regime != previous_trend:
+                reversal_confirmed = (
+                    hysteresis_score <= -0.35
+                    and raw_signal.trend_strength_score >= 0.70
+                    and (raw_signal.confidence >= 0.75 or raw_signal.transition_confidence >= 0.72)
+                )
+                if not reversal_confirmed:
+                    pullback_regime = pullback_by_trend[previous_trend]
+                    self._last_regime = pullback_regime
+                    self._trend_hold_remaining = max(self._trend_hold_remaining - 1, 0)
+                    return pullback_regime, hysteresis_score
+
             self._last_regime = raw_regime
             self._trend_hold_remaining = self.trend_hold_ticks
-            return raw_regime
+            return raw_regime, hysteresis_score
 
         if (
             raw_regime == MarketRegime.RANGE
-            and self._last_regime in {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN}
+            and previous_trend in trend_regimes
             and self._trend_hold_remaining > 0
         ):
             self._trend_hold_remaining -= 1
-            return self._last_regime
+            held_regime = previous_trend if hysteresis_score >= -0.10 else pullback_by_trend[previous_trend]
+            self._last_regime = held_regime
+            return held_regime, hysteresis_score
 
         self._last_regime = raw_regime
         self._trend_hold_remaining = 0
-        return raw_regime
+        return raw_regime, hysteresis_score
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -250,6 +284,34 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 def _signed_score(value: float, threshold: float) -> float:
     return _clamp(float(value) / max(float(threshold), 1e-9), -1.0, 1.0)
+
+
+def calculate_regime_hysteresis_score(
+    signal: RegimeSignal,
+    *,
+    previous_trend: MarketRegime,
+    ema_slope_threshold_pct: float,
+) -> float:
+    """Score whether the previous strong trend still has enough evidence to resist a flip.
+
+    Positive values mean the prior trend remains structurally supported; negative
+    values mean opposite-trend evidence is strong enough to justify flipping.
+    """
+    direction = 1.0 if previous_trend == MarketRegime.TREND_UP else -1.0
+    fast_slope_score = _signed_score(signal.ema_slope_fast_pct, ema_slope_threshold_pct)
+    slow_slope_score = _signed_score(signal.ema_slope_slow_pct, ema_slope_threshold_pct * 0.7)
+    ema_alignment = direction * ((fast_slope_score * 0.60) + (slow_slope_score * 0.40))
+    structure_alignment = direction * signal.trend_structure_score
+    sequence_alignment = direction * ((signal.higher_high_sequence_score * 0.50) + (signal.higher_low_sequence_score * 0.50))
+    trend_strength_alignment = signal.trend_strength_score if structure_alignment >= 0.0 else -signal.trend_strength_score
+    return _clamp(
+        0.35 * ema_alignment
+        + 0.25 * structure_alignment
+        + 0.25 * sequence_alignment
+        + 0.15 * trend_strength_alignment,
+        -1.0,
+        1.0,
+    )
 
 
 def calculate_trend_structure_score(candles: pd.DataFrame, lookback: int = 60) -> float:

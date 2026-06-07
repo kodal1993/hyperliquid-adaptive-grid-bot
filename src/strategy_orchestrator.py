@@ -84,16 +84,17 @@ class StrategyOrchestrator:
             "transition_direction": regime_signal.transition_direction,
             "transition_confidence": regime_signal.transition_confidence,
             "trend_transition_delta": regime_signal.trend_transition_delta,
+            "regime_hysteresis_score": regime_signal.regime_hysteresis_score,
         }
 
         mode = GridMode.NEUTRAL
         neutral_entries_blocked = False
-        if regime == MarketRegime.TREND_UP:
+        if regime in {MarketRegime.TREND_UP, MarketRegime.TREND_UP_PULLBACK}:
             if self.config.allow_long_biased:
                 mode = GridMode.LONG_BIASED
             else:
                 neutral_entries_blocked = True
-        elif regime == MarketRegime.TREND_DOWN:
+        elif regime in {MarketRegime.TREND_DOWN, MarketRegime.TREND_DOWN_PULLBACK}:
             if self.config.allow_short_biased:
                 mode = GridMode.SHORT_BIASED
             else:
@@ -167,8 +168,8 @@ class StrategyOrchestrator:
         force_reduce_only = effective_position_notional > rebalance_cap
 
         wrong_way_trend_position = (
-            (regime == MarketRegime.TREND_DOWN and effective_position_side == "LONG")
-            or (regime == MarketRegime.TREND_UP and effective_position_side == "SHORT")
+            (regime in {MarketRegime.TREND_DOWN, MarketRegime.TREND_DOWN_PULLBACK} and effective_position_side == "LONG")
+            or (regime in {MarketRegime.TREND_UP, MarketRegime.TREND_UP_PULLBACK} and effective_position_side == "SHORT")
         )
         wrong_way_loss_pct = 0.0
         if wrong_way_trend_position and avg_entry > 0:
@@ -224,10 +225,10 @@ class StrategyOrchestrator:
                 allow_buys = False
                 allow_sells = False
 
-        if regime == MarketRegime.TREND_UP and mode == GridMode.LONG_BIASED and not force_reduce_only:
+        if regime in {MarketRegime.TREND_UP, MarketRegime.TREND_UP_PULLBACK} and mode == GridMode.LONG_BIASED and not force_reduce_only:
             allow_buys = effective_position_side != "LONG" and long_exposure < threshold
             allow_sells = effective_position_side == "LONG"
-        if regime == MarketRegime.TREND_DOWN and mode == GridMode.SHORT_BIASED and not force_reduce_only:
+        if regime in {MarketRegime.TREND_DOWN, MarketRegime.TREND_DOWN_PULLBACK} and mode == GridMode.SHORT_BIASED and not force_reduce_only:
             allow_sells = effective_position_side != "SHORT" and short_exposure < threshold
             allow_buys = effective_position_side == "SHORT"
 
@@ -237,10 +238,10 @@ class StrategyOrchestrator:
                 allow_buys = False
                 allow_sells = False
                 self.trend_flip_cooldown_remaining -= 1
-            elif regime == MarketRegime.TREND_UP and effective_position_side == "SHORT":
+            elif regime in {MarketRegime.TREND_UP, MarketRegime.TREND_UP_PULLBACK} and effective_position_side == "SHORT":
                 allow_buys = True
                 allow_sells = False
-            elif regime == MarketRegime.TREND_DOWN and effective_position_side == "LONG":
+            elif regime in {MarketRegime.TREND_DOWN, MarketRegime.TREND_DOWN_PULLBACK} and effective_position_side == "LONG":
                 allow_buys = False
                 allow_sells = True
             else:
@@ -550,6 +551,7 @@ class StrategyOrchestrator:
             "transition_direction": regime_signal.transition_direction,
             "transition_confidence": regime_signal.transition_confidence,
             "trend_transition_delta": regime_signal.trend_transition_delta,
+            "regime_hysteresis_score": regime_signal.regime_hysteresis_score,
             "pending_regime": self.pending_regime.value if self.pending_regime else None,
             "pending_regime_count": self.pending_regime_count,
             "wrong_way_loss_pct": wrong_way_loss_pct,

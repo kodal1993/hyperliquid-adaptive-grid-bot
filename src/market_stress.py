@@ -188,8 +188,8 @@ def decide_market_stress(
         raw = _regime_value(raw_regime)
         confirmed = _regime_value(confirmed_regime)
         trend_strength_input = regime_confidence if regime_trend_strength_score is None else regime_trend_strength_score
-        trend_strength_score = max(0.0, min(float(trend_strength_input), 1.0)) if confirmed in {"TREND_UP", "TREND_DOWN"} else 0.0
-        strong_trend = confirmed in {"TREND_UP", "TREND_DOWN"} and trend_strength_score >= trend_strong_confidence
+        trend_strength_score = max(0.0, min(float(trend_strength_input), 1.0)) if confirmed in {"TREND_UP", "TREND_DOWN", "TREND_UP_PULLBACK", "TREND_DOWN_PULLBACK"} else 0.0
+        strong_trend = confirmed in {"TREND_UP", "TREND_DOWN", "TREND_UP_PULLBACK", "TREND_DOWN_PULLBACK"} and trend_strength_score >= trend_strong_confidence
         weak_trend = confirmed == "RANGE" or trend_strength_score <= trend_weak_confidence
         spacing_multiplier = 1.0
         new_allow_buys = bool(allow_buys)
@@ -200,14 +200,14 @@ def decide_market_stress(
         emergency_flat = False
         reason = f"normal_grid raw_regime={raw} confirmed_regime={confirmed}"
 
-        if volatility_mode in {VolatilityMode.HIGH, VolatilityMode.EXTREME} and strong_trend and confirmed == "TREND_DOWN":
+        if volatility_mode in {VolatilityMode.HIGH, VolatilityMode.EXTREME} and strong_trend and confirmed in {"TREND_DOWN", "TREND_DOWN_PULLBACK"}:
             opportunity_mode = OpportunityMode.TREND_FOLLOW_SHORT
             new_allow_sells = position_side.upper() != "SHORT" and bool(allow_sells)
             new_allow_buys = position_side.upper() == "SHORT"
             new_levels = max(1, min(current_levels, 2))
             spacing_multiplier = 1.5 if volatility_mode == VolatilityMode.EXTREME else 1.2
             reason = "high_or_extreme_vol_strong_trend_down"
-        elif volatility_mode in {VolatilityMode.HIGH, VolatilityMode.EXTREME} and strong_trend and confirmed == "TREND_UP":
+        elif volatility_mode in {VolatilityMode.HIGH, VolatilityMode.EXTREME} and strong_trend and confirmed in {"TREND_UP", "TREND_UP_PULLBACK"}:
             opportunity_mode = OpportunityMode.TREND_FOLLOW_LONG
             new_allow_buys = position_side.upper() != "LONG" and bool(allow_buys)
             new_allow_sells = position_side.upper() == "LONG"
