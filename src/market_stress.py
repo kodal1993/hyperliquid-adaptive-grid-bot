@@ -125,6 +125,7 @@ def decide_market_stress(
     allow_buys: bool,
     allow_sells: bool,
     current_levels: int,
+    regime_trend_strength_score: float | None = None,
 ) -> MarketStressDecision:
     """BTC-only Phase 1 market stress layer using local candle data only.
 
@@ -186,7 +187,8 @@ def decide_market_stress(
 
         raw = _regime_value(raw_regime)
         confirmed = _regime_value(confirmed_regime)
-        trend_strength_score = max(0.0, min(float(regime_confidence), 1.0)) if confirmed in {"TREND_UP", "TREND_DOWN"} else 0.0
+        trend_strength_input = regime_confidence if regime_trend_strength_score is None else regime_trend_strength_score
+        trend_strength_score = max(0.0, min(float(trend_strength_input), 1.0)) if confirmed in {"TREND_UP", "TREND_DOWN"} else 0.0
         strong_trend = confirmed in {"TREND_UP", "TREND_DOWN"} and trend_strength_score >= trend_strong_confidence
         weak_trend = confirmed == "RANGE" or trend_strength_score <= trend_weak_confidence
         spacing_multiplier = 1.0

@@ -77,6 +77,7 @@ class BotConfig:
     trend_lookback_candles: int
     trend_move_threshold_pct: float
     ema_slope_threshold_pct: float
+    trend_strength_threshold: float
     stuck_position_minutes: int
     log_level: str
     soft_exposure_cap_pct: float
@@ -193,6 +194,7 @@ class BotConfig:
             trend_lookback_candles=int(os.getenv("TREND_LOOKBACK_CANDLES", "60")),
             trend_move_threshold_pct=float(os.getenv("TREND_MOVE_THRESHOLD_PCT", "0.006")),
             ema_slope_threshold_pct=float(os.getenv("EMA_SLOPE_THRESHOLD_PCT", "0.003")),
+            trend_strength_threshold=float(os.getenv("TREND_STRENGTH_THRESHOLD", "0.65")),
             stuck_position_minutes=int(os.getenv("STUCK_POSITION_MINUTES", "60")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             soft_exposure_cap_pct=float(os.getenv("SOFT_EXPOSURE_CAP_PCT", "0.6")),
