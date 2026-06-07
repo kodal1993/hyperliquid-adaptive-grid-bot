@@ -43,6 +43,7 @@ class StrategyOrchestrator:
         self.trend_flip_cooldown_remaining = 0
         self.trend_flip_cooldown_ticks = max(int(getattr(config, "trend_flip_cooldown_ticks", 6)), 0)
         self.wrong_way_exit_loss_pct = 0.0035
+        self.adverse_move_exit_pct = max(float(getattr(config, "adverse_move_exit_pct", 0.0045)), 0.0)
         self.orphan_order_cleanup_count = 0
         self.stale_order_cleanup_count = 0
 
@@ -208,6 +209,49 @@ class StrategyOrchestrator:
                 **dust_context,
             }
 
+        adverse_move_pct = self._adverse_move_pct(effective_position_side, avg_entry, price)
+        mean_reversion_confirmed = self._mean_reversion_confirmed(
+            candles,
+            effective_position_side,
+            avg_entry,
+            price,
+            regime_signal.transition_direction,
+        )
+        if (
+            effective_position_side in {"LONG", "SHORT"}
+            and adverse_move_pct > self.adverse_move_exit_pct
+            and not mean_reversion_confirmed
+        ):
+            canceled = self.execution_engine.cancel_all_orders(symbol)
+            flattened = self.execution_engine.flatten_position(symbol, price)
+            logger.warning(
+                "adverse_move_protection_exit_requested side=%s entry=%s price=%s adverse_move_pct=%.5f threshold=%.5f mean_reversion_confirmed=%s canceled=%s flattened=%s",
+                effective_position_side,
+                avg_entry,
+                price,
+                adverse_move_pct,
+                self.adverse_move_exit_pct,
+                mean_reversion_confirmed,
+                canceled,
+                flattened,
+            )
+            return {
+                "status": "managing_position",
+                "regime": regime.value,
+                "risk": None,
+                "mode": mode.value,
+                "reason": "adverse_move_protection_exit_requested",
+                "allowed_to_trade": False,
+                "allowed_to_reduce": True,
+                "canceled_orders": canceled,
+                "flattened": flattened,
+                "position_management_action": "adverse_move_close",
+                "adverse_move_pct": adverse_move_pct,
+                "adverse_move_exit_pct": self.adverse_move_exit_pct,
+                "mean_reversion_confirmed": mean_reversion_confirmed,
+                **dust_context,
+            }
+
         if force_reduce_only:
             if effective_position_side == "LONG":
                 allow_sells = True
@@ -257,6 +301,19 @@ class StrategyOrchestrator:
             elif regime_signal.transition_direction == "DOWN":
                 allow_buys = effective_position_side == "SHORT"
 
+        entry_filter_context = self._apply_counter_trend_entry_filter(
+            allow_buys=allow_buys,
+            allow_sells=allow_sells,
+            position_side=effective_position_side,
+            regime=regime,
+            regime_signal=regime_signal,
+            spacing_pct=final_spacing_pct,
+            fee_rate=max(float(getattr(self.execution_engine, "fee_rate", 0.0)), 0.0),
+            force_reduce_only=force_reduce_only,
+        )
+        allow_buys = entry_filter_context.pop("allow_buys")
+        allow_sells = entry_filter_context.pop("allow_sells")
+
         allow_buys_before_stress = allow_buys
         allow_sells_before_stress = allow_sells
         grid_levels_before_stress = volatility_grid_levels
@@ -279,7 +336,7 @@ class StrategyOrchestrator:
         allow_sells = market_stress.allow_sells
         volatility_grid_levels = market_stress.grid_levels
         final_spacing_pct *= market_stress.spacing_multiplier
-        market_stress_context = market_stress.telemetry()
+        market_stress_context = {**entry_filter_context, **market_stress.telemetry()}
         logger.info(
             "market_stress_decision volatility_mode=%s market_stress_score=%.3f trend_strength_score=%.3f opportunity_mode=%s allow_buys_before=%s allow_buys_after=%s allow_sells_before=%s allow_sells_after=%s grid_levels_before=%s grid_levels_after=%s spacing_before=%.6f spacing_after=%.6f reason=%s",
             market_stress.volatility_mode.value,
@@ -585,6 +642,87 @@ class StrategyOrchestrator:
             return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **market_stress_context, **recenter_context, **edge_context}
         return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **market_stress_context, **recenter_context, **edge_context}
 
+    def _entry_edge_score(self, spacing_pct: float, fee_rate: float) -> float:
+        roundtrip_fee_pct = max(fee_rate * 2.0, 1e-9)
+        return max(spacing_pct, 0.0) / roundtrip_fee_pct
+
+    def _has_strong_bullish_momentum(self, signal) -> bool:
+        threshold = max(float(getattr(self.config, "strong_momentum_block_threshold", 0.65)), 0.0)
+        return (
+            signal.transition_direction == "UP" and signal.transition_confidence >= threshold
+        ) or signal.momentum_score >= threshold or signal.ema_slope_acceleration_score >= threshold
+
+    def _has_strong_bearish_momentum(self, signal) -> bool:
+        threshold = max(float(getattr(self.config, "strong_momentum_block_threshold", 0.65)), 0.0)
+        return (
+            signal.transition_direction == "DOWN" and signal.transition_confidence >= threshold
+        ) or signal.momentum_score <= -threshold or signal.ema_slope_acceleration_score <= -threshold
+
+    def _apply_counter_trend_entry_filter(
+        self,
+        *,
+        allow_buys: bool,
+        allow_sells: bool,
+        position_side: str,
+        regime: MarketRegime,
+        regime_signal,
+        spacing_pct: float,
+        fee_rate: float,
+        force_reduce_only: bool,
+    ) -> dict:
+        edge_score = self._entry_edge_score(spacing_pct, fee_rate)
+        required_edge_score = max(float(getattr(self.config, "counter_trend_entry_edge_score", 3.5)), 0.0)
+        strong_bullish = self._has_strong_bullish_momentum(regime_signal)
+        strong_bearish = self._has_strong_bearish_momentum(regime_signal)
+        short_blocked = False
+        long_blocked = False
+        reasons: list[str] = []
+
+        if not force_reduce_only and edge_score < required_edge_score:
+            if allow_sells and position_side != "LONG" and (regime == MarketRegime.TREND_UP or strong_bullish):
+                allow_sells = False
+                short_blocked = True
+                reasons.append("short_blocked_bullish_trend_or_momentum")
+            if allow_buys and position_side != "SHORT" and (regime == MarketRegime.TREND_DOWN or strong_bearish):
+                allow_buys = False
+                long_blocked = True
+                reasons.append("long_blocked_bearish_trend_or_momentum")
+
+        return {
+            "allow_buys": allow_buys,
+            "allow_sells": allow_sells,
+            "counter_trend_entry_filter_enabled": True,
+            "counter_trend_edge_score": edge_score,
+            "counter_trend_required_edge_score": required_edge_score,
+            "strong_bullish_momentum": strong_bullish,
+            "strong_bearish_momentum": strong_bearish,
+            "short_entry_blocked_by_trend_filter": short_blocked,
+            "long_entry_blocked_by_trend_filter": long_blocked,
+            "counter_trend_entry_filter_reason": ",".join(reasons),
+        }
+
+    def _adverse_move_pct(self, position_side: str, avg_entry: float, price: float) -> float:
+        if avg_entry <= 0:
+            return 0.0
+        if position_side == "LONG":
+            return max((avg_entry - price) / avg_entry, 0.0)
+        if position_side == "SHORT":
+            return max((price - avg_entry) / avg_entry, 0.0)
+        return 0.0
+
+    def _mean_reversion_confirmed(self, candles: pd.DataFrame, position_side: str, avg_entry: float, price: float, transition_direction: str) -> bool:
+        if avg_entry <= 0 or len(candles) < 2:
+            return False
+        previous_close = float(candles["close"].iloc[-2])
+        min_reversion = max(float(getattr(self.config, "min_reversion_confirmation_pct", 0.0015)), 0.0)
+        if position_side == "LONG":
+            recovered_pct = (price - previous_close) / max(previous_close, 1e-9)
+            return recovered_pct >= min_reversion or transition_direction == "UP"
+        if position_side == "SHORT":
+            recovered_pct = (previous_close - price) / max(previous_close, 1e-9)
+            return recovered_pct >= min_reversion or transition_direction == "DOWN"
+        return False
+
     def _confirmed_regime(self, raw_regime: MarketRegime, confidence: float, transition_confidence: float = 0.0) -> MarketRegime:
         """Require configured confirmation and confidence before acting on trend regimes."""
         min_confidence = max(float(getattr(self.config, "regime_min_confidence", 0.0)), 0.0)
@@ -642,6 +780,7 @@ class StrategyOrchestrator:
         min_edge_usd = max(float(self.config.min_expected_net_edge_usd), 0.0)
         min_edge_pct = max(float(self.config.min_expected_net_edge_pct), 0.0)
         min_rr = max(float(self.config.min_rr_ratio), 0.0)
+        min_net_fee_multiple = max(float(getattr(self.config, "min_expected_net_profit_fee_multiple", 2.5)), 0.0)
 
         for order in plan.long_levels + plan.short_levels:
             action = self._classify_order_action(position_size, order.side, order.size)
@@ -661,6 +800,8 @@ class StrategyOrchestrator:
                     block_reason = "below_min_expected_net_edge_usd"
                 elif estimate["expected_net_edge_pct"] < min_edge_pct:
                     block_reason = "below_min_expected_net_edge_pct"
+                elif estimate["expected_net_edge"] <= estimate["expected_fee_cost"] * min_net_fee_multiple:
+                    block_reason = "below_min_expected_net_profit_fee_multiple"
                 elif estimate["rr_ratio"] < min_rr:
                     block_reason = "below_min_rr_ratio"
 
@@ -671,7 +812,7 @@ class StrategyOrchestrator:
                 skipped += 1
                 skipped_by_reason[block_reason] = skipped_by_reason.get(block_reason, 0) + 1
                 logger.info(
-                    "order_skipped reason=edge_filter side=%s price=%s size=%s expected_move_pct=%.6f grid_spacing_pct=%.6f expected_gross_pnl=%.6f expected_fee_cost=%.6f expected_net_edge=%.6f expected_net_edge_pct=%.6f rr_ratio=%.3f block_reason=%s",
+                    "order_skipped reason=edge_filter side=%s price=%s size=%s expected_move_pct=%.6f grid_spacing_pct=%.6f expected_gross_pnl=%.6f expected_fee_cost=%.6f expected_net_edge=%.6f expected_net_edge_pct=%.6f expected_profit_after_fees=%.6f net_fee_multiple=%.3f min_net_fee_multiple=%.3f rr_ratio=%.3f block_reason=%s",
                     order.side,
                     order.price,
                     order.size,
@@ -681,6 +822,9 @@ class StrategyOrchestrator:
                     estimate["expected_fee_cost"],
                     estimate["expected_net_edge"],
                     estimate["expected_net_edge_pct"],
+                    estimate["expected_profit_after_fees"],
+                    estimate["net_fee_multiple"],
+                    min_net_fee_multiple,
                     estimate["rr_ratio"],
                     block_reason,
                 )
@@ -701,10 +845,13 @@ class StrategyOrchestrator:
             "min_expected_net_edge_usd": min_edge_usd,
             "min_expected_net_edge_pct": min_edge_pct,
             "min_rr_ratio": min_rr,
+            "min_expected_net_profit_fee_multiple": min_net_fee_multiple,
             "expected_move_pct": best.get("expected_move_pct"),
             "expected_gross_pnl": best.get("expected_gross_pnl"),
             "expected_fee_cost": best.get("expected_fee_cost"),
             "expected_net_edge": best.get("expected_net_edge"),
+            "expected_profit_after_fees": best.get("expected_profit_after_fees"),
+            "expected_net_fee_multiple": best.get("net_fee_multiple"),
             "expected_net_edge_pct": best.get("expected_net_edge_pct"),
             "expected_rr_ratio": best.get("rr_ratio"),
         }
@@ -717,12 +864,15 @@ class StrategyOrchestrator:
         expected_net_edge = expected_gross_pnl - expected_fee_cost
         expected_net_edge_pct = expected_net_edge / max(notional, 1e-9)
         rr_ratio = expected_gross_pnl / max(expected_fee_cost, 1e-9)
+        net_fee_multiple = expected_net_edge / max(expected_fee_cost, 1e-9)
         return {
             "expected_move_pct": expected_move_pct,
             "grid_spacing_pct": grid_spacing_pct,
             "expected_gross_pnl": expected_gross_pnl,
             "expected_fee_cost": expected_fee_cost,
             "expected_net_edge": expected_net_edge,
+            "expected_profit_after_fees": expected_net_edge,
+            "net_fee_multiple": net_fee_multiple,
             "expected_net_edge_pct": expected_net_edge_pct,
             "rr_ratio": rr_ratio,
         }
@@ -807,23 +957,33 @@ class StrategyOrchestrator:
         return self.config.trend_bias_base
 
     def _calculate_spacing_pct(self, atr_pct: float, return_vol_pct: float) -> tuple[float, str]:
+        realized_vol = max(float(atr_pct or 0.0), float(return_vol_pct or 0.0))
         spacing_multiplier = max(float(getattr(self.config, "grid_spacing_multiplier", 1.0)), 0.0)
+        if realized_vol >= self.config.vol_high_threshold:
+            bucket = "high_volatility"
+            bucket_min = float(getattr(self.config, "grid_spacing_high_vol_min_pct", 0.0055))
+            bucket_max = float(getattr(self.config, "grid_spacing_high_vol_max_pct", 0.0075))
+        elif realized_vol <= self.config.vol_low_threshold:
+            bucket = "low_volatility"
+            bucket_min = float(getattr(self.config, "grid_spacing_low_vol_min_pct", 0.0025))
+            bucket_max = float(getattr(self.config, "grid_spacing_low_vol_max_pct", 0.0030))
+        else:
+            bucket = "normal_volatility"
+            bucket_min = float(getattr(self.config, "grid_spacing_normal_vol_min_pct", 0.0035))
+            bucket_max = float(getattr(self.config, "grid_spacing_normal_vol_max_pct", 0.0045))
+
         atr_component = atr_pct * self.config.grid_spacing_vol_multiplier
         vol_component = return_vol_pct * self.config.grid_spacing_vol_multiplier
         raw_spacing = max(self.config.grid_spacing_pct, atr_component, vol_component) * spacing_multiplier
-        final_spacing = min(max(raw_spacing, self.config.grid_spacing_min_pct), self.config.grid_spacing_max_pct)
-        if atr_component >= self.config.grid_spacing_pct and atr_component >= vol_component:
-            source = "atr14"
-        elif vol_component > self.config.grid_spacing_pct:
-            source = "return_volatility"
-        else:
-            source = "base_floor"
+        final_spacing = min(max(raw_spacing, bucket_min), bucket_max)
+        driver = "atr14" if atr_component >= vol_component else "return_volatility"
+        source = f"{bucket}_{driver}"
         if abs(spacing_multiplier - 1.0) > 1e-12:
             source = f"{source}_x{spacing_multiplier:.2f}"
-        if final_spacing == self.config.grid_spacing_min_pct and raw_spacing < final_spacing:
-            source = f"{source}_min_floor"
-        elif final_spacing == self.config.grid_spacing_max_pct and raw_spacing > final_spacing:
-            source = f"{source}_max_cap"
+        if final_spacing == bucket_min and raw_spacing < final_spacing:
+            source = f"{source}_bucket_floor"
+        elif final_spacing == bucket_max and raw_spacing > final_spacing:
+            source = f"{source}_bucket_cap"
         return final_spacing, source
 
     def _volatility_adjusted_grid_levels(self, atr_pct: float) -> int:

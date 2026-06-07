@@ -46,6 +46,17 @@ class BotConfig:
     min_expected_net_edge_usd: float
     min_expected_net_edge_pct: float
     min_rr_ratio: float
+    min_expected_net_profit_fee_multiple: float
+    counter_trend_entry_edge_score: float
+    strong_momentum_block_threshold: float
+    adverse_move_exit_pct: float
+    min_reversion_confirmation_pct: float
+    grid_spacing_low_vol_min_pct: float
+    grid_spacing_low_vol_max_pct: float
+    grid_spacing_normal_vol_min_pct: float
+    grid_spacing_normal_vol_max_pct: float
+    grid_spacing_high_vol_min_pct: float
+    grid_spacing_high_vol_max_pct: float
     max_notional_per_trade_usd: float
     min_order_size: float
     max_order_size: float
@@ -163,6 +174,17 @@ class BotConfig:
             min_expected_net_edge_usd=float(os.getenv("MIN_EXPECTED_NET_EDGE_USD", "0")),
             min_expected_net_edge_pct=float(os.getenv("MIN_EXPECTED_NET_EDGE_PCT", "0")),
             min_rr_ratio=float(os.getenv("MIN_RR_RATIO", "1.0")),
+            min_expected_net_profit_fee_multiple=float(os.getenv("MIN_EXPECTED_NET_PROFIT_FEE_MULTIPLE", "2.5")),
+            counter_trend_entry_edge_score=float(os.getenv("COUNTER_TREND_ENTRY_EDGE_SCORE", "3.5")),
+            strong_momentum_block_threshold=float(os.getenv("STRONG_MOMENTUM_BLOCK_THRESHOLD", "0.65")),
+            adverse_move_exit_pct=float(os.getenv("ADVERSE_MOVE_EXIT_PCT", "0.0045")),
+            min_reversion_confirmation_pct=float(os.getenv("MIN_REVERSION_CONFIRMATION_PCT", "0.0015")),
+            grid_spacing_low_vol_min_pct=float(os.getenv("GRID_SPACING_LOW_VOL_MIN_PCT", "0.0025")),
+            grid_spacing_low_vol_max_pct=float(os.getenv("GRID_SPACING_LOW_VOL_MAX_PCT", "0.0030")),
+            grid_spacing_normal_vol_min_pct=float(os.getenv("GRID_SPACING_NORMAL_VOL_MIN_PCT", "0.0035")),
+            grid_spacing_normal_vol_max_pct=float(os.getenv("GRID_SPACING_NORMAL_VOL_MAX_PCT", "0.0045")),
+            grid_spacing_high_vol_min_pct=float(os.getenv("GRID_SPACING_HIGH_VOL_MIN_PCT", "0.0055")),
+            grid_spacing_high_vol_max_pct=float(os.getenv("GRID_SPACING_HIGH_VOL_MAX_PCT", "0.0075")),
             max_notional_per_trade_usd=float(os.getenv("MAX_NOTIONAL_PER_TRADE_USD", os.getenv("ORDER_NOTIONAL_USD", "10"))),
             min_order_size=float(os.getenv("MIN_ORDER_SIZE", "0.0001")),
             max_order_size=float(os.getenv("MAX_ORDER_SIZE", "10")),

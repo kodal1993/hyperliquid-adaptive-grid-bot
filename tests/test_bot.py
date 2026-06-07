@@ -2113,8 +2113,8 @@ def test_spacing_multiplier_and_floor_reduce_grid_density(tmp_path, monkeypatch)
 
     spacing, source = orch._calculate_spacing_pct(atr_pct=0.002, return_vol_pct=0.001)
 
-    assert spacing == pytest.approx(0.0036)
-    assert source == "base_floor_x1.20"
+    assert spacing == pytest.approx(0.0030)
+    assert source == "low_volatility_atr14_x1.20_bucket_cap"
     assert cfg.grid_spacing_min_pct == pytest.approx(0.0018)
 
 
@@ -2231,3 +2231,140 @@ def test_pullback_regime_keeps_trend_biased_grid_mode(tmp_path):
     assert status["regime"] == "TREND_UP_PULLBACK"
     assert status["mode"] == GridMode.LONG_BIASED.value
     assert status["regime_hysteresis_score"] == 0.3
+
+
+def test_counter_trend_entry_filter_blocks_weak_edge_shorts_in_bullish_momentum(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.counter_trend_entry_edge_score = 10.0
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "counter_trend_filter.json", paper_mode=True, enable_live_trading=False))
+    signal = RegimeSignal(
+        MarketRegime.TREND_UP,
+        0.9,
+        0.002,
+        0.001,
+        0.01,
+        0.01,
+        0.01,
+        momentum_score=0.8,
+        ema_slope_acceleration_score=0.7,
+        transition_direction="UP",
+        transition_confidence=0.8,
+    )
+
+    decision = orch._apply_counter_trend_entry_filter(
+        allow_buys=True,
+        allow_sells=True,
+        position_side="FLAT",
+        regime=MarketRegime.TREND_UP,
+        regime_signal=signal,
+        spacing_pct=0.003,
+        fee_rate=0.0004,
+        force_reduce_only=False,
+    )
+
+    assert decision["allow_buys"] is True
+    assert decision["allow_sells"] is False
+    assert decision["short_entry_blocked_by_trend_filter"] is True
+
+
+def test_counter_trend_entry_filter_blocks_weak_edge_longs_in_bearish_momentum(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.counter_trend_entry_edge_score = 10.0
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "counter_trend_long_filter.json", paper_mode=True, enable_live_trading=False))
+    signal = RegimeSignal(
+        MarketRegime.TREND_DOWN,
+        0.9,
+        0.002,
+        0.001,
+        -0.01,
+        -0.01,
+        -0.01,
+        momentum_score=-0.8,
+        ema_slope_acceleration_score=-0.7,
+        transition_direction="DOWN",
+        transition_confidence=0.8,
+    )
+
+    decision = orch._apply_counter_trend_entry_filter(
+        allow_buys=True,
+        allow_sells=True,
+        position_side="FLAT",
+        regime=MarketRegime.TREND_DOWN,
+        regime_signal=signal,
+        spacing_pct=0.003,
+        fee_rate=0.0004,
+        force_reduce_only=False,
+    )
+
+    assert decision["allow_buys"] is False
+    assert decision["allow_sells"] is True
+    assert decision["long_entry_blocked_by_trend_filter"] is True
+
+
+def test_minimum_expected_edge_filter_requires_net_profit_fee_multiple(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.min_expected_net_profit_fee_multiple = 2.5
+    eng = make_test_engine(tmp_path, "net_fee_multiple.json")
+    orch = StrategyOrchestrator(cfg, eng)
+    plan = GridManager().build_grid(100, 1, 0.0025, 0.0, MarketRegime.RANGE, 1, 0.0, 0.0, GridMode.NEUTRAL)
+
+    edge = orch._apply_minimum_expected_edge_filter(plan, mid_price=100, position_size=0.0)
+
+    assert edge["edge_filter_skipped_by_reason"] == {"below_min_expected_net_profit_fee_multiple": 2}
+    assert edge["expected_profit_after_fees"] is not None
+    assert len(plan.long_levels) == 0
+    assert len(plan.short_levels) == 0
+
+
+def test_adverse_move_protection_closes_before_reversion_confirmation(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.adverse_move_exit_pct = 0.0045
+    cfg.min_reversion_confirmation_pct = 0.0015
+    cfg.max_position_notional_usd = 500
+    eng = make_test_engine(tmp_path, "adverse_move.json", paper_mode=True, enable_live_trading=False)
+    eng.paper.position_size = 1.0
+    eng.paper.avg_entry = 100.0
+    orch = StrategyOrchestrator(cfg, eng)
+    orch.wrong_way_exit_loss_pct = 0.99
+    candles = pd.DataFrame({"close": [100.0 for _ in range(78)] + [99.6, 99.4], "high": [101.0 for _ in range(80)], "low": [99.0 for _ in range(80)]})
+
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=99.4)
+
+    assert status["reason"] == "adverse_move_protection_exit_requested"
+    assert status["flattened"] is True
+    assert status["adverse_move_pct"] > cfg.adverse_move_exit_pct
+
+
+def test_volatility_adaptive_spacing_uses_configured_buckets(tmp_path):
+    cfg = BotConfig.from_env()
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "vol_bucket_spacing.json", paper_mode=True, enable_live_trading=False))
+
+    low_spacing, low_source = orch._calculate_spacing_pct(0.001, 0.001)
+    normal_spacing, normal_source = orch._calculate_spacing_pct(0.006, 0.001)
+    high_spacing, high_source = orch._calculate_spacing_pct(0.02, 0.001)
+
+    assert 0.0025 <= low_spacing <= 0.0030
+    assert 0.0035 <= normal_spacing <= 0.0045
+    assert 0.0055 <= high_spacing <= 0.0075
+    assert "low_volatility" in low_source
+    assert "normal_volatility" in normal_source
+    assert "high_volatility" in high_source
+
+
+def test_trade_analytics_report_groups_by_side_regime_hour_and_volatility_bucket(tmp_path):
+    from src.main import _trade_analytics_report
+
+    trades = tmp_path / "grouped_trades.csv"
+    trades.write_text(
+        "timestamp,symbol,side,price,qty,notional,fee,realized_pnl_delta,position_size,regime,trade_category,volatility_bucket\n"
+        "2026-01-01T05:00:00+00:00,BTC,buy,10000,1,10000,0.04,1,1,RANGE,entry,low\n"
+        "2026-01-01T05:10:00+00:00,BTC,sell,10100,1,10100,0.04,-0.5,0,TREND_UP,close,high\n"
+        "2026-01-01T13:00:00+00:00,BTC,sell,10000,1,10000,0.04,2,-1,TREND_DOWN,entry,normal\n"
+    )
+
+    report = _trade_analytics_report("BTC", trades)
+
+    assert report["performance_by_side"]["buy"]["trades"] == 1
+    assert report["performance_by_regime"]["TREND_UP"]["pnl"] == pytest.approx(-0.54)
+    assert report["performance_by_hour"]["05:00"]["trades"] == 2
+    assert report["performance_by_volatility_bucket"]["high"]["pnl"] == pytest.approx(-0.54)
