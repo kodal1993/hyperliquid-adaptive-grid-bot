@@ -106,7 +106,7 @@ def trade_category_for_action(exposure_action: str) -> str:
     }.get(exposure_action, exposure_action or "unknown")
 
 class PaperExecutionEngine:
-    def __init__(self, client: HyperliquidClient, state_file: str, paper_mode: bool = True, enable_live_trading: bool = False, fee_rate: float = 0.0004, start_balance: float = 500.0, fill_model: str = "optimistic", max_position_notional_usd: float = 500.0, soft_exposure_cap_pct: float = 0.6, hard_exposure_cap_pct: float = 0.8, absolute_exposure_cap_pct: float = 1.0, allow_position_flip: bool = False, trade_ledger_csv: str | None = None, trade_ledger_jsonl: str | None = None, risk_decisions_csv: str | None = None) -> None:
+    def __init__(self, client: HyperliquidClient, state_file: str, paper_mode: bool = True, enable_live_trading: bool = False, fee_rate: float = 0.0004, start_balance: float = 500.0, fill_model: str = "optimistic", max_position_notional_usd: float = 500.0, soft_exposure_cap_pct: float = 0.6, hard_exposure_cap_pct: float = 0.8, absolute_exposure_cap_pct: float = 1.0, allow_position_flip: bool = False, min_order_notional_usd: float | None = None, dust_position_notional_usd: float = 2.0, trade_ledger_csv: str | None = None, trade_ledger_jsonl: str | None = None, risk_decisions_csv: str | None = None) -> None:
         self.client = client
         self.paper_mode = paper_mode
         self.enable_live_trading = enable_live_trading
@@ -126,6 +126,9 @@ class PaperExecutionEngine:
         self.hard_exposure_cap_pct = hard_exposure_cap_pct
         self.absolute_exposure_cap_pct = absolute_exposure_cap_pct
         self.allow_position_flip = allow_position_flip
+        self.min_order_notional_usd = float(min_order_notional_usd if min_order_notional_usd is not None else 0.0)
+        self.dust_position_notional_usd = float(dust_position_notional_usd)
+        self.min_notional_blocked_count = 0
         self.no_fill_cycles = 0
         self.last_real_trade_ts: datetime | None = None
         self.flip_trade_count = 0
@@ -167,7 +170,22 @@ class PaperExecutionEngine:
         if not plan.should_regrid:
             return {"canceled": 0, "placed": 0, "symbol": symbol}
         now_ts = time.time()
-        self.open_orders = [{"symbol": symbol, "side": o.side, "price": o.price, "size": o.size, "created_ts": now_ts} for o in (plan.long_levels + plan.short_levels)]
+        orders = []
+        for o in (plan.long_levels + plan.short_levels):
+            notional = abs(o.price * o.size)
+            if self.min_order_notional_usd > 0 and notional + 1e-9 < self.min_order_notional_usd:
+                self.min_notional_blocked_count += 1
+                logger.warning(
+                    "min_notional_blocked side=%s price=%s qty=%s notional=%s min_order_notional_usd=%s",
+                    o.side,
+                    o.price,
+                    o.size,
+                    notional,
+                    self.min_order_notional_usd,
+                )
+                continue
+            orders.append({"symbol": symbol, "side": o.side, "price": o.price, "size": o.size, "created_ts": now_ts})
+        self.open_orders = orders
         return {"canceled": 0, "placed": len(self.open_orders), "symbol": symbol}
 
     def cancel_all_orders(self, symbol: str) -> int:
@@ -352,7 +370,7 @@ class PaperExecutionEngine:
         notional = abs(price * size)
         fee = notional * self.fee_rate
         fill_liquidity = _classify_fill_liquidity(fill, default="maker")
-        is_dust_fill = _is_dust_notional(notional)
+        is_dust_fill = _is_dust_notional(notional, self.dust_position_notional_usd)
         self.paper.fees_paid += fee
         self.paper.cash -= fee
         new_pos = self.paper.position_size + signed
@@ -483,6 +501,22 @@ class PaperExecutionEngine:
         with self.trade_ledger_jsonl.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
 
+    def last_closed_trade_net_pnls(self, limit: int) -> list[float]:
+        if limit <= 0 or not self.trade_ledger_csv.exists():
+            return []
+        import csv
+        pnls: list[float] = []
+        with self.trade_ledger_csv.open(encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    realized = float(row.get("realized_pnl_delta", 0.0) or 0.0)
+                    fee = abs(float(row.get("fee", 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if abs(realized) > 1e-12:
+                    pnls.append(realized - fee)
+        return pnls[-limit:]
+
     def consume_trade_log(self) -> list[dict]:
         out = list(self.trade_log)
         self.trade_log.clear()
@@ -504,6 +538,8 @@ class LiveExecutionEngine:
         *,
         max_notional_per_trade_usd: float = 10.0,
         min_notional_usd: float = 10.0,
+        min_order_notional_usd: float | None = None,
+        dust_position_notional_usd: float = 2.0,
         leverage: int = 1,
         fee_rate: float = 0.0004,
         **kwargs,
@@ -526,6 +562,9 @@ class LiveExecutionEngine:
         self.last_flip_trade_ts: datetime | None = None
         self.max_notional_per_trade_usd = max_notional_per_trade_usd
         self.min_notional_usd = min_notional_usd
+        self.min_order_notional_usd = float(min_order_notional_usd if min_order_notional_usd is not None else min_notional_usd)
+        self.dust_position_notional_usd = float(dust_position_notional_usd)
+        self.min_notional_blocked_count = 0
         self.leverage = leverage
         self.fee_rate = fee_rate
         self._seen_fill_ids: set[str] = set()
@@ -729,6 +768,22 @@ class LiveExecutionEngine:
         with self.trade_ledger_jsonl.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
 
+    def last_closed_trade_net_pnls(self, limit: int) -> list[float]:
+        if limit <= 0 or not self.trade_ledger_csv.exists():
+            return []
+        import csv
+        pnls: list[float] = []
+        with self.trade_ledger_csv.open(encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    realized = float(row.get("realized_pnl_delta", 0.0) or 0.0)
+                    fee = abs(float(row.get("fee", 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if abs(realized) > 1e-12:
+                    pnls.append(realized - fee)
+        return pnls[-limit:]
+
     def consume_trade_log(self) -> list[dict]:
         out = list(self.trade_log)
         self.trade_log.clear()
@@ -738,7 +793,7 @@ class LiveExecutionEngine:
         normalized_price = normalize_price(symbol, price)
         normalized_size = normalize_size(symbol, size)
         notional_decimal = abs(Decimal(str(normalized_size)) * Decimal(str(normalized_price)))
-        min_notional_decimal = Decimal(str(self.min_notional_usd))
+        min_notional_decimal = Decimal(str(self.min_order_notional_usd if not reduce_only else self.min_notional_usd))
         max_notional_decimal = Decimal(str(self.max_notional_per_trade_usd))
 
         if normalized_price <= 0 or normalized_size <= 0:
@@ -758,14 +813,23 @@ class LiveExecutionEngine:
             notional_decimal = abs(Decimal(str(normalized_size)) * Decimal(str(normalized_price)))
 
         if normalized_size <= 0 or (not reduce_only and notional_decimal < min_notional_decimal):
-            logger.warning(
-                "live_order_skipped reason=min_notional normalized_price=%s normalized_size=%s notional=%s min_notional_usd=%s reduce_only=%s",
-                normalized_price,
-                normalized_size,
-                notional_decimal,
-                self.min_notional_usd,
-                reduce_only,
-            )
+            if not reduce_only:
+                self.min_notional_blocked_count += 1
+                logger.warning(
+                    "live_order_skipped reason=min_notional min_notional_blocked side=%s price=%s qty=%s notional=%s min_order_notional_usd=%s",
+                    side,
+                    normalized_price,
+                    normalized_size,
+                    notional_decimal,
+                    self.min_order_notional_usd,
+                )
+            else:
+                logger.warning(
+                    "live_order_skipped reason=non_positive_reduce_only side=%s price=%s qty=%s",
+                    side,
+                    normalized_price,
+                    normalized_size,
+                )
             return False
 
         if notional_decimal > max_notional_decimal:
@@ -804,7 +868,7 @@ class LiveExecutionEngine:
         notional = abs(price * size)
         fee = abs(float(raw.get("fee", 0.0) or 0.0))
         fill_liquidity = _classify_fill_liquidity(raw, default="maker")
-        is_dust_fill = _is_dust_notional(notional)
+        is_dust_fill = _is_dust_notional(notional, self.dust_position_notional_usd)
         realized_delta = float(raw.get("closedPnl", raw.get("closed_pnl", 0.0)) or 0.0)
         ts_raw = raw.get("time")
         if ts_raw is not None:

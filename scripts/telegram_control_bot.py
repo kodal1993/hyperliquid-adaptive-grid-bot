@@ -398,6 +398,16 @@ def format_performance() -> str:
     total_notional = sum(abs(_trade_float(t, "notional")) for t in trades)
     total_fees = sum(abs(_trade_float(t, "fee")) for t in trades)
     realized_delta = sum(_trade_float(t, "realized_pnl_delta") for t in trades)
+    net_pnls = [_trade_float(t, "realized_pnl_delta") - abs(_trade_float(t, "fee")) for t in trades]
+    net_pnl = sum(net_pnls)
+    gross_pnl_before_fees = net_pnl + total_fees
+    gross_profit = sum(x for x in net_pnls if x > 0)
+    gross_loss = sum(abs(x) for x in net_pnls if x < 0)
+    profit_factor_after_fees = gross_profit / gross_loss if gross_loss > 1e-12 else (gross_profit if gross_profit > 0 else 0.0)
+    dust_trade_count = sum(1 for t in trades if str(t.get("dust_fill", "")).lower() == "true" or (0.0 < abs(_trade_float(t, "notional")) < 2.0))
+    avg_net_profit_per_closed_trade = net_pnl / max(sum(1 for t in trades if abs(_trade_float(t, "realized_pnl_delta")) > 1e-12), 1)
+    avg_fee_per_trade = total_fees / max(len(trades), 1)
+    fee_to_gross_profit_ratio = total_fees / gross_profit if gross_profit > 1e-12 else 0.0
     wins = sum(1 for t in trades if _trade_float(t, "realized_pnl_delta") > 0)
     losses = sum(1 for t in trades if _trade_float(t, "realized_pnl_delta") < 0)
     buys = sum(1 for t in trades if str(t.get("side", "")).lower() in {"buy", "b"})
@@ -414,6 +424,13 @@ def format_performance() -> str:
             f"Volume: {fmt_money(total_notional)}",
             f"Fees: {fmt_money(total_fees, 4)}",
             f"Realized PnL Δ: {fmt_money(realized_delta, 4)}",
+            f"Gross PnL before fees: {fmt_money(gross_pnl_before_fees, 4)}",
+            f"Net PnL: {fmt_money(net_pnl, 4)}",
+            f"Fee/gross profit ratio: {fmt_pct(fee_to_gross_profit_ratio, 2)}",
+            f"Dust trades: {dust_trade_count}",
+            f"Avg net/closed trade: {fmt_money(avg_net_profit_per_closed_trade, 4)}",
+            f"Avg fee/trade: {fmt_money(avg_fee_per_trade, 4)}",
+            f"Profit factor after fees: {profit_factor_after_fees:.2f}",
             f"Last equity: {fmt_money(last_equity)}",
             "",
             f"First trade: {first_ts}",
