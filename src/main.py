@@ -665,8 +665,10 @@ def run() -> None:
         order_book_snapshot = None
         try:
             order_book_snapshot = client.get_l2_book(cfg.default_symbol)
+            if isinstance(order_book_snapshot, dict) and "received_ts" not in order_book_snapshot:
+                order_book_snapshot = {**order_book_snapshot, "received_ts": time.time()}
         except Exception as exc:
-            logger.warning("orderbook_unavailable symbol=%s error=%s", cfg.default_symbol, exc)
+            logger.warning("orderbook_unavailable symbol=%s reason=fetch_error fallback=existing_strategy error=%s", cfg.default_symbol, exc)
         status = orchestrator.on_tick(candles, equity=equity, daily_pnl_pct=daily_pnl_pct, symbol=cfg.default_symbol, position_notional=position_notional, order_book_snapshot=order_book_snapshot)
         risk = status.get("risk")
         reason = status.get("reason") or (getattr(risk, "reason", "") if risk else "")
@@ -805,8 +807,11 @@ def run() -> None:
                 "btc_5m_return_pct": status.get("btc_5m_return_pct"),
                 "btc_1h_return_pct": status.get("btc_1h_return_pct"),
                 "market_stress_reason": status.get("market_stress_reason"),
+                "orderbook_filter_enabled": status.get("orderbook_filter_enabled"),
+                "orderbook_soft_mode": status.get("orderbook_soft_mode"),
                 "orderbook_available": status.get("orderbook_available"),
                 "orderbook_ready": status.get("ready"),
+                "orderbook_stale": status.get("stale", status.get("orderbook_stale")),
                 "orderbook_bid_volume_top10": status.get("bid_volume_top10"),
                 "orderbook_ask_volume_top10": status.get("ask_volume_top10"),
                 "orderbook_imbalance_ratio": status.get("imbalance_ratio"),

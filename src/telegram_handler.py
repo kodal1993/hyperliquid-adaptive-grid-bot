@@ -100,8 +100,9 @@ class TelegramHandler:
             f"Reason: {report.get('market_stress_reason') or 'none'}",
             "",
             "OrderBook:",
-            f"{report.get('orderbook_classification') or 'Unavailable'}",
+            f"OrderBook: {self._orderbook_status(report)}",
             f"Imbalance: {num(report.get('orderbook_imbalance_ratio'), 2)}",
+            f"Soft mode: {'on' if report.get('orderbook_soft_mode', True) else 'off'}",
             f"Pressure: {num(report.get('orderbook_pressure_score'), 2)}",
             f"Decision: {report.get('orderbook_decision') or 'none'}",
             "",
@@ -238,6 +239,18 @@ class TelegramHandler:
             f"Reason: {trade.get('reason') or 'none'}",
             f"Time: {str(trade.get('timestamp', '')).replace('T', ' ').replace('+00:00', ' UTC')}",
         ])[:3900]
+
+    def _orderbook_status(self, report: dict) -> str:
+        if report.get("orderbook_available") is False or report.get("orderbook_stale") is True:
+            return "Unavailable"
+        classification = str(report.get("orderbook_classification") or "Unavailable")
+        if "Bullish" in classification:
+            return "Bullish"
+        if "Bearish" in classification:
+            return "Bearish"
+        if classification == "Warming Up":
+            return "Unavailable"
+        return "Neutral" if classification == "Neutral" else "Unavailable"
 
     def send_status_report(self, report: dict) -> bool:
         return self.send(self.format_status_report(report))
