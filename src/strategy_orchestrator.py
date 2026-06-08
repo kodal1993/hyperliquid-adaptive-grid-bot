@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 import pandas as pd
@@ -46,6 +46,10 @@ class StrategyOrchestrator:
         self.adverse_move_exit_pct = max(float(getattr(config, "adverse_move_exit_pct", 0.0045)), 0.0)
         self.orphan_order_cleanup_count = 0
         self.stale_order_cleanup_count = 0
+        self.min_notional_blocked_count = 0
+        self.anti_chop_trigger_count = 0
+        self.anti_chop_cooldown_until: datetime | None = None
+        self._last_anti_chop_signature: tuple[float, ...] = ()
 
     def on_tick(self, candles: pd.DataFrame, equity: float, daily_pnl_pct: float, symbol: str, position_notional: float = 0.0) -> dict:
         regime_signal = self.detector.detect_signal(candles, trend_lookback_candles=self.config.trend_lookback_candles, trend_move_threshold_pct=self.config.trend_move_threshold_pct, ema_slope_threshold_pct=self.config.ema_slope_threshold_pct, trend_strength_threshold=self.config.trend_strength_threshold)
@@ -101,30 +105,16 @@ class StrategyOrchestrator:
             else:
                 neutral_entries_blocked = True
 
-        if dust_cleanup_requested:
-            canceled = self.execution_engine.cancel_all_orders(symbol)
-            flattened = self.execution_engine.flatten_position(symbol, price)
-            logger.warning(
-                "dust_cleanup_requested symbol=%s position_notional=%.8f threshold_usd=%.2f canceled=%s flattened=%s",
-                symbol,
+        if is_dust_position:
+            dust_cleanup_action = "hold_for_next_normal_reduce_only_close"
+            logger.info(
+                "dust_detected dust_cleanup_action=%s remaining_qty=%.8f remaining_notional=%.8f threshold=%.2f",
+                dust_cleanup_action,
+                pos_size,
                 raw_position_notional,
-                auto_dust_cleanup_usd,
-                canceled,
-                flattened,
+                dust_threshold_usd,
             )
-            return {
-                "status": "managing_position",
-                "regime": regime.value,
-                "risk": None,
-                "mode": mode.value,
-                "reason": "dust_cleanup_requested",
-                "allowed_to_trade": False,
-                "allowed_to_reduce": True,
-                "canceled_orders": canceled,
-                "flattened": flattened,
-                "position_management_action": "flatten_dust",
-                **dust_context,
-            }
+            dust_context["dust_cleanup_action"] = dust_cleanup_action
 
         trend_flip_detected = False
         if regime in {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN}:
@@ -291,10 +281,6 @@ class StrategyOrchestrator:
             else:
                 self.trend_flip_cooldown_remaining = max(self.trend_flip_cooldown_remaining - 1, 0)
 
-        if is_dust_position and regime == MarketRegime.RANGE and mode == GridMode.NEUTRAL and not force_reduce_only:
-            allow_buys = True
-            allow_sells = True
-
         if regime == MarketRegime.RANGE and not force_reduce_only and regime_signal.transition_confidence >= 0.55:
             if regime_signal.transition_direction == "UP":
                 allow_sells = effective_position_side == "LONG"
@@ -460,6 +446,14 @@ class StrategyOrchestrator:
                 **dust_context,
                 **market_stress_context,
             }
+
+        anti_chop_context = self._apply_anti_chop_cooldown(
+            position_side=effective_position_side,
+            allow_buys=allow_buys,
+            allow_sells=allow_sells,
+        )
+        allow_buys = anti_chop_context.pop("allow_buys")
+        allow_sells = anti_chop_context.pop("allow_sells")
 
         no_fill_cycles = self.execution_engine.no_fill_cycles
         last_trade_age_hours = 0.0
@@ -656,8 +650,25 @@ class StrategyOrchestrator:
             "wrong_way_loss_pct": wrong_way_loss_pct,
         }
 
-        if order_notional + 1e-9 < self.config.min_notional_usd:
-            logger.warning("no_new_order_placed reason=min_notional order_notional=%.4f min_notional_usd=%.4f price=%.4f order_size=%.8f", order_notional, self.config.min_notional_usd, price, order_size)
+        min_order_notional_usd = max(float(getattr(self.config, "min_order_notional_usd", self.config.min_notional_usd)), 0.0)
+        if order_notional + 1e-9 < min_order_notional_usd:
+            blocked_sides = []
+            if allow_buys and effective_position_side != "SHORT":
+                allow_buys = False
+                blocked_sides.append("buy")
+            if allow_sells and effective_position_side != "LONG":
+                allow_sells = False
+                blocked_sides.append("sell")
+            for blocked_side in blocked_sides:
+                self.min_notional_blocked_count += 1
+                logger.warning(
+                    "min_notional_blocked side=%s price=%.4f qty=%.8f notional=%.4f min_order_notional_usd=%.4f",
+                    blocked_side,
+                    price,
+                    order_size,
+                    order_notional,
+                    min_order_notional_usd,
+                )
         configured_levels = max(int(self.config.grid_levels), 1)
         risk_adjusted_levels = self._exposure_limited_grid_levels(mode, allow_buys, allow_sells, order_notional, threshold, configured_levels=volatility_grid_levels)
         effective_grid_levels, reduction_reason = self._final_effective_grid_levels(
@@ -695,7 +706,7 @@ class StrategyOrchestrator:
         elif not build_allow_buys and not build_allow_sells:
             no_grid_orders_generated_reason = "no_allowed_sides"
         plan: GridPlan = self.grid_manager.build_grid(price, max(effective_grid_levels, 1), final_spacing_pct, 0.0, regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=build_allow_buys, allow_sells=build_allow_sells, force_recenter=force_recenter, spacing_source=spacing_source, atr_pct=atr_pct, trend_bias=trend_bias, regime_confidence=regime_confidence)
-        edge_context = self._apply_minimum_expected_edge_filter(plan, mid_price=price, position_size=effective_position_size)
+        edge_context = self._apply_minimum_expected_edge_filter(plan, mid_price=price, position_size=effective_position_size, avg_entry=avg_entry)
         if not plan.long_levels and not plan.short_levels:
             if edge_context.get("edge_filter_skipped_orders"):
                 no_grid_orders_generated_reason = "edge_filter_removed_all_orders"
@@ -727,6 +738,9 @@ class StrategyOrchestrator:
             "grid_level_reduction_reason": reduction_reason,
             "reduction_reason": reduction_reason,
             "no_grid_orders_generated_reason": no_grid_orders_generated_reason,
+            "min_notional_blocked_count": self.min_notional_blocked_count,
+            "anti_chop_trigger_count": self.anti_chop_trigger_count,
+            **anti_chop_context,
         }
         try:
             result = self.execution_engine.cancel_replace_grid(symbol, plan)
@@ -865,7 +879,7 @@ class StrategyOrchestrator:
         return raw_regime
 
 
-    def _apply_minimum_expected_edge_filter(self, plan: GridPlan, *, mid_price: float, position_size: float) -> dict:
+    def _apply_minimum_expected_edge_filter(self, plan: GridPlan, *, mid_price: float, position_size: float, avg_entry: float = 0.0) -> dict:
         """Remove exposure-building grid orders whose expected net edge cannot pay fees.
 
         Expected edge is evaluated as a round-trip grid capture: the distance from
@@ -882,7 +896,7 @@ class StrategyOrchestrator:
         min_edge_usd = max(float(self.config.min_expected_net_edge_usd), 0.0)
         min_edge_pct = max(float(self.config.min_expected_net_edge_pct), 0.0)
         min_rr = max(float(self.config.min_rr_ratio), 0.0)
-        min_net_fee_multiple = max(float(getattr(self.config, "min_expected_net_profit_fee_multiple", 2.5)), 0.0)
+        min_net_fee_multiple = max(float(getattr(self.config, "min_net_profit_fee_multiplier", getattr(self.config, "min_expected_net_profit_fee_multiple", 3.0))), 0.0)
 
         for order in plan.long_levels + plan.short_levels:
             action = self._classify_order_action(position_size, order.side, order.size)
@@ -906,6 +920,32 @@ class StrategyOrchestrator:
                     block_reason = "below_min_expected_net_profit_fee_multiple"
                 elif estimate["rr_ratio"] < min_rr:
                     block_reason = "below_min_rr_ratio"
+            elif avg_entry > 0:
+                close_estimate = self._expected_close_profit_for_order(
+                    side=order.side,
+                    qty=order.size,
+                    entry_price=avg_entry,
+                    target_price=order.price,
+                    fee_rate=fee_rate,
+                    position_size=position_size,
+                )
+                estimate.update(close_estimate)
+                required_net_profit = close_estimate["estimated_roundtrip_fee"] * min_net_fee_multiple
+                if close_estimate["expected_net_profit"] < required_net_profit:
+                    block_reason = "below_min_net_profit_after_fees"
+                logger.info(
+                    "net_profit_filter side=%s entry_price=%s target_price=%s qty=%s expected_gross_profit=%.6f estimated_roundtrip_fee=%.6f expected_net_profit=%.6f required_net_profit=%.6f decision=%s reason=%s",
+                    order.side,
+                    avg_entry,
+                    order.price,
+                    order.size,
+                    close_estimate["expected_gross_profit"],
+                    close_estimate["estimated_roundtrip_fee"],
+                    close_estimate["expected_net_profit"],
+                    required_net_profit,
+                    "block" if block_reason else "allow",
+                    block_reason or "profit_target_meets_fee_floor",
+                )
 
             estimate["edge_filter_decision"] = "block" if block_reason else "allow"
             estimate["edge_filter_reason"] = block_reason
@@ -956,6 +996,68 @@ class StrategyOrchestrator:
             "expected_net_fee_multiple": best.get("net_fee_multiple"),
             "expected_net_edge_pct": best.get("expected_net_edge_pct"),
             "expected_rr_ratio": best.get("rr_ratio"),
+        }
+
+    def _expected_close_profit_for_order(self, *, side: str, qty: float, entry_price: float, target_price: float, fee_rate: float, position_size: float) -> dict:
+        qty = abs(qty)
+        close_qty = min(qty, abs(position_size)) if abs(position_size) > 1e-12 else qty
+        if position_size > 0 and side.lower() == "sell":
+            expected_gross_profit = max(target_price - entry_price, 0.0) * close_qty
+        elif position_size < 0 and side.lower() == "buy":
+            expected_gross_profit = max(entry_price - target_price, 0.0) * close_qty
+        else:
+            expected_gross_profit = 0.0
+        estimated_open_fee = abs(entry_price * close_qty) * fee_rate
+        estimated_close_fee = abs(target_price * close_qty) * fee_rate
+        estimated_roundtrip_fee = estimated_open_fee + estimated_close_fee
+        expected_net_profit = expected_gross_profit - estimated_open_fee - estimated_close_fee
+        return {
+            "expected_gross_profit": expected_gross_profit,
+            "estimated_open_fee": estimated_open_fee,
+            "estimated_close_fee": estimated_close_fee,
+            "estimated_roundtrip_fee": estimated_roundtrip_fee,
+            "expected_net_profit": expected_net_profit,
+        }
+
+    def _apply_anti_chop_cooldown(self, *, position_side: str, allow_buys: bool, allow_sells: bool) -> dict:
+        now = datetime.now(timezone.utc)
+        last_n = max(int(getattr(self.config, "anti_chop_last_n_trades", 5)), 0)
+        cooldown_minutes = max(int(getattr(self.config, "anti_chop_cooldown_minutes", 15)), 0)
+        net_pnls: list[float] = []
+        if last_n > 0 and hasattr(self.execution_engine, "last_closed_trade_net_pnls"):
+            net_pnls = list(self.execution_engine.last_closed_trade_net_pnls(last_n))
+        signature = tuple(round(x, 10) for x in net_pnls)
+        triggered = False
+        if len(net_pnls) >= last_n and sum(net_pnls) < 0 and cooldown_minutes > 0:
+            if self.anti_chop_cooldown_until is None or now >= self.anti_chop_cooldown_until or signature != self._last_anti_chop_signature:
+                self.anti_chop_cooldown_until = now + timedelta(minutes=cooldown_minutes)
+                self._last_anti_chop_signature = signature
+                self.anti_chop_trigger_count += 1
+                triggered = True
+                logger.warning(
+                    "anti_chop_triggered last_n_trades=%s net_pnl=%.6f cooldown_until=%s",
+                    last_n,
+                    sum(net_pnls),
+                    self.anti_chop_cooldown_until.isoformat(),
+                )
+        cooldown_active = self.anti_chop_cooldown_until is not None and now < self.anti_chop_cooldown_until
+        if cooldown_active:
+            if position_side == "FLAT":
+                allow_buys = False
+                allow_sells = False
+            elif position_side == "LONG":
+                allow_buys = False
+            elif position_side == "SHORT":
+                allow_sells = False
+        return {
+            "allow_buys": allow_buys,
+            "allow_sells": allow_sells,
+            "anti_chop_cooldown_active": cooldown_active,
+            "anti_chop_triggered": triggered,
+            "anti_chop_last_n_trades": last_n,
+            "anti_chop_net_pnl": sum(net_pnls) if net_pnls else 0.0,
+            "anti_chop_cooldown_until": self.anti_chop_cooldown_until.isoformat() if self.anti_chop_cooldown_until else "",
+            "anti_chop_trigger_count": self.anti_chop_trigger_count,
         }
 
     def _expected_edge_for_order(self, *, price: float, size: float, mid_price: float, grid_spacing_pct: float, fee_rate: float) -> dict:
@@ -1127,15 +1229,31 @@ class StrategyOrchestrator:
         atr_component = atr_pct * self.config.grid_spacing_vol_multiplier
         vol_component = return_vol_pct * self.config.grid_spacing_vol_multiplier
         raw_spacing = max(self.config.grid_spacing_pct, atr_component, vol_component) * spacing_multiplier
-        final_spacing = min(max(raw_spacing, bucket_min), bucket_max)
+        fee_rate = max(float(getattr(self.execution_engine, "fee_rate", 0.0)), 0.0)
+        fee_floor_pct = fee_rate * 2.0 * max(float(getattr(self.config, "min_net_profit_fee_multiplier", 3.0)), 1.0)
+        global_min = max(float(getattr(self.config, "grid_spacing_pct_min", 0.004)), fee_floor_pct)
+        global_max = max(float(getattr(self.config, "grid_spacing_pct_max", 0.0075)), global_min)
+        effective_min = max(bucket_min, global_min)
+        effective_max = min(bucket_max, global_max) if bucket_max >= global_min else global_max
+        final_spacing = min(max(raw_spacing, effective_min), effective_max)
         driver = "atr14" if atr_component >= vol_component else "return_volatility"
         source = f"{bucket}_{driver}"
+        reason = "raw_within_bounds"
         if abs(spacing_multiplier - 1.0) > 1e-12:
             source = f"{source}_x{spacing_multiplier:.2f}"
-        if final_spacing == bucket_min and raw_spacing < final_spacing:
-            source = f"{source}_bucket_floor"
-        elif final_spacing == bucket_max and raw_spacing > final_spacing:
-            source = f"{source}_bucket_cap"
+        if final_spacing == effective_min and raw_spacing < final_spacing:
+            source = f"{source}_fee_floor"
+            reason = "fee_floor" if fee_floor_pct >= float(getattr(self.config, "grid_spacing_pct_min", 0.004)) else "configured_min_floor"
+        elif final_spacing == effective_max and raw_spacing > final_spacing:
+            source = f"{source}_configured_cap"
+            reason = "configured_max_cap"
+        logger.info(
+            "grid_spacing_adjusted raw_spacing_pct=%.6f final_spacing_pct=%.6f fee_floor_pct=%.6f reason=%s",
+            raw_spacing,
+            final_spacing,
+            fee_floor_pct,
+            reason,
+        )
         return final_spacing, source
 
     def _volatility_adjusted_grid_levels(self, atr_pct: float) -> int:

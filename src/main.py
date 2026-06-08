@@ -321,6 +321,15 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
         "exclude_dust_from_performance_stats": exclude_dust,
         "avg_winner_before": 0.0,
         "avg_winner_after": 0.0,
+        "gross_pnl_before_fees": 0.0,
+        "total_fees": 0.0,
+        "net_pnl": 0.0,
+        "fee_to_gross_profit_ratio": 0.0,
+        "avg_net_profit_per_closed_trade": 0.0,
+        "avg_fee_per_trade": 0.0,
+        "profit_factor_after_fees": 0.0,
+        "min_notional_blocked_count": 0,
+        "anti_chop_trigger_count": 0,
         "performance_by_side": {},
         "performance_by_regime": {},
         "performance_by_hour": {},
@@ -333,6 +342,8 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
     losers: list[float] = []
     gross_profit = 0.0
     gross_loss = 0.0
+    net_gross_profit = 0.0
+    net_gross_loss = 0.0
     total_fees = 0.0
     net_pnl = 0.0
     trade_count = 0
@@ -412,6 +423,10 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
                 analytics["short_trades"] += 1
                 analytics["pnl_short_trades"] += net
                 short_outcomes.append(net)
+            if net > 0:
+                net_gross_profit += net
+            elif net < 0:
+                net_gross_loss += abs(net)
             if realized > 0:
                 winners.append(realized)
                 if ts is not None and ts < cutover_ts:
@@ -440,8 +455,15 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
     analytics["avg_profit_per_winner"] = analytics["avg_winner"]
     analytics["avg_loss_per_loser"] = analytics["avg_loser"]
     analytics["profit_factor"] = gross_profit / gross_loss if gross_loss > 1e-12 else (gross_profit if gross_profit > 0 else 0.0)
+    analytics["profit_factor_after_fees"] = net_gross_profit / net_gross_loss if net_gross_loss > 1e-12 else (net_gross_profit if net_gross_profit > 0 else 0.0)
     analytics["expectancy"] = net_pnl / trade_count if trade_count else 0.0
     analytics["fee_gross_profit_ratio"] = total_fees / gross_profit if gross_profit > 1e-12 else 0.0
+    analytics["fee_to_gross_profit_ratio"] = analytics["fee_gross_profit_ratio"]
+    analytics["gross_pnl_before_fees"] = net_pnl + total_fees
+    analytics["total_fees"] = total_fees
+    analytics["net_pnl"] = net_pnl
+    analytics["avg_net_profit_per_closed_trade"] = net_pnl / trade_count if trade_count else 0.0
+    analytics["avg_fee_per_trade"] = total_fees / trade_count if trade_count else 0.0
     analytics["average_holding_time_seconds"] = sum(holding_times) / len(holding_times) if holding_times else 0.0
     analytics["pnl_by_regime"] = dict(pnl_by_regime)
     _finalize_group_stats(regime_stats)
@@ -568,7 +590,7 @@ def run() -> None:
 
     client = HyperliquidClient(cfg.private_key, cfg.account_address, cfg.hl_network)
     client.connect()
-    engine = LiveExecutionEngine(client=client, state_file=cfg.state_file, start_balance=0.0, max_position_notional_usd=cfg.max_position_notional_usd, allow_position_flip=cfg.allow_position_flip, max_notional_per_trade_usd=cfg.max_notional_per_trade_usd, min_notional_usd=cfg.min_notional_usd, leverage=cfg.base_leverage)
+    engine = LiveExecutionEngine(client=client, state_file=cfg.state_file, start_balance=0.0, max_position_notional_usd=cfg.max_position_notional_usd, allow_position_flip=cfg.allow_position_flip, max_notional_per_trade_usd=cfg.max_notional_per_trade_usd, min_notional_usd=cfg.min_notional_usd, min_order_notional_usd=cfg.min_order_notional_usd, dust_position_notional_usd=cfg.dust_position_notional_usd, leverage=cfg.base_leverage)
     logger.info("execution_mode=live_only")
     client.set_leverage(cfg.default_symbol, cfg.base_leverage)
     orchestrator = StrategyOrchestrator(config=cfg, execution_engine=engine)
@@ -835,6 +857,17 @@ def run() -> None:
                 "exclude_dust_from_performance_stats": trade_analytics["exclude_dust_from_performance_stats"],
                 "avg_winner_before": trade_analytics["avg_winner_before"],
                 "avg_winner_after": trade_analytics["avg_winner_after"],
+                "gross_pnl_before_fees": trade_analytics["gross_pnl_before_fees"],
+                "total_fees": trade_analytics["total_fees"],
+                "net_pnl": trade_analytics["net_pnl"],
+                "fee_to_gross_profit_ratio": trade_analytics["fee_to_gross_profit_ratio"],
+                "avg_net_profit_per_closed_trade": trade_analytics["avg_net_profit_per_closed_trade"],
+                "avg_fee_per_trade": trade_analytics["avg_fee_per_trade"],
+                "profit_factor_after_fees": trade_analytics["profit_factor_after_fees"],
+                "min_notional_blocked_count": max(int(status.get("min_notional_blocked_count", 0) or 0), int(getattr(engine, "min_notional_blocked_count", 0) or 0)),
+                "anti_chop_trigger_count": status.get("anti_chop_trigger_count", 0),
+                "anti_chop_cooldown_active": status.get("anti_chop_cooldown_active", False),
+                "anti_chop_cooldown_until": status.get("anti_chop_cooldown_until", ""),
                 "edge_filter_skipped_orders": status.get("edge_filter_skipped_orders", 0),
                 "edge_filter_skipped_by_reason": status.get("edge_filter_skipped_by_reason", {}),
                 "expected_move_pct": status.get("expected_move_pct"),

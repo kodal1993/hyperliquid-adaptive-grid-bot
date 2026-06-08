@@ -47,6 +47,7 @@ class BotConfig:
     min_expected_net_edge_pct: float
     min_rr_ratio: float
     min_expected_net_profit_fee_multiple: float
+    min_net_profit_fee_multiplier: float
     counter_trend_entry_edge_score: float
     strong_momentum_block_threshold: float
     adverse_move_exit_pct: float
@@ -57,7 +58,10 @@ class BotConfig:
     grid_spacing_normal_vol_max_pct: float
     grid_spacing_high_vol_min_pct: float
     grid_spacing_high_vol_max_pct: float
+    grid_spacing_pct_min: float
+    grid_spacing_pct_max: float
     max_notional_per_trade_usd: float
+    min_order_notional_usd: float
     min_order_size: float
     max_order_size: float
     min_notional_usd: float
@@ -114,6 +118,8 @@ class BotConfig:
     trend_weak_confidence: float
     panic_score_threshold: float
     market_stress_extreme_flat: bool
+    anti_chop_last_n_trades: int
+    anti_chop_cooldown_minutes: int
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -174,7 +180,8 @@ class BotConfig:
             min_expected_net_edge_usd=float(os.getenv("MIN_EXPECTED_NET_EDGE_USD", "0")),
             min_expected_net_edge_pct=float(os.getenv("MIN_EXPECTED_NET_EDGE_PCT", "0")),
             min_rr_ratio=float(os.getenv("MIN_RR_RATIO", "1.0")),
-            min_expected_net_profit_fee_multiple=float(os.getenv("MIN_EXPECTED_NET_PROFIT_FEE_MULTIPLE", "2.5")),
+            min_expected_net_profit_fee_multiple=float(os.getenv("MIN_EXPECTED_NET_PROFIT_FEE_MULTIPLE", os.getenv("MIN_NET_PROFIT_FEE_MULTIPLIER", "3.0"))),
+            min_net_profit_fee_multiplier=float(os.getenv("MIN_NET_PROFIT_FEE_MULTIPLIER", os.getenv("MIN_EXPECTED_NET_PROFIT_FEE_MULTIPLE", "3.0"))),
             counter_trend_entry_edge_score=float(os.getenv("COUNTER_TREND_ENTRY_EDGE_SCORE", "3.5")),
             strong_momentum_block_threshold=float(os.getenv("STRONG_MOMENTUM_BLOCK_THRESHOLD", "0.65")),
             adverse_move_exit_pct=float(os.getenv("ADVERSE_MOVE_EXIT_PCT", "0.0045")),
@@ -185,7 +192,10 @@ class BotConfig:
             grid_spacing_normal_vol_max_pct=float(os.getenv("GRID_SPACING_NORMAL_VOL_MAX_PCT", "0.0045")),
             grid_spacing_high_vol_min_pct=float(os.getenv("GRID_SPACING_HIGH_VOL_MIN_PCT", "0.0055")),
             grid_spacing_high_vol_max_pct=float(os.getenv("GRID_SPACING_HIGH_VOL_MAX_PCT", "0.0075")),
+            grid_spacing_pct_min=float(os.getenv("GRID_SPACING_PCT_MIN", os.getenv("GRID_SPACING_MIN_PCT", "0.004"))),
+            grid_spacing_pct_max=float(os.getenv("GRID_SPACING_PCT_MAX", os.getenv("GRID_SPACING_MAX_PCT", "0.0075"))),
             max_notional_per_trade_usd=float(os.getenv("MAX_NOTIONAL_PER_TRADE_USD", os.getenv("ORDER_NOTIONAL_USD", "10"))),
+            min_order_notional_usd=float(os.getenv("MIN_ORDER_NOTIONAL_USD", os.getenv("MIN_NOTIONAL_USD", "10.0"))),
             min_order_size=float(os.getenv("MIN_ORDER_SIZE", "0.0001")),
             max_order_size=float(os.getenv("MAX_ORDER_SIZE", "10")),
             min_notional_usd=float(os.getenv("MIN_NOTIONAL_USD", "10")),
@@ -225,7 +235,7 @@ class BotConfig:
             allow_position_flip=os.getenv("ENABLE_POSITION_FLIP", os.getenv("ALLOW_POSITION_FLIP", "false")).lower() == "true",
             stale_position_max_hours=float(os.getenv("STALE_POSITION_MAX_HOURS", "12")),
             min_residual_notional_usd=float(os.getenv("MIN_RESIDUAL_NOTIONAL_USD", "10")),
-            dust_position_notional_usd=float(os.getenv("DUST_POSITION_NOTIONAL_USD", "1")),
+            dust_position_notional_usd=float(os.getenv("DUST_POSITION_NOTIONAL_USD", "2.0")),
             auto_dust_cleanup_usd=float(os.getenv("AUTO_DUST_CLEANUP_USD", "5")),
             exclude_dust_from_performance_stats=os.getenv("EXCLUDE_DUST_FROM_PERFORMANCE_STATS", "true").lower() == "true",
             no_fill_cycles_before_recenter=int(os.getenv("NO_FILL_CYCLES_BEFORE_RECENTER", "360")),
@@ -242,4 +252,6 @@ class BotConfig:
             trend_weak_confidence=float(os.getenv("TREND_WEAK_CONFIDENCE", "0.45")),
             panic_score_threshold=float(os.getenv("PANIC_SCORE_THRESHOLD", "0.80")),
             market_stress_extreme_flat=os.getenv("MARKET_STRESS_EXTREME_FLAT", "false").lower() == "true",
+            anti_chop_last_n_trades=int(os.getenv("ANTI_CHOP_LAST_N_TRADES", "5")),
+            anti_chop_cooldown_minutes=int(os.getenv("ANTI_CHOP_COOLDOWN_MINUTES", "15")),
         )

@@ -1214,10 +1214,10 @@ def test_live_flatten_position_uses_aggressive_reduce_only_limit_for_dust_long(t
     assert client.placed == [("BTC", "sell", 0.00001, 70858.0, True)]
 
 
-def test_dust_position_triggers_cleanup_before_grid_management(tmp_path):
+def test_dust_position_is_held_for_next_normal_reduce_only_close(tmp_path):
     cfg = BotConfig.from_env()
     cfg.auto_dust_cleanup_usd = 5.0
-    cfg.dust_position_notional_usd = 1.0
+    cfg.dust_position_notional_usd = 3.0
     cfg.allow_long_biased = False
     cfg.allow_short_biased = False
     eng = make_test_engine(tmp_path, "dust_cleanup.json", paper_mode=True, enable_live_trading=False)
@@ -1226,17 +1226,12 @@ def test_dust_position_triggers_cleanup_before_grid_management(tmp_path):
     orch = StrategyOrchestrator(cfg, eng)
     candles = pd.DataFrame({"close": [70000 - i for i in range(80)], "high": [70001 - i for i in range(80)], "low": [69999 - i for i in range(80)]})
 
-    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=2.1)
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
 
-    assert status["status"] == "managing_position"
-    assert status["reason"] == "dust_cleanup_requested"
-    assert status["allowed_to_trade"] is False
-    assert status["allowed_to_reduce"] is True
-    assert status["canceled_orders"] == 1
-    assert status["flattened"] is True
+    assert status["is_dust_position"] is True
+    assert status["dust_cleanup_action"] == "hold_for_next_normal_reduce_only_close"
     assert status["dust_cleanup_requested"] is True
-    assert eng.open_orders == []
-    assert eng.state.position_size == 0.0
+    assert eng.state.position_size == pytest.approx(0.00003)
 
 
 def test_live_submit_sends_normalized_btc_wire_values_and_not_raw_floats(tmp_path):
@@ -1937,7 +1932,8 @@ def test_live_strategy_uses_live_account_state_not_paper_mirror():
     assert status["position_notional_raw"] == pytest.approx(9999.0)  # explicit caller override is still honored
     status = orch.on_tick(candles, equity=9999.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
     assert status["position_notional_raw"] == pytest.approx(1.0)
-    assert status["effective_position_side"] == "LONG"
+    assert status["is_dust_position"] is True
+    assert status["effective_position_side"] == "FLAT"
 
 
 def test_daily_pnl_baseline_calculation_is_equity_based():
@@ -2208,7 +2204,7 @@ def test_spacing_multiplier_and_floor_reduce_grid_density(tmp_path, monkeypatch)
     spacing, source = orch._calculate_spacing_pct(atr_pct=0.002, return_vol_pct=0.001)
 
     assert spacing == pytest.approx(0.0030)
-    assert source == "low_volatility_atr14_x1.20_bucket_cap"
+    assert source == "low_volatility_atr14_x1.20_configured_cap"
     assert cfg.grid_spacing_min_pct == pytest.approx(0.0018)
 
 
@@ -2437,8 +2433,8 @@ def test_volatility_adaptive_spacing_uses_configured_buckets(tmp_path):
     normal_spacing, normal_source = orch._calculate_spacing_pct(0.006, 0.001)
     high_spacing, high_source = orch._calculate_spacing_pct(0.02, 0.001)
 
-    assert 0.0025 <= low_spacing <= 0.0030
-    assert 0.0035 <= normal_spacing <= 0.0045
+    assert 0.004 <= low_spacing <= 0.004
+    assert 0.004 <= normal_spacing <= 0.0045
     assert 0.0055 <= high_spacing <= 0.0075
     assert "low_volatility" in low_source
     assert "normal_volatility" in normal_source
