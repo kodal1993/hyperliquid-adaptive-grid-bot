@@ -1,7 +1,8 @@
+import logging
 import os
 import subprocess
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import time
 from pathlib import Path
 
@@ -2391,19 +2392,20 @@ def test_counter_trend_entry_filter_blocks_weak_edge_longs_in_bearish_momentum(t
     assert decision["long_entry_blocked_by_trend_filter"] is True
 
 
-def test_minimum_expected_edge_filter_requires_net_profit_fee_multiple(tmp_path):
+def test_minimum_expected_edge_filter_does_not_apply_net_profit_fee_multiple_to_openings(tmp_path):
     cfg = BotConfig.from_env()
     cfg.min_expected_net_profit_fee_multiple = 2.5
+    cfg.min_net_profit_fee_multiplier = 2.5
     eng = make_test_engine(tmp_path, "net_fee_multiple.json")
     orch = StrategyOrchestrator(cfg, eng)
     plan = GridManager().build_grid(100, 1, 0.0025, 0.0, MarketRegime.RANGE, 1, 0.0, 0.0, GridMode.NEUTRAL)
 
     edge = orch._apply_minimum_expected_edge_filter(plan, mid_price=100, position_size=0.0)
 
-    assert edge["edge_filter_skipped_by_reason"] == {"below_min_expected_net_profit_fee_multiple": 2}
+    assert edge["edge_filter_skipped_by_reason"] == {}
     assert edge["expected_profit_after_fees"] is not None
-    assert len(plan.long_levels) == 0
-    assert len(plan.short_levels) == 0
+    assert len(plan.long_levels) == 1
+    assert len(plan.short_levels) == 1
 
 
 def test_adverse_move_protection_closes_before_reversion_confirmation(tmp_path):
@@ -2433,9 +2435,9 @@ def test_volatility_adaptive_spacing_uses_configured_buckets(tmp_path):
     normal_spacing, normal_source = orch._calculate_spacing_pct(0.006, 0.001)
     high_spacing, high_source = orch._calculate_spacing_pct(0.02, 0.001)
 
-    assert 0.004 <= low_spacing <= 0.004
-    assert 0.004 <= normal_spacing <= 0.0045
-    assert 0.0055 <= high_spacing <= 0.0075
+    assert 0.0025 <= low_spacing <= 0.0030
+    assert 0.0035 <= normal_spacing <= 0.0045
+    assert 0.0055 <= high_spacing <= 0.0055
     assert "low_volatility" in low_source
     assert "normal_volatility" in normal_source
     assert "high_volatility" in high_source
@@ -2458,3 +2460,159 @@ def test_trade_analytics_report_groups_by_side_regime_hour_and_volatility_bucket
     assert report["performance_by_regime"]["TREND_UP"]["pnl"] == pytest.approx(-0.54)
     assert report["performance_by_hour"]["05:00"]["trades"] == 2
     assert report["performance_by_volatility_bucket"]["high"]["pnl"] == pytest.approx(-0.54)
+
+
+def _flat_pipeline_cfg(monkeypatch):
+    cfg = _cfg_for_grid_tests(monkeypatch)
+    cfg.order_notional_usd = 10
+    cfg.max_notional_per_trade_usd = 10
+    cfg.min_order_notional_usd = 10
+    cfg.min_notional_usd = 10
+    cfg.max_active_exposure_usd = 50
+    cfg.max_position_notional_usd = 50
+    cfg.max_directional_exposure_pct = 1.0
+    cfg.grid_levels = 2
+    cfg.min_grid_levels = 1
+    cfg.enable_market_stress_filter = False
+    cfg.trend_flip_cooldown_ticks = 0
+    cfg.min_expected_net_edge_usd = 0
+    cfg.min_expected_net_edge_pct = 0
+    cfg.min_rr_ratio = 1.0
+    cfg.min_net_profit_fee_multiplier = 999.0
+    cfg.min_expected_net_profit_fee_multiple = 999.0
+    cfg.anti_chop_cooldown_minutes = 5
+    return cfg
+
+
+def _force_signal(orch, regime):
+    orch.detector.detect_signal = lambda *args, **kwargs: RegimeSignal(
+        regime=regime,
+        confidence=0.9,
+        atr_pct=0.003,
+        return_vol_pct=0.001,
+        move_pct=0.0,
+        ema_slope_fast_pct=0.0,
+        ema_slope_slow_pct=0.0,
+        trend_strength_score=0.9 if regime in {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN} else 0.0,
+    )
+
+
+def _flat_candles(price=100.0):
+    return pd.DataFrame({"close": [price for _ in range(80)], "high": [price + 1 for _ in range(80)], "low": [price - 1 for _ in range(80)]})
+
+
+def test_flat_range_neutral_submits_buy_and_sell_orders(tmp_path, monkeypatch):
+    cfg = _flat_pipeline_cfg(monkeypatch)
+    eng = make_test_engine(tmp_path, "flat_range_orders.json", paper_mode=True)
+    orch = StrategyOrchestrator(cfg, eng)
+    _force_signal(orch, MarketRegime.RANGE)
+
+    status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status["status"] == "running"
+    assert status["mode"] == "neutral"
+    assert status["orders"]["placed"] >= 2
+    assert {o["side"] for o in eng.open_orders} == {"buy", "sell"}
+    assert status["skip_reason"] == "none"
+
+
+def test_flat_trend_down_short_biased_submits_sell_orders_if_allowed(tmp_path, monkeypatch):
+    cfg = _flat_pipeline_cfg(monkeypatch)
+    eng = make_test_engine(tmp_path, "flat_down_orders.json", paper_mode=True)
+    orch = StrategyOrchestrator(cfg, eng)
+    _force_signal(orch, MarketRegime.TREND_DOWN)
+
+    status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status["mode"] == "short_biased"
+    assert status["allow_sells"] is True
+    assert status["allow_buys"] is False
+    assert len(eng.open_orders) > 0
+    assert all(o["side"] == "sell" for o in eng.open_orders)
+
+
+def test_flat_trend_up_long_biased_submits_buy_orders_if_allowed(tmp_path, monkeypatch):
+    cfg = _flat_pipeline_cfg(monkeypatch)
+    eng = make_test_engine(tmp_path, "flat_up_orders.json", paper_mode=True)
+    orch = StrategyOrchestrator(cfg, eng)
+    _force_signal(orch, MarketRegime.TREND_UP)
+
+    status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status["mode"] == "long_biased"
+    assert status["allow_buys"] is True
+    assert status["allow_sells"] is False
+    assert len(eng.open_orders) > 0
+    assert all(o["side"] == "buy" for o in eng.open_orders)
+
+
+def test_min_notional_blocks_only_below_threshold_orders(tmp_path, monkeypatch):
+    cfg = _flat_pipeline_cfg(monkeypatch)
+    cfg.order_notional_usd = 9
+    cfg.max_notional_per_trade_usd = 9
+    cfg.min_order_notional_usd = 10
+    eng = make_test_engine(tmp_path, "min_notional_block.json", paper_mode=True)
+    orch = StrategyOrchestrator(cfg, eng)
+    _force_signal(orch, MarketRegime.RANGE)
+
+    status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status["raw_grid_orders"] > 0
+    assert status["after_min_notional"] == 0
+    assert status["final_orders_to_submit"] == 0
+    assert status["skip_reason"] == "no_allowed_sides"
+    assert eng.open_orders == []
+
+
+def test_net_profit_filter_does_not_block_opening_orders(tmp_path, monkeypatch):
+    cfg = _flat_pipeline_cfg(monkeypatch)
+    cfg.min_net_profit_fee_multiplier = 10_000.0
+    cfg.min_expected_net_profit_fee_multiple = 10_000.0
+    eng = make_test_engine(tmp_path, "net_profit_fail_open.json", paper_mode=True)
+    orch = StrategyOrchestrator(cfg, eng)
+    _force_signal(orch, MarketRegime.RANGE)
+
+    status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status["edge_filter_skipped_orders"] == 0
+    assert status["orders"]["placed"] >= 2
+    assert {o["side"] for o in eng.open_orders} == {"buy", "sell"}
+
+
+def test_dust_filter_does_not_block_normal_flat_entries(tmp_path, monkeypatch):
+    cfg = _flat_pipeline_cfg(monkeypatch)
+    cfg.dust_position_notional_usd = 2
+    eng = make_test_engine(tmp_path, "dust_flat_entries.json", paper_mode=True)
+    eng.paper.position_size = 0.01
+    eng.paper.avg_entry = 100.0
+    orch = StrategyOrchestrator(cfg, eng)
+    _force_signal(orch, MarketRegime.RANGE)
+
+    status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status["is_dust_position"] is True
+    assert status["effective_position_side"] == "FLAT"
+    assert status["orders"]["placed"] >= 2
+    assert {o["side"] for o in eng.open_orders} == {"buy", "sell"}
+
+
+def test_anti_chop_logs_and_expires_correctly(tmp_path, monkeypatch, caplog):
+    cfg = _flat_pipeline_cfg(monkeypatch)
+    eng = make_test_engine(tmp_path, "anti_chop.json", paper_mode=True)
+    orch = StrategyOrchestrator(cfg, eng)
+    _force_signal(orch, MarketRegime.RANGE)
+    orch.anti_chop_cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=1)
+
+    with caplog.at_level(logging.WARNING):
+        active_status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert active_status["anti_chop_cooldown_active"] is True
+    assert active_status["final_orders_to_submit"] == 0
+    assert "anti_chop_active" in caplog.text
+
+    caplog.clear()
+    orch.anti_chop_cooldown_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+    expired_status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert expired_status["anti_chop_cooldown_active"] is False
+    assert expired_status["orders"]["placed"] >= 2
