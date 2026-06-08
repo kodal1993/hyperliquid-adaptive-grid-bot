@@ -2678,6 +2678,7 @@ def test_strategy_orderbook_bearish_filters_flat_longs_in_downtrend(tmp_path, mo
     cfg.min_notional_usd = 1
     cfg.regrid_threshold_pct = 0.0
     cfg.orderbook_min_samples = 3
+    cfg.orderbook_soft_mode = False
     cfg.orderbook_counter_edge_score = 999.0
     cfg.regime_confirmation_bars = 1
     cfg.regime_min_confidence = 0.1
@@ -2709,3 +2710,85 @@ def test_strategy_orderbook_bearish_filters_flat_longs_in_downtrend(tmp_path, mo
     assert status["allow_sells"] is True
     assert status["orderbook_decision"] == "counter_orderbook_edge_too_low"
     assert status["orderbook_filtered_entries"] >= 1
+
+
+def test_orderbook_stale_fails_open_without_blocking_trading(tmp_path, monkeypatch):
+    cfg = _flat_pipeline_cfg(monkeypatch)
+    cfg.orderbook_max_age_seconds = 5
+    eng = make_test_engine(tmp_path, "orderbook_stale_fail_open.json", paper_mode=True)
+    orch = StrategyOrchestrator(cfg, eng)
+    _force_signal(orch, MarketRegime.RANGE)
+    stale_snapshot = {**_l2_snapshot([10.0] * 10, [1.0] * 10), "received_ts": time.time() - 10}
+
+    status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0, order_book_snapshot=stale_snapshot)
+
+    assert status["orderbook_available"] is False
+    assert status["stale"] is True
+    assert status["orderbook_action_taken"] == "fallback_existing_strategy"
+    assert status["allowed_to_trade"] is True
+    assert status["final_orders_to_submit"] > 0
+
+
+def test_orderbook_malformed_fails_open_without_blocking_trading(tmp_path, monkeypatch):
+    cfg = _flat_pipeline_cfg(monkeypatch)
+    eng = make_test_engine(tmp_path, "orderbook_malformed_fail_open.json", paper_mode=True)
+    orch = StrategyOrchestrator(cfg, eng)
+    _force_signal(orch, MarketRegime.RANGE)
+
+    status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0, order_book_snapshot={"levels": "bad"})
+
+    assert status["orderbook_available"] is False
+    assert status["orderbook_action_taken"] == "fallback_existing_strategy"
+    assert status["allowed_to_trade"] is True
+    assert status["final_orders_to_submit"] > 0
+
+
+def test_orderbook_soft_mode_never_zero_orders_while_flat_risk_ok(tmp_path, monkeypatch):
+    cfg = _flat_pipeline_cfg(monkeypatch)
+    cfg.grid_levels = 2
+    cfg.orderbook_min_samples = 1
+    cfg.orderbook_soft_mode = True
+    cfg.orderbook_counter_edge_score = 999.0
+    eng = make_test_engine(tmp_path, "orderbook_soft_no_zero.json", paper_mode=True)
+    orch = StrategyOrchestrator(cfg, eng)
+    _force_signal(orch, MarketRegime.RANGE)
+    bearish = _l2_snapshot([1.0] * 10, [10.0] * 10)
+
+    status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0, order_book_snapshot=bearish)
+
+    assert status["orderbook_soft_mode"] is True
+    assert status["allow_buys"] is True
+    assert status["allow_sells"] is True
+    assert status["orderbook_action_taken"] == "reduce_grid_levels"
+    assert status["final_orders_to_submit"] > 0
+    assert len(eng.open_orders) > 0
+
+
+def test_orderbook_level_reduction_capped_by_config_pct(tmp_path, monkeypatch):
+    cfg = _flat_pipeline_cfg(monkeypatch)
+    cfg.grid_levels = 4
+    cfg.min_grid_levels = 4
+    cfg.max_grid_levels = 4
+    cfg.orderbook_min_samples = 1
+    cfg.orderbook_soft_mode = True
+    cfg.orderbook_counter_edge_score = 999.0
+    cfg.orderbook_max_level_reduction_pct = 0.25
+    eng = make_test_engine(tmp_path, "orderbook_reduction_cap.json", paper_mode=True)
+    orch = StrategyOrchestrator(cfg, eng)
+    _force_signal(orch, MarketRegime.RANGE)
+    bullish = _l2_snapshot([10.0] * 10, [1.0] * 10)
+
+    status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0, order_book_snapshot=bullish)
+
+    assert status["orderbook_levels_before"] == 4
+    assert status["orderbook_levels_after"] >= 3
+    assert status["orderbook_grid_level_multiplier"] == pytest.approx(0.75)
+
+
+def test_orderbook_hard_mode_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("ORDERBOOK_SOFT_MODE", raising=False)
+    monkeypatch.delenv("ORDERBOOK_FILTER_ENABLED", raising=False)
+    cfg = BotConfig.from_env()
+
+    assert cfg.orderbook_filter_enabled is True
+    assert cfg.orderbook_soft_mode is True

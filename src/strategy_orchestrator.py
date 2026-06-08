@@ -40,7 +40,8 @@ class StrategyOrchestrator:
         self.orderbook_analyzer = OrderBookAnalyzer(
             top_levels=getattr(config, "orderbook_top_levels", 10),
             smoothing_window=getattr(config, "orderbook_smoothing_window", 5),
-            min_samples=getattr(config, "orderbook_min_samples", 3),
+            min_samples=getattr(config, "orderbook_min_samples", 5),
+            max_age_seconds=getattr(config, "orderbook_max_age_seconds", 5.0),
         )
         self.orderbook_bullish_entries = 0
         self.orderbook_bearish_entries = 0
@@ -80,7 +81,10 @@ class StrategyOrchestrator:
         effective_position_notional = 0.0 if is_dust_position else raw_position_notional
         effective_position_size = 0.0 if is_dust_position else pos_size
         effective_position_side = "LONG" if effective_position_size > 0 else ("SHORT" if effective_position_size < 0 else "FLAT")
-        orderbook_analysis = self.orderbook_analyzer.analyze(order_book_snapshot) if order_book_snapshot is not None else self.orderbook_analyzer.unavailable()
+        if bool(getattr(self.config, "orderbook_filter_enabled", True)):
+            orderbook_analysis = self.orderbook_analyzer.analyze(order_book_snapshot)
+        else:
+            orderbook_analysis = self.orderbook_analyzer.unavailable("orderbook_filter_disabled", fallback_reason="disabled")
         orderbook_context = orderbook_analysis.to_dict()
         logger.info(
             "orderbook_analysis available=%s ready=%s bid_volume_top10=%.8f ask_volume_top10=%.8f imbalance_ratio=%.6f pressure_score=%.6f classification=%s long_multiplier=%.2f short_multiplier=%.2f decision=%s orderbook_imbalance_ema=%s",
@@ -97,7 +101,12 @@ class StrategyOrchestrator:
             orderbook_analysis.orderbook_imbalance_ema,
         )
         if not orderbook_analysis.available:
-            logger.warning("orderbook_unavailable symbol=%s decision=fail_open_normal_trading", symbol)
+            logger.warning(
+                "orderbook_unavailable symbol=%s reason=%s fallback=existing_strategy decision=%s",
+                symbol,
+                orderbook_analysis.fallback_reason or orderbook_analysis.decision,
+                orderbook_analysis.decision,
+            )
         auto_dust_cleanup_usd = max(float(self.config.auto_dust_cleanup_usd), 0.0)
         dust_cleanup_requested = 0 < raw_position_notional < auto_dust_cleanup_usd
         dust_context = {
@@ -716,8 +725,8 @@ class StrategyOrchestrator:
         }
 
         orderbook_level_multiplier = float(orderbook_filter_context.get("orderbook_grid_level_multiplier", 1.0) or 1.0)
+        before_orderbook_levels = volatility_grid_levels
         if effective_position_side == "FLAT" and orderbook_level_multiplier < 1.0 and (allow_buys or allow_sells):
-            before_orderbook_levels = volatility_grid_levels
             volatility_grid_levels = max(1, int(round(volatility_grid_levels * orderbook_level_multiplier)))
             logger.info(
                 "orderbook_grid_level_adjustment before=%s after=%s multiplier=%.2f decision=%s",
@@ -726,6 +735,28 @@ class StrategyOrchestrator:
                 orderbook_level_multiplier,
                 orderbook_filter_context.get("orderbook_decision"),
             )
+        orderbook_filter_context["orderbook_levels_before"] = before_orderbook_levels
+        orderbook_filter_context["orderbook_levels_after"] = volatility_grid_levels
+        market_stress_context.update({
+            "orderbook_levels_before": before_orderbook_levels,
+            "orderbook_levels_after": volatility_grid_levels,
+            "orderbook_action_taken": orderbook_filter_context.get("orderbook_action_taken"),
+            "orderbook_fallback_reason": orderbook_filter_context.get("orderbook_fallback_reason", ""),
+        })
+        logger.info(
+            "orderbook_filter_state enabled=%s soft_mode=%s available=%s stale=%s classification=%s imbalance_ratio=%.6f pressure_score=%.6f action_taken=%s levels_before=%s levels_after=%s fallback_reason=%s",
+            bool(getattr(self.config, "orderbook_filter_enabled", True)),
+            bool(getattr(self.config, "orderbook_soft_mode", True)),
+            bool(orderbook_context.get("available")),
+            bool(orderbook_context.get("stale")),
+            orderbook_context.get("classification") or "Unavailable",
+            float(orderbook_context.get("imbalance_ratio", 1.0) or 1.0),
+            float(orderbook_context.get("pressure_score", 0.0) or 0.0),
+            orderbook_filter_context.get("orderbook_action_taken", orderbook_filter_context.get("orderbook_decision", "none")),
+            before_orderbook_levels,
+            volatility_grid_levels,
+            orderbook_context.get("fallback_reason") or orderbook_filter_context.get("orderbook_fallback_reason") or "",
+        )
 
         min_order_notional_usd = max(float(getattr(self.config, "min_order_notional_usd", self.config.min_notional_usd)), 0.0)
         allow_buys_before_min_notional = allow_buys
@@ -994,10 +1025,16 @@ class StrategyOrchestrator:
         fee_rate: float,
         force_reduce_only: bool,
     ) -> dict:
+        enabled = bool(getattr(self.config, "orderbook_filter_enabled", True))
+        soft_mode = bool(getattr(self.config, "orderbook_soft_mode", True))
         context = {
             "allow_buys": allow_buys,
             "allow_sells": allow_sells,
+            "orderbook_filter_enabled": enabled,
+            "orderbook_soft_mode": soft_mode,
             "orderbook_decision": orderbook.get("decision", "orderbook_unavailable"),
+            "orderbook_action_taken": "none",
+            "orderbook_fallback_reason": orderbook.get("fallback_reason", ""),
             "orderbook_grid_level_multiplier": 1.0,
             "orderbook_filtered_buy": False,
             "orderbook_filtered_sell": False,
@@ -1005,17 +1042,27 @@ class StrategyOrchestrator:
             "orderbook_bearish_entries": self.orderbook_bearish_entries,
             "orderbook_filtered_entries": self.orderbook_filtered_entries,
         }
+        if not enabled:
+            context["orderbook_decision"] = "orderbook_filter_disabled"
+            context["orderbook_action_taken"] = "fallback_existing_strategy"
+            context["orderbook_fallback_reason"] = "disabled"
+            return context
         if force_reduce_only or position_side != "FLAT":
             context["orderbook_decision"] = "orderbook_skip_not_flat_or_reduce_only"
+            context["orderbook_action_taken"] = "none"
             return context
-        if not bool(orderbook.get("available")) or not bool(orderbook.get("ready")):
+        if not bool(orderbook.get("available")) or not bool(orderbook.get("ready")) or bool(orderbook.get("stale")):
             context["orderbook_decision"] = str(orderbook.get("decision") or "orderbook_fail_open")
+            context["orderbook_action_taken"] = "fallback_existing_strategy"
+            context["orderbook_fallback_reason"] = str(orderbook.get("fallback_reason") or orderbook.get("decision") or "unavailable")
             return context
 
         ratio = float(orderbook.get("imbalance_ratio", 1.0) or 1.0)
         classification = str(orderbook.get("classification") or "Neutral")
         edge_score = self._entry_edge_score(spacing_pct, fee_rate)
         required_counter_edge = max(float(getattr(self.config, "orderbook_counter_edge_score", getattr(self.config, "counter_trend_entry_edge_score", 1.25))), 0.0)
+        max_reduction_pct = min(max(float(getattr(self.config, "orderbook_max_level_reduction_pct", 0.5)), 0.0), 1.0)
+        capped_multiplier = max(1.0 - max_reduction_pct, 0.0)
         decisions: list[str] = []
 
         orderbook_bullish = ratio > 1.15
@@ -1025,35 +1072,58 @@ class StrategyOrchestrator:
         if allow_sells and orderbook_bearish:
             self.orderbook_bearish_entries += 1
 
+        def reduce_levels(reason: str) -> None:
+            context["orderbook_grid_level_multiplier"] = min(float(context["orderbook_grid_level_multiplier"]), max(capped_multiplier, 0.0))
+            decisions.append(reason)
+
         if regime in {MarketRegime.TREND_UP, MarketRegime.TREND_UP_PULLBACK} and allow_sells and orderbook_bullish:
-            allow_sells = False
-            context["orderbook_filtered_sell"] = True
-            decisions.append("restrict_short_in_uptrend_bullish_orderbook")
+            if soft_mode:
+                reduce_levels("soft_reduce_short_in_uptrend_bullish_orderbook")
+            else:
+                allow_sells = False
+                context["orderbook_filtered_sell"] = True
+                decisions.append("restrict_short_in_uptrend_bullish_orderbook")
         if regime in {MarketRegime.TREND_DOWN, MarketRegime.TREND_DOWN_PULLBACK} and allow_buys and orderbook_bearish:
-            allow_buys = False
-            context["orderbook_filtered_buy"] = True
-            decisions.append("restrict_long_in_downtrend_bearish_orderbook")
+            if soft_mode:
+                reduce_levels("soft_reduce_long_in_downtrend_bearish_orderbook")
+            else:
+                allow_buys = False
+                context["orderbook_filtered_buy"] = True
+                decisions.append("restrict_long_in_downtrend_bearish_orderbook")
 
         counter_buy = allow_buys and orderbook_bearish
         counter_sell = allow_sells and orderbook_bullish
         if counter_buy or counter_sell:
             if edge_score < required_counter_edge:
-                if counter_buy:
-                    allow_buys = False
-                    context["orderbook_filtered_buy"] = True
-                if counter_sell:
-                    allow_sells = False
-                    context["orderbook_filtered_sell"] = True
-                decisions.append("counter_orderbook_edge_too_low")
+                if soft_mode:
+                    reduce_levels("soft_counter_orderbook_reduce_grid_levels")
+                else:
+                    if counter_buy:
+                        allow_buys = False
+                        context["orderbook_filtered_buy"] = True
+                    if counter_sell:
+                        allow_sells = False
+                        context["orderbook_filtered_sell"] = True
+                    decisions.append("counter_orderbook_edge_too_low")
             else:
-                context["orderbook_grid_level_multiplier"] = 0.5
-                decisions.append("counter_orderbook_reduce_grid_levels")
+                reduce_levels("counter_orderbook_reduce_grid_levels")
 
+        if soft_mode and position_side == "FLAT" and not force_reduce_only:
+            # LIVE safety: order book imbalance is additive only in soft mode. It
+            # must never be the sole reason a flat, risk-OK strategy has no side.
+            allow_buys = bool(context["allow_buys"])
+            allow_sells = bool(context["allow_sells"])
+            if decisions and not allow_buys and not allow_sells:
+                context["orderbook_fallback_reason"] = "soft_mode_no_zero_order_flat_state"
+                decisions.append("soft_mode_fail_open_keep_allowed_sides")
+
+        action_taken = "fallback_existing_strategy" if context.get("orderbook_fallback_reason") else ("reduce_grid_levels" if float(context["orderbook_grid_level_multiplier"]) < 1.0 else ("hard_filter" if (context["orderbook_filtered_buy"] or context["orderbook_filtered_sell"]) else "none"))
         context.update(
             {
                 "allow_buys": allow_buys,
                 "allow_sells": allow_sells,
-                "orderbook_decision": ",".join(decisions) if decisions else "orderbook_entry_aligned_or_neutral",
+                "orderbook_decision": ",".join(dict.fromkeys(decisions)) if decisions else "orderbook_entry_aligned_or_neutral",
+                "orderbook_action_taken": action_taken,
                 "orderbook_entry_edge_score": edge_score,
                 "orderbook_required_counter_edge_score": required_counter_edge,
                 "orderbook_entry_classification": classification,
@@ -1064,16 +1134,19 @@ class StrategyOrchestrator:
             }
         )
         logger.info(
-            "orderbook_entry_filter classification=%s ratio=%.6f edge_score=%.3f required_counter_edge=%.3f allow_buys=%s allow_sells=%s decision=%s long_multiplier=%.2f short_multiplier=%.2f",
+            "orderbook_entry_filter classification=%s ratio=%.6f edge_score=%.3f required_counter_edge=%.3f allow_buys=%s allow_sells=%s soft_mode=%s decision=%s action_taken=%s long_multiplier=%.2f short_multiplier=%.2f level_multiplier=%.2f",
             classification,
             ratio,
             edge_score,
             required_counter_edge,
             allow_buys,
             allow_sells,
+            soft_mode,
             context["orderbook_decision"],
+            context["orderbook_action_taken"],
             float(orderbook.get("long_size_multiplier", 1.0) or 1.0),
             float(orderbook.get("short_size_multiplier", 1.0) or 1.0),
+            float(context["orderbook_grid_level_multiplier"]),
         )
         return context
 
