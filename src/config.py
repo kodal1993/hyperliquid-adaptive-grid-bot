@@ -120,6 +120,10 @@ class BotConfig:
     market_stress_extreme_flat: bool
     anti_chop_last_n_trades: int
     anti_chop_cooldown_minutes: int
+    orderbook_top_levels: int
+    orderbook_smoothing_window: int
+    orderbook_min_samples: int
+    orderbook_counter_edge_score: float
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -254,4 +258,8 @@ class BotConfig:
             market_stress_extreme_flat=os.getenv("MARKET_STRESS_EXTREME_FLAT", "false").lower() == "true",
             anti_chop_last_n_trades=int(os.getenv("ANTI_CHOP_LAST_N_TRADES", "5")),
             anti_chop_cooldown_minutes=int(os.getenv("ANTI_CHOP_COOLDOWN_MINUTES", "5")),
+            orderbook_top_levels=int(os.getenv("ORDERBOOK_TOP_LEVELS", "10")),
+            orderbook_smoothing_window=int(os.getenv("ORDERBOOK_SMOOTHING_WINDOW", "5")),
+            orderbook_min_samples=int(os.getenv("ORDERBOOK_MIN_SAMPLES", "3")),
+            orderbook_counter_edge_score=float(os.getenv("ORDERBOOK_COUNTER_EDGE_SCORE", os.getenv("COUNTER_TREND_ENTRY_EDGE_SCORE", "1.25"))),
         )

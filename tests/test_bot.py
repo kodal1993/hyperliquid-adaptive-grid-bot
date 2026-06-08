@@ -2380,7 +2380,7 @@ def test_counter_trend_entry_filter_blocks_weak_edge_longs_in_bearish_momentum(t
         allow_buys=True,
         allow_sells=True,
         position_side="FLAT",
-        regime=MarketRegime.TREND_DOWN,
+        regime=MarketRegime.RANGE,
         regime_signal=signal,
         spacing_pct=0.003,
         fee_rate=0.0004,
@@ -2619,3 +2619,93 @@ def test_anti_chop_logs_and_expires_correctly(tmp_path, monkeypatch, caplog):
     assert expired_status["anti_chop_cooldown_active"] is False
     assert expired_status["final_orders_to_submit"] >= 2
     assert {o["side"] for o in eng.open_orders} == {"buy", "sell"}
+
+
+def _l2_snapshot(bid_sizes, ask_sizes):
+    return {
+        "levels": [
+            [{"px": str(100 - i), "sz": str(sz)} for i, sz in enumerate(bid_sizes)],
+            [{"px": str(101 + i), "sz": str(sz)} for i, sz in enumerate(ask_sizes)],
+        ]
+    }
+
+
+def test_orderbook_analyzer_smooths_and_classifies_strong_bullish():
+    from src.orderbook_analyzer import OrderBookAnalyzer
+
+    analyzer = OrderBookAnalyzer(top_levels=10, smoothing_window=3, min_samples=3)
+    snapshot = _l2_snapshot([2.0] * 10, [1.0] * 10)
+
+    first = analyzer.analyze(snapshot)
+    second = analyzer.analyze(snapshot)
+    third = analyzer.analyze(snapshot)
+
+    assert first.ready is False
+    assert second.ready is False
+    assert third.ready is True
+    assert third.bid_volume_top10 == pytest.approx(20.0)
+    assert third.ask_volume_top10 == pytest.approx(10.0)
+    assert third.imbalance_ratio == pytest.approx(2.0)
+    assert third.pressure_score == pytest.approx(1.0 / 3.0)
+    assert third.classification == "Strong Bullish"
+    assert third.long_size_multiplier == pytest.approx(1.25)
+    assert third.short_size_multiplier == pytest.approx(0.75)
+
+
+def test_strategy_orderbook_unavailable_fails_open(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.order_notional_usd = 10
+    cfg.max_notional_per_trade_usd = 10
+    cfg.min_order_notional_usd = 1
+    cfg.min_notional_usd = 1
+    cfg.regrid_threshold_pct = 0.0
+    eng = make_test_engine(tmp_path, "orderbook_fail_open.json", paper_mode=True, enable_live_trading=False)
+    orch = StrategyOrchestrator(cfg, eng)
+
+    status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status["orderbook_available"] is False
+    assert status["decision"] == "orderbook_unavailable"
+    assert status["allowed_to_trade"] is True
+    assert status["final_orders_to_submit"] > 0
+
+
+def test_strategy_orderbook_bearish_filters_flat_longs_in_downtrend(tmp_path, monkeypatch):
+    cfg = BotConfig.from_env()
+    cfg.order_notional_usd = 10
+    cfg.max_notional_per_trade_usd = 10
+    cfg.min_order_notional_usd = 1
+    cfg.min_notional_usd = 1
+    cfg.regrid_threshold_pct = 0.0
+    cfg.orderbook_min_samples = 3
+    cfg.orderbook_counter_edge_score = 999.0
+    cfg.regime_confirmation_bars = 1
+    cfg.regime_min_confidence = 0.1
+    eng = make_test_engine(tmp_path, "orderbook_filter.json", paper_mode=True, enable_live_trading=False)
+    orch = StrategyOrchestrator(cfg, eng)
+    bearish = _l2_snapshot([1.0] * 10, [2.0] * 10)
+
+    signal = RegimeSignal(
+        regime=MarketRegime.RANGE,
+        confidence=0.95,
+        atr_pct=0.003,
+        return_vol_pct=0.001,
+        move_pct=-0.01,
+        ema_slope_fast_pct=-0.01,
+        ema_slope_slow_pct=-0.01,
+        trend_structure_score=1.0,
+        momentum_score=1.0,
+        trend_strength_score=1.0,
+    )
+    monkeypatch.setattr(orch.detector, "detect_signal", lambda *args, **kwargs: signal)
+
+    for _ in range(2):
+        orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0, order_book_snapshot=bearish)
+    status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0, order_book_snapshot=bearish)
+
+    assert status["ready"] is True
+    assert status["classification"] == "Strong Bearish"
+    assert status["allow_buys"] is False
+    assert status["allow_sells"] is True
+    assert status["orderbook_decision"] == "counter_orderbook_edge_too_low"
+    assert status["orderbook_filtered_entries"] >= 1

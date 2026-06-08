@@ -334,6 +334,11 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
         "performance_by_regime": {},
         "performance_by_hour": {},
         "performance_by_volatility_bucket": {},
+        "orderbook_bullish_entries": 0,
+        "orderbook_bearish_entries": 0,
+        "orderbook_filtered_entries": 0,
+        "avg_pnl_bullish_entries": 0.0,
+        "avg_pnl_bearish_entries": 0.0,
     }
     if not csv_path.exists():
         return analytics
@@ -363,6 +368,8 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
     holding_times: list[float] = []
     open_position_started_at: datetime | None = None
     previous_position_size = 0.0
+    orderbook_bullish_pnls: list[float] = []
+    orderbook_bearish_pnls: list[float] = []
 
     with csv_path.open(encoding="utf-8") as f:
         for row in csv.DictReader(f):
@@ -379,6 +386,13 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
                 continue
             realized = _safe_float(row.get("realized_pnl_delta")) or 0.0
             net = realized - fee
+            orderbook_classification = str(row.get("orderbook_classification") or "")
+            if "Bullish" in orderbook_classification:
+                analytics["orderbook_bullish_entries"] += 1
+                orderbook_bullish_pnls.append(net)
+            elif "Bearish" in orderbook_classification:
+                analytics["orderbook_bearish_entries"] += 1
+                orderbook_bearish_pnls.append(net)
             total_fees += fee
             net_pnl += net
             trade_count += 1
@@ -486,6 +500,8 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
         analytics["trades_per_day"] = trade_count / days
     analytics["avg_winner_before"] = sum(winner_before_cutover) / len(winner_before_cutover) if winner_before_cutover else 0.0
     analytics["avg_winner_after"] = sum(winner_after_cutover) / len(winner_after_cutover) if winner_after_cutover else analytics["avg_winner"]
+    analytics["avg_pnl_bullish_entries"] = sum(orderbook_bullish_pnls) / len(orderbook_bullish_pnls) if orderbook_bullish_pnls else 0.0
+    analytics["avg_pnl_bearish_entries"] = sum(orderbook_bearish_pnls) / len(orderbook_bearish_pnls) if orderbook_bearish_pnls else 0.0
     return analytics
 
 
@@ -646,7 +662,12 @@ def run() -> None:
         daily_metrics = calculate_daily_pnl_metrics(current_equity=equity, daily_start_equity=daily_start_equity, realized_pnl_total=account_state.realized_pnl, daily_start_realized_pnl=daily_start_realized_pnl, unrealized_pnl=unrealized_pnl, fees_paid_total=account_state.fees_paid, daily_start_fees_paid=daily_start_fees_paid)
         daily_pnl_pct = daily_metrics["daily_pnl_pct"]
 
-        status = orchestrator.on_tick(candles, equity=equity, daily_pnl_pct=daily_pnl_pct, symbol=cfg.default_symbol, position_notional=position_notional)
+        order_book_snapshot = None
+        try:
+            order_book_snapshot = client.get_l2_book(cfg.default_symbol)
+        except Exception as exc:
+            logger.warning("orderbook_unavailable symbol=%s error=%s", cfg.default_symbol, exc)
+        status = orchestrator.on_tick(candles, equity=equity, daily_pnl_pct=daily_pnl_pct, symbol=cfg.default_symbol, position_notional=position_notional, order_book_snapshot=order_book_snapshot)
         risk = status.get("risk")
         reason = status.get("reason") or (getattr(risk, "reason", "") if risk else "")
         strategy_status = status.get("status", "unknown")
@@ -655,7 +676,17 @@ def run() -> None:
 
         latest_candle = candles.iloc[-1].to_dict()
         latest_candle["symbol"] = cfg.default_symbol
-        fills = engine.on_candle(latest_candle, regime=status.get("regime", "unknown"), mode=mode, risk_state=risk_state, pause_reason=reason, strategy_status=strategy_status)
+        fills = engine.on_candle(
+            latest_candle,
+            regime=status.get("regime", "unknown"),
+            mode=mode,
+            risk_state=risk_state,
+            pause_reason=reason,
+            strategy_status=strategy_status,
+            orderbook_classification=status.get("classification", status.get("orderbook_entry_classification", "")),
+            orderbook_imbalance_ratio=status.get("imbalance_ratio"),
+            orderbook_pressure_score=status.get("pressure_score"),
+        )
         trade_events = engine.consume_trade_log()
         account_state = _account_metrics(cfg, engine, client, latest_close)
         unrealized_pnl, equity, position_notional = account_state.unrealized_pnl, account_state.equity, account_state.position_notional
@@ -774,6 +805,22 @@ def run() -> None:
                 "btc_5m_return_pct": status.get("btc_5m_return_pct"),
                 "btc_1h_return_pct": status.get("btc_1h_return_pct"),
                 "market_stress_reason": status.get("market_stress_reason"),
+                "orderbook_available": status.get("orderbook_available"),
+                "orderbook_ready": status.get("ready"),
+                "orderbook_bid_volume_top10": status.get("bid_volume_top10"),
+                "orderbook_ask_volume_top10": status.get("ask_volume_top10"),
+                "orderbook_imbalance_ratio": status.get("imbalance_ratio"),
+                "orderbook_pressure_score": status.get("pressure_score"),
+                "orderbook_classification": status.get("classification"),
+                "orderbook_long_multiplier": status.get("long_size_multiplier"),
+                "orderbook_short_multiplier": status.get("short_size_multiplier"),
+                "orderbook_imbalance_ema": status.get("orderbook_imbalance_ema"),
+                "orderbook_decision": status.get("orderbook_decision", status.get("decision")),
+                "orderbook_bullish_entries": status.get("orderbook_bullish_entries", trade_analytics.get("orderbook_bullish_entries", 0)),
+                "orderbook_bearish_entries": status.get("orderbook_bearish_entries", trade_analytics.get("orderbook_bearish_entries", 0)),
+                "orderbook_filtered_entries": status.get("orderbook_filtered_entries", trade_analytics.get("orderbook_filtered_entries", 0)),
+                "avg_pnl_bullish_entries": trade_analytics.get("avg_pnl_bullish_entries", 0.0),
+                "avg_pnl_bearish_entries": trade_analytics.get("avg_pnl_bearish_entries", 0.0),
                 "mark_price": latest_close,
                 "last_trade_price": _safe_float(last_trade.get("price")),
                 "last_trade_qty": _safe_float(last_trade.get("qty")),
