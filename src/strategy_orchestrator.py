@@ -11,6 +11,7 @@ from .config import BotConfig
 from .grid_manager import GridManager, GridPlan
 from .market_stress import OpportunityMode, decide_market_stress
 from .orderbook_analyzer import OrderBookAnalyzer
+from .prediction_layer import PredictionLayer, PredictionResult
 from .regime_detector import RegimeDetector, calculate_atr_pct
 from .risk_manager import RiskManager
 from .types import GridMode, MarketRegime
@@ -38,6 +39,7 @@ class StrategyOrchestrator:
         self.detector = RegimeDetector()
         self.risk = RiskManager(config.max_drawdown_pct, config.daily_loss_limit_pct)
         self.grid_manager = GridManager()
+        self.prediction_layer = PredictionLayer()
         self.orderbook_analyzer = OrderBookAnalyzer(
             top_levels=getattr(config, "orderbook_top_levels", 10),
             smoothing_window=getattr(config, "orderbook_smoothing_window", 5),
@@ -110,6 +112,26 @@ class StrategyOrchestrator:
                 orderbook_analysis.fallback_reason or orderbook_analysis.decision,
                 orderbook_analysis.decision,
             )
+        prediction = self._build_prediction(
+            candles=candles,
+            regime=regime,
+            regime_confidence=regime_confidence,
+            regime_signal=regime_signal,
+            orderbook_context=orderbook_context,
+        )
+        prediction_context = prediction.to_dict()
+        logger.info(
+            "prediction_layer available=%s directional_score=%.6f bullish_probability=%.4f bearish_probability=%.4f neutral_probability=%.4f confidence_score=%.4f prediction_bias=%s contributing_signals=%s fallback_reason=%s",
+            prediction.available,
+            prediction.directional_score,
+            prediction.bullish_probability,
+            prediction.bearish_probability,
+            prediction.neutral_probability,
+            prediction.confidence_score,
+            prediction.prediction_bias,
+            prediction.contributing_signals,
+            prediction.fallback_reason,
+        )
         auto_dust_cleanup_usd = max(float(self.config.auto_dust_cleanup_usd), 0.0)
         dust_cleanup_requested = 0 < raw_position_notional < auto_dust_cleanup_usd
         dust_context = {
@@ -130,6 +152,7 @@ class StrategyOrchestrator:
             "trend_transition_delta": regime_signal.trend_transition_delta,
             "regime_hysteresis_score": regime_signal.regime_hysteresis_score,
             **orderbook_context,
+            **prediction_context,
         }
 
         mode = GridMode.NEUTRAL
@@ -452,6 +475,17 @@ class StrategyOrchestrator:
         orderbook_filter_context["orderbook_bullish_entries"] = self.orderbook_bullish_entries
         orderbook_filter_context["orderbook_bearish_entries"] = self.orderbook_bearish_entries
 
+        prediction_filter_context = self._apply_prediction_entry_filter(
+            allow_buys=allow_buys,
+            allow_sells=allow_sells,
+            position_side=effective_position_side,
+            regime=regime,
+            prediction=prediction,
+            force_reduce_only=force_reduce_only,
+        )
+        allow_buys = prediction_filter_context.pop("allow_buys")
+        allow_sells = prediction_filter_context.pop("allow_sells")
+
         allow_buys_before_stress = allow_buys
         allow_sells_before_stress = allow_sells
         grid_levels_before_stress = volatility_grid_levels
@@ -474,7 +508,7 @@ class StrategyOrchestrator:
         allow_sells = market_stress.allow_sells
         volatility_grid_levels = market_stress.grid_levels
         final_spacing_pct *= market_stress.spacing_multiplier
-        market_stress_context = {**entry_filter_context, **orderbook_filter_context, **market_stress.telemetry()}
+        market_stress_context = {**entry_filter_context, **orderbook_filter_context, **prediction_filter_context, **market_stress.telemetry()}
         logger.info(
             "market_stress_decision volatility_mode=%s market_stress_score=%.3f trend_strength_score=%.3f opportunity_mode=%s allow_buys_before=%s allow_buys_after=%s allow_sells_before=%s allow_sells_after=%s grid_levels_before=%s grid_levels_after=%s spacing_before=%.6f spacing_after=%.6f reason=%s",
             market_stress.volatility_mode.value,
@@ -898,6 +932,13 @@ class StrategyOrchestrator:
         plan: GridPlan = self.grid_manager.build_grid(price, max(effective_grid_levels, 1), final_spacing_pct, 0.0, regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=build_allow_buys, allow_sells=build_allow_sells, force_recenter=force_recenter, spacing_source=spacing_source, atr_pct=atr_pct, trend_bias=trend_bias, regime_confidence=regime_confidence)
         if effective_position_side == "FLAT" and orderbook_analysis.available and orderbook_analysis.ready:
             self._apply_orderbook_size_multipliers(plan, price, orderbook_analysis.long_size_multiplier, orderbook_analysis.short_size_multiplier)
+        prediction_bias_context = self._apply_prediction_grid_bias(
+            plan,
+            price=price,
+            prediction=prediction,
+            position_side=effective_position_side,
+            max_one_side_notional=threshold,
+        )
         after_min_notional = len(plan.long_levels) + len(plan.short_levels)
         after_dust_filter = after_min_notional
         after_anti_chop = after_min_notional
@@ -1061,6 +1102,7 @@ class StrategyOrchestrator:
             "final_orders_to_submit": final_orders_to_submit,
             "skip_reason": no_grid_orders_generated_reason or "none",
             "anti_chop_trigger_count": self.anti_chop_trigger_count,
+            **prediction_bias_context,
             **anti_chop_context,
         }
         try:
@@ -1078,6 +1120,164 @@ class StrategyOrchestrator:
             canceled = self.execution_engine.cancel_all_orders(symbol)
             return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **market_stress_context, **recenter_context, **edge_context, **level_decision_context}
         return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **market_stress_context, **recenter_context, **edge_context, **level_decision_context}
+
+    def _build_prediction(
+        self,
+        *,
+        candles: pd.DataFrame,
+        regime: MarketRegime,
+        regime_confidence: float,
+        regime_signal,
+        orderbook_context: dict,
+    ) -> PredictionResult:
+        if not bool(getattr(self.config, "prediction_layer_enabled", True)):
+            return self.prediction_layer.unavailable("prediction_layer_disabled")
+        recent_taker_pressure = getattr(self.execution_engine, "recent_taker_pressure", None)
+        return self.prediction_layer.predict(
+            candles=candles,
+            regime=regime,
+            regime_confidence=regime_confidence,
+            regime_signal=regime_signal,
+            orderbook=orderbook_context,
+            recent_taker_pressure=recent_taker_pressure,
+            ema_slope_threshold_pct=self.config.ema_slope_threshold_pct,
+        )
+
+    def _prediction_allows_countertrend(self, prediction: PredictionResult, allowed_biases: set[str]) -> bool:
+        threshold = max(float(getattr(self.config, "prediction_confidence_threshold", 0.65)), 0.0)
+        return prediction.available and prediction.prediction_bias in allowed_biases and prediction.confidence_score > threshold
+
+    def _apply_prediction_entry_filter(
+        self,
+        *,
+        allow_buys: bool,
+        allow_sells: bool,
+        position_side: str,
+        regime: MarketRegime,
+        prediction: PredictionResult,
+        force_reduce_only: bool,
+    ) -> dict:
+        context = {
+            "allow_buys": allow_buys,
+            "allow_sells": allow_sells,
+            "prediction_entry_action": "none",
+            "prediction_filtered_buy": False,
+            "prediction_filtered_sell": False,
+        }
+        if not prediction.available or force_reduce_only:
+            context["prediction_entry_action"] = "fallback_existing_strategy" if not prediction.available else "none"
+            return context
+
+        soft_mode = bool(getattr(self.config, "prediction_soft_mode", True))
+        actions: list[str] = []
+        strong_short_counter = self._prediction_allows_countertrend(prediction, {"SHORT", "STRONG_SHORT"})
+        strong_long_counter = self._prediction_allows_countertrend(prediction, {"LONG", "STRONG_LONG"})
+        if regime in {MarketRegime.TREND_UP, MarketRegime.TREND_UP_PULLBACK} and position_side != "LONG":
+            if allow_sells and not strong_short_counter:
+                if soft_mode:
+                    actions.append("soft_keep_existing_trend_up_short_state")
+                else:
+                    allow_sells = False
+                    context["prediction_filtered_sell"] = True
+                    actions.append("block_short_without_strong_short_prediction")
+            elif not allow_sells and strong_short_counter and position_side == "FLAT":
+                allow_sells = True
+                actions.append("allow_short_on_strong_short_prediction")
+        if regime in {MarketRegime.TREND_DOWN, MarketRegime.TREND_DOWN_PULLBACK} and position_side != "SHORT":
+            if allow_buys and not strong_long_counter:
+                if soft_mode:
+                    actions.append("soft_keep_existing_trend_down_long_state")
+                else:
+                    allow_buys = False
+                    context["prediction_filtered_buy"] = True
+                    actions.append("block_long_without_strong_long_prediction")
+            elif not allow_buys and strong_long_counter and position_side == "FLAT":
+                allow_buys = True
+                actions.append("allow_long_on_strong_long_prediction")
+
+        if soft_mode and position_side == "FLAT" and not force_reduce_only and not allow_buys and not allow_sells:
+            allow_buys = bool(context["allow_buys"])
+            allow_sells = bool(context["allow_sells"])
+            actions.append("soft_mode_fail_open_keep_allowed_sides")
+
+        context.update({
+            "allow_buys": allow_buys,
+            "allow_sells": allow_sells,
+            "prediction_entry_action": ",".join(actions) if actions else "none",
+        })
+        return context
+
+    def _apply_prediction_grid_bias(
+        self,
+        plan: GridPlan,
+        *,
+        price: float,
+        prediction: PredictionResult,
+        position_side: str,
+        max_one_side_notional: float,
+    ) -> dict:
+        context = {
+            "prediction_grid_action": "none",
+            "prediction_long_size_multiplier": 1.0,
+            "prediction_short_size_multiplier": 1.0,
+            "prediction_long_levels_before": len(plan.long_levels),
+            "prediction_short_levels_before": len(plan.short_levels),
+            "prediction_long_levels_after": len(plan.long_levels),
+            "prediction_short_levels_after": len(plan.short_levels),
+        }
+        if not prediction.available or plan.regime != MarketRegime.RANGE or position_side != "FLAT":
+            if not prediction.available:
+                context["prediction_grid_action"] = "fallback_existing_strategy"
+            return context
+        if prediction.prediction_bias not in {"LONG", "STRONG_LONG", "SHORT", "STRONG_SHORT"}:
+            return context
+
+        max_bias_pct = min(max(float(getattr(self.config, "prediction_max_level_bias_pct", 0.5)), 0.0), 1.0)
+        confidence = min(max(prediction.confidence_score, 0.0), 1.0)
+        level_reduction_pct = min(max_bias_pct * confidence, max_bias_pct)
+        max_size_multiplier = max(float(getattr(self.config, "prediction_max_size_multiplier", 1.25)), 1.0)
+        min_size_multiplier = min(max(float(getattr(self.config, "prediction_min_size_multiplier", 0.75)), 0.0), 1.0)
+        favored_multiplier = min(1.0 + (max_size_multiplier - 1.0) * confidence, max_size_multiplier)
+        reduced_multiplier = max(1.0 - (1.0 - min_size_multiplier) * confidence, min_size_multiplier)
+
+        bullish = prediction.prediction_bias in {"LONG", "STRONG_LONG"}
+        favored_levels = plan.long_levels if bullish else plan.short_levels
+        reduced_levels = plan.short_levels if bullish else plan.long_levels
+        if reduced_levels and level_reduction_pct > 0:
+            keep = max(1, int(round(len(reduced_levels) * (1.0 - level_reduction_pct))))
+            del reduced_levels[keep:]
+
+        favored_notional = sum(level.price * level.size for level in favored_levels)
+        if favored_notional > 0:
+            favored_multiplier = min(favored_multiplier, max_one_side_notional / max(favored_notional, 1e-9))
+        favored_multiplier = max(1.0, favored_multiplier)
+        max_size_by_notional = self.config.max_notional_per_trade_usd / max(price, 1e-9)
+        max_size = max(0.0, min(float(self.config.max_order_size), max_size_by_notional))
+        for level in favored_levels:
+            level.size = min(max(level.size * favored_multiplier, 0.0), max_size)
+        for level in reduced_levels:
+            level.size = min(max(level.size * reduced_multiplier, 0.0), max_size)
+
+        context.update({
+            "prediction_grid_action": "range_long_bias" if bullish else "range_short_bias",
+            "prediction_long_size_multiplier": favored_multiplier if bullish else reduced_multiplier,
+            "prediction_short_size_multiplier": reduced_multiplier if bullish else favored_multiplier,
+            "prediction_long_levels_after": len(plan.long_levels),
+            "prediction_short_levels_after": len(plan.short_levels),
+        })
+        logger.info(
+            "prediction_grid_bias action=%s bias=%s confidence=%.4f long_levels_before=%s short_levels_before=%s long_levels_after=%s short_levels_after=%s long_size_multiplier=%.3f short_size_multiplier=%.3f",
+            context["prediction_grid_action"],
+            prediction.prediction_bias,
+            prediction.confidence_score,
+            context["prediction_long_levels_before"],
+            context["prediction_short_levels_before"],
+            context["prediction_long_levels_after"],
+            context["prediction_short_levels_after"],
+            context["prediction_long_size_multiplier"],
+            context["prediction_short_size_multiplier"],
+        )
+        return context
 
     def _entry_edge_score(self, spacing_pct: float, fee_rate: float) -> float:
         roundtrip_fee_pct = max(fee_rate * 2.0, 1e-9)

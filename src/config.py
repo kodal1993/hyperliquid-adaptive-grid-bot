@@ -130,6 +130,12 @@ class BotConfig:
     orderbook_max_level_reduction_pct: float
     orderbook_max_age_seconds: float
     orderbook_counter_edge_score: float
+    prediction_layer_enabled: bool
+    prediction_soft_mode: bool
+    prediction_confidence_threshold: float
+    prediction_max_level_bias_pct: float
+    prediction_max_size_multiplier: float
+    prediction_min_size_multiplier: float
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -274,4 +280,10 @@ class BotConfig:
             orderbook_max_level_reduction_pct=float(os.getenv("ORDERBOOK_MAX_LEVEL_REDUCTION_PCT", "0.5")),
             orderbook_max_age_seconds=float(os.getenv("ORDERBOOK_MAX_AGE_SECONDS", "5")),
             orderbook_counter_edge_score=float(os.getenv("ORDERBOOK_COUNTER_EDGE_SCORE", os.getenv("COUNTER_TREND_ENTRY_EDGE_SCORE", "1.25"))),
+            prediction_layer_enabled=os.getenv("PREDICTION_LAYER_ENABLED", "true").lower() == "true",
+            prediction_soft_mode=os.getenv("PREDICTION_SOFT_MODE", "true").lower() == "true",
+            prediction_confidence_threshold=float(os.getenv("PREDICTION_CONFIDENCE_THRESHOLD", "0.65")),
+            prediction_max_level_bias_pct=float(os.getenv("PREDICTION_MAX_LEVEL_BIAS_PCT", "0.5")),
+            prediction_max_size_multiplier=float(os.getenv("PREDICTION_MAX_SIZE_MULTIPLIER", "1.25")),
+            prediction_min_size_multiplier=float(os.getenv("PREDICTION_MIN_SIZE_MULTIPLIER", "0.75")),
         )
