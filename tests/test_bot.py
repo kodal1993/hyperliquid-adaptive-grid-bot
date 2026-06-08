@@ -1955,7 +1955,7 @@ def test_daily_pnl_baseline_calculation_is_equity_based():
     assert metrics["daily_pnl_pct"] < 0.61
 
 
-def test_minimum_expected_edge_filter_blocks_fee_dominated_entries(tmp_path, monkeypatch):
+def test_minimum_expected_edge_filter_fails_open_for_flat_entries(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MIN_EXPECTED_NET_EDGE_USD", "999")
     cfg = BotConfig.from_env()
@@ -1965,9 +1965,9 @@ def test_minimum_expected_edge_filter_blocks_fee_dominated_entries(tmp_path, mon
 
     edge = orchestrator._apply_minimum_expected_edge_filter(plan, mid_price=100, position_size=0.0)
 
-    assert edge["edge_filter_skipped_orders"] == 4
-    assert len(plan.long_levels) == 0
-    assert len(plan.short_levels) == 0
+    assert edge["edge_filter_skipped_orders"] == 0
+    assert len(plan.long_levels) == 2
+    assert len(plan.short_levels) == 2
     assert edge["expected_net_edge"] is not None
 
 
@@ -2607,7 +2607,9 @@ def test_anti_chop_logs_and_expires_correctly(tmp_path, monkeypatch, caplog):
         active_status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
 
     assert active_status["anti_chop_cooldown_active"] is True
-    assert active_status["final_orders_to_submit"] == 0
+    assert active_status["final_orders_to_submit"] >= 2
+    assert active_status["orders"]["placed"] >= 2
+    assert "anti_chop_flat_fail_open_override" in caplog.text
     assert "anti_chop_active" in caplog.text
 
     caplog.clear()
@@ -2615,4 +2617,5 @@ def test_anti_chop_logs_and_expires_correctly(tmp_path, monkeypatch, caplog):
     expired_status = orch.on_tick(_flat_candles(), equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
 
     assert expired_status["anti_chop_cooldown_active"] is False
-    assert expired_status["orders"]["placed"] >= 2
+    assert expired_status["final_orders_to_submit"] >= 2
+    assert {o["side"] for o in eng.open_orders} == {"buy", "sell"}

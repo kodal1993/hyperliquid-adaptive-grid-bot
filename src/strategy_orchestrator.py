@@ -269,9 +269,18 @@ class StrategyOrchestrator:
         flip_cooldown_active = self.trend_flip_cooldown_remaining > 0
         if flip_cooldown_active and not force_reduce_only:
             if effective_position_side == "FLAT":
-                allow_buys = False
-                allow_sells = False
+                # Emergency flat fail-open: the trend-flip cooldown is allowed to
+                # delay adding to an existing wrong-way position, but it must not
+                # leave a live, risk-OK service flat with no replacement grid.
                 self.trend_flip_cooldown_remaining -= 1
+                logger.critical(
+                    "trend_flip_cooldown_flat_fail_open_override regime=%s mode=%s allow_buys=%s allow_sells=%s cooldown_remaining_after=%s",
+                    regime.value,
+                    mode.value,
+                    allow_buys,
+                    allow_sells,
+                    self.trend_flip_cooldown_remaining,
+                )
             elif regime in {MarketRegime.TREND_UP, MarketRegime.TREND_UP_PULLBACK} and effective_position_side == "SHORT":
                 allow_buys = True
                 allow_sells = False
@@ -282,7 +291,15 @@ class StrategyOrchestrator:
                 self.trend_flip_cooldown_remaining = max(self.trend_flip_cooldown_remaining - 1, 0)
 
         if regime == MarketRegime.RANGE and not force_reduce_only and regime_signal.transition_confidence >= 0.55:
-            if regime_signal.transition_direction == "UP":
+            if effective_position_side == "FLAT":
+                logger.critical(
+                    "range_transition_flat_fail_open_override transition_direction=%s transition_confidence=%.3f allow_buys=%s allow_sells=%s",
+                    regime_signal.transition_direction,
+                    regime_signal.transition_confidence,
+                    allow_buys,
+                    allow_sells,
+                )
+            elif regime_signal.transition_direction == "UP":
                 allow_sells = effective_position_side == "LONG"
             elif regime_signal.transition_direction == "DOWN":
                 allow_buys = effective_position_side == "SHORT"
@@ -741,6 +758,83 @@ class StrategyOrchestrator:
             )
         if not no_grid_orders_generated_reason and final_orders_to_submit <= 0:
             no_grid_orders_generated_reason = "final_order_plan_empty"
+        if neutral_entries_blocked:
+            cycle_pause_reason = "neutral_entries_blocked_in_trend"
+        elif not risk_state.can_trade:
+            cycle_pause_reason = risk_state.reason or "risk_blocked"
+        else:
+            cycle_pause_reason = "none"
+        final_skip_reason = no_grid_orders_generated_reason or "none"
+        risk_state_label = "OK" if risk_state.can_trade else "BLOCKED"
+        if effective_position_side == "FLAT":
+            logger.info(
+                "FLAT_STATE_CHECK risk_state=%s pause_reason=%s regime=%s mode=%s allow_buys=%s allow_sells=%s candidate_orders_before_filters=%s after_min_notional=%s after_net_profit_filter=%s after_dust_filter=%s after_anti_chop=%s final_order_count=%s final_skip_reason=%s blocking_conditions=%s",
+                risk_state_label,
+                cycle_pause_reason,
+                regime.value,
+                mode.value,
+                allow_buys,
+                allow_sells,
+                raw_grid_orders,
+                after_min_notional,
+                after_net_profit_filter,
+                after_dust_filter,
+                after_anti_chop,
+                final_orders_to_submit,
+                final_skip_reason,
+                {
+                    "risk_can_trade": risk_state.can_trade,
+                    "risk_reason": risk_state.reason or "none",
+                    "neutral_entries_blocked": neutral_entries_blocked,
+                    "force_reduce_only": force_reduce_only,
+                    "flip_cooldown_active": flip_cooldown_active,
+                    "trend_flip_cooldown_remaining": self.trend_flip_cooldown_remaining,
+                    "market_stress_opportunity_mode": market_stress.opportunity_mode.value,
+                    "market_stress_reason": market_stress.reason,
+                    "anti_chop_cooldown_active": anti_chop_context.get("anti_chop_cooldown_active", False),
+                    "counter_trend_entry_filter_reason": entry_filter_context.get("counter_trend_entry_filter_reason", ""),
+                    "edge_filter_skipped_by_reason": edge_context.get("edge_filter_skipped_by_reason", {}),
+                    "order_notional": order_notional,
+                    "min_order_notional_usd": min_order_notional_usd,
+                    "effective_grid_levels": effective_grid_levels,
+                    "reduction_reason": reduction_reason,
+                    "build_allow_buys": build_allow_buys,
+                    "build_allow_sells": build_allow_sells,
+                    "should_regrid": plan.should_regrid,
+                    "trading_enabled": bool(getattr(self.config, "enable_live_trading", True)),
+                },
+            )
+            if risk_state.can_trade and cycle_pause_reason == "none" and final_orders_to_submit == 0:
+                logger.critical(
+                    "NO_ORDERS_GENERATED_WHILE_FLAT risk_state=%s pause_reason=%s regime=%s mode=%s allow_buys=%s allow_sells=%s candidate_orders_before_filters=%s after_min_notional=%s after_net_profit_filter=%s after_dust_filter=%s after_anti_chop=%s final_order_count=%s final_skip_reason=%s blocking_conditions=%s",
+                    risk_state_label,
+                    cycle_pause_reason,
+                    regime.value,
+                    mode.value,
+                    allow_buys,
+                    allow_sells,
+                    raw_grid_orders,
+                    after_min_notional,
+                    after_net_profit_filter,
+                    after_dust_filter,
+                    after_anti_chop,
+                    final_orders_to_submit,
+                    final_skip_reason,
+                    {
+                        "risk_reason": risk_state.reason or "none",
+                        "neutral_entries_blocked": neutral_entries_blocked,
+                        "force_reduce_only": force_reduce_only,
+                        "flip_cooldown_active": flip_cooldown_active,
+                        "market_stress_opportunity_mode": market_stress.opportunity_mode.value,
+                        "anti_chop_cooldown_active": anti_chop_context.get("anti_chop_cooldown_active", False),
+                        "edge_filter_skipped_by_reason": edge_context.get("edge_filter_skipped_by_reason", {}),
+                        "order_notional": order_notional,
+                        "min_order_notional_usd": min_order_notional_usd,
+                        "effective_grid_levels": effective_grid_levels,
+                        "reduction_reason": reduction_reason,
+                        "should_regrid": plan.should_regrid,
+                    },
+                )
         if (
             effective_position_side == "FLAT"
             and risk_state.can_trade
@@ -777,7 +871,7 @@ class StrategyOrchestrator:
             after_net_profit_filter,
             after_anti_chop,
             final_orders_to_submit,
-            no_grid_orders_generated_reason or "none",
+            final_skip_reason,
         )
         level_decision_context = {
             "configured_levels": configured_levels,
@@ -968,7 +1062,23 @@ class StrategyOrchestrator:
             estimate.update({"side": order.side, "price": order.price, "size": order.size, "exposure_action": action})
             block_reason = ""
             if action == "increasing":
-                if estimate["expected_net_edge"] <= 0:
+                if abs(position_size) < 1e-12:
+                    # Temporary emergency disable for the offending flat-entry edge
+                    # filter: fee/edge gates may rank entries, but must not erase
+                    # every opening grid level while the account is flat and risk OK.
+                    logger.critical(
+                        "flat_entry_edge_filter_fail_open side=%s price=%s size=%s expected_net_edge=%.6f expected_net_edge_pct=%.6f rr_ratio=%.3f min_expected_net_edge_usd=%.6f min_expected_net_edge_pct=%.6f min_rr_ratio=%.3f",
+                        order.side,
+                        order.price,
+                        order.size,
+                        estimate["expected_net_edge"],
+                        estimate["expected_net_edge_pct"],
+                        estimate["rr_ratio"],
+                        min_edge_usd,
+                        min_edge_pct,
+                        min_rr,
+                    )
+                elif estimate["expected_net_edge"] <= 0:
                     block_reason = "non_positive_expected_net_edge"
                 elif estimate["expected_net_edge"] < min_edge_usd:
                     block_reason = "below_min_expected_net_edge_usd"
@@ -1101,8 +1211,12 @@ class StrategyOrchestrator:
             original_allow_buys = allow_buys
             original_allow_sells = allow_sells
             if position_side == "FLAT":
-                allow_buys = False
-                allow_sells = False
+                logger.critical(
+                    "anti_chop_flat_fail_open_override original_allow_buys=%s original_allow_sells=%s cooldown_until=%s",
+                    original_allow_buys,
+                    original_allow_sells,
+                    self.anti_chop_cooldown_until.isoformat() if self.anti_chop_cooldown_until else "",
+                )
             elif position_side == "LONG":
                 allow_buys = False
             elif position_side == "SHORT":
