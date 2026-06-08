@@ -651,6 +651,8 @@ class StrategyOrchestrator:
         }
 
         min_order_notional_usd = max(float(getattr(self.config, "min_order_notional_usd", self.config.min_notional_usd)), 0.0)
+        allow_buys_before_min_notional = allow_buys
+        allow_sells_before_min_notional = allow_sells
         if order_notional + 1e-9 < min_order_notional_usd:
             blocked_sides = []
             if allow_buys and effective_position_side != "SHORT":
@@ -705,8 +707,15 @@ class StrategyOrchestrator:
             logger.warning("no_new_order_placed reason=max_exposure_too_small_for_min_order order_notional=%.4f threshold=%.4f", order_notional, threshold)
         elif not build_allow_buys and not build_allow_sells:
             no_grid_orders_generated_reason = "no_allowed_sides"
+        raw_buy_levels, raw_sell_levels = self.grid_manager._level_counts(max(effective_grid_levels, 1), mode, trend_bias=trend_bias)
+        raw_grid_orders = (raw_buy_levels if allow_buys_before_min_notional else 0) + (raw_sell_levels if allow_sells_before_min_notional else 0)
         plan: GridPlan = self.grid_manager.build_grid(price, max(effective_grid_levels, 1), final_spacing_pct, 0.0, regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=build_allow_buys, allow_sells=build_allow_sells, force_recenter=force_recenter, spacing_source=spacing_source, atr_pct=atr_pct, trend_bias=trend_bias, regime_confidence=regime_confidence)
+        after_min_notional = len(plan.long_levels) + len(plan.short_levels)
+        after_dust_filter = after_min_notional
+        after_anti_chop = after_min_notional
         edge_context = self._apply_minimum_expected_edge_filter(plan, mid_price=price, position_size=effective_position_size, avg_entry=avg_entry)
+        after_net_profit_filter = len(plan.long_levels) + len(plan.short_levels)
+        final_orders_to_submit = after_net_profit_filter
         if not plan.long_levels and not plan.short_levels:
             if edge_context.get("edge_filter_skipped_orders"):
                 no_grid_orders_generated_reason = "edge_filter_removed_all_orders"
@@ -730,6 +739,46 @@ class StrategyOrchestrator:
                 edge_context.get("edge_filter_skipped_orders", 0),
                 edge_context.get("edge_filter_skipped_by_reason", {}),
             )
+        if not no_grid_orders_generated_reason and final_orders_to_submit <= 0:
+            no_grid_orders_generated_reason = "final_order_plan_empty"
+        if (
+            effective_position_side == "FLAT"
+            and risk_state.can_trade
+            and not neutral_entries_blocked
+            and (allow_buys or allow_sells)
+            and order_notional + 1e-9 >= min_order_notional_usd
+            and final_orders_to_submit <= 0
+        ):
+            logger.warning(
+                "flat_fail_open_violation symbol=%s regime=%s mode=%s price=%.4f allow_buys=%s allow_sells=%s order_notional=%.4f min_order_notional_usd=%.4f skip_reason=%s",
+                symbol,
+                regime.value,
+                mode.value,
+                price,
+                allow_buys,
+                allow_sells,
+                order_notional,
+                min_order_notional_usd,
+                no_grid_orders_generated_reason or "unknown",
+            )
+        logger.info(
+            "order_pipeline_summary symbol=%s regime=%s mode=%s price=%.4f position_side=%s position_notional=%.4f allow_buys=%s allow_sells=%s raw_grid_orders=%s after_min_notional=%s after_dust_filter=%s after_net_profit_filter=%s after_anti_chop=%s final_orders_to_submit=%s skip_reason=%s",
+            symbol,
+            regime.value,
+            mode.value,
+            price,
+            effective_position_side,
+            effective_position_notional,
+            allow_buys,
+            allow_sells,
+            raw_grid_orders,
+            after_min_notional,
+            after_dust_filter,
+            after_net_profit_filter,
+            after_anti_chop,
+            final_orders_to_submit,
+            no_grid_orders_generated_reason or "none",
+        )
         level_decision_context = {
             "configured_levels": configured_levels,
             "volatility_grid_levels": volatility_grid_levels,
@@ -739,6 +788,13 @@ class StrategyOrchestrator:
             "reduction_reason": reduction_reason,
             "no_grid_orders_generated_reason": no_grid_orders_generated_reason,
             "min_notional_blocked_count": self.min_notional_blocked_count,
+            "raw_grid_orders": raw_grid_orders,
+            "after_min_notional": after_min_notional,
+            "after_dust_filter": after_dust_filter,
+            "after_net_profit_filter": after_net_profit_filter,
+            "after_anti_chop": after_anti_chop,
+            "final_orders_to_submit": final_orders_to_submit,
+            "skip_reason": no_grid_orders_generated_reason or "none",
             "anti_chop_trigger_count": self.anti_chop_trigger_count,
             **anti_chop_context,
         }
@@ -880,12 +936,14 @@ class StrategyOrchestrator:
 
 
     def _apply_minimum_expected_edge_filter(self, plan: GridPlan, *, mid_price: float, position_size: float, avg_entry: float = 0.0) -> dict:
-        """Remove exposure-building grid orders whose expected net edge cannot pay fees.
+        """Remove only orders that are unsafe after the fee/profitability checks.
 
-        Expected edge is evaluated as a round-trip grid capture: the distance from
-        the candidate entry price back to the current grid center, minus estimated
-        entry and exit fees. Exposure-reducing orders are never blocked by this
-        profitability filter because exits are risk-management actions.
+        Opening grid entries must remain fail-open while flat.  The minimum net
+        profit fee-multiple guard is a closing/profit-taking guard; applying it
+        to normal opening grid entries can remove every level in live trading.
+        Exposure-reducing/flatting/flip orders are checked against the realized
+        entry price when available, because those are the orders that should
+        prove enough expected net profit after fees.
         """
         estimates: list[dict] = []
         kept_long = []
@@ -909,15 +967,13 @@ class StrategyOrchestrator:
             )
             estimate.update({"side": order.side, "price": order.price, "size": order.size, "exposure_action": action})
             block_reason = ""
-            if action not in {"reducing", "flat"}:
+            if action == "increasing":
                 if estimate["expected_net_edge"] <= 0:
                     block_reason = "non_positive_expected_net_edge"
                 elif estimate["expected_net_edge"] < min_edge_usd:
                     block_reason = "below_min_expected_net_edge_usd"
                 elif estimate["expected_net_edge_pct"] < min_edge_pct:
                     block_reason = "below_min_expected_net_edge_pct"
-                elif estimate["expected_net_edge"] <= estimate["expected_fee_cost"] * min_net_fee_multiple:
-                    block_reason = "below_min_expected_net_profit_fee_multiple"
                 elif estimate["rr_ratio"] < min_rr:
                     block_reason = "below_min_rr_ratio"
             elif avg_entry > 0:
@@ -1042,6 +1098,8 @@ class StrategyOrchestrator:
                 )
         cooldown_active = self.anti_chop_cooldown_until is not None and now < self.anti_chop_cooldown_until
         if cooldown_active:
+            original_allow_buys = allow_buys
+            original_allow_sells = allow_sells
             if position_side == "FLAT":
                 allow_buys = False
                 allow_sells = False
@@ -1049,6 +1107,15 @@ class StrategyOrchestrator:
                 allow_buys = False
             elif position_side == "SHORT":
                 allow_sells = False
+            logger.warning(
+                "anti_chop_active position_side=%s original_allow_buys=%s original_allow_sells=%s allow_buys=%s allow_sells=%s cooldown_until=%s pause_scope=exposure_increasing_entries_only",
+                position_side,
+                original_allow_buys,
+                original_allow_sells,
+                allow_buys,
+                allow_sells,
+                self.anti_chop_cooldown_until.isoformat() if self.anti_chop_cooldown_until else "",
+            )
         return {
             "allow_buys": allow_buys,
             "allow_sells": allow_sells,
