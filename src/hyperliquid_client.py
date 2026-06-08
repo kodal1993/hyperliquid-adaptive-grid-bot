@@ -193,6 +193,17 @@ class HyperliquidClient:
             }
         )
 
+
+    def get_l2_book(self, symbol: str) -> dict[str, Any]:
+        if self.info is not None:
+            try:
+                return self._retry_hyperliquid_api(
+                    "Info.l2_snapshot", lambda: self.info.l2_snapshot(symbol)
+                )
+            except Exception:
+                pass
+        return self._post_info({"type": "l2Book", "coin": symbol})
+
     def _interval_minutes(self, interval: str) -> int:
         if interval.endswith("m"):
             return max(1, int(interval[:-1]))
