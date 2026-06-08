@@ -57,6 +57,8 @@ class TelegramHandler:
         next_exit_side = (report.get("next_exit_side") or "n/a").upper()
         next_exit_price = money(report.get("next_exit_price"))
         dust_one_sided_warning = bool(report.get("one_sided_grid_due_to_dust", False))
+        raw_prediction_bias = str(report.get("prediction_bias", "NEUTRAL") or "NEUTRAL").upper()
+        prediction_label = "LONG" if "LONG" in raw_prediction_bias else ("SHORT" if "SHORT" in raw_prediction_bias else "NEUTRAL")
 
         human = "A bot aktív, de várakozik, mert az ár nem érte el a grid szinteket."
         if pause_reason in {"neutral_blocked_in_trend", "neutral_entries_blocked_in_trend"}:
@@ -105,6 +107,11 @@ class TelegramHandler:
             f"Soft mode: {'on' if report.get('orderbook_soft_mode', True) else 'off'}",
             f"Pressure: {num(report.get('orderbook_pressure_score'), 2)}",
             f"Decision: {report.get('orderbook_decision') or 'none'}",
+            "",
+            "Prediction:",
+            f"Prediction: {prediction_label}",
+            f"Confidence: {num(report.get('confidence_score'), 2)}",
+            f"Bull/Bear/Neutral: {num(report.get('bullish_probability'), 2)} / {num(report.get('bearish_probability'), 2)} / {num(report.get('neutral_probability'), 2)}",
             "",
             "Account:",
             f"Equity: {money(report.get('equity'))}",

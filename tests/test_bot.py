@@ -570,6 +570,22 @@ def test_telegram_fill_alert_buy_and_sell_formats():
     assert "Position after: SHORT" in sell_msg
 
 
+
+
+def test_telegram_report_formatter_prediction_fields():
+    tg = TelegramHandler("", "")
+    msg = tg.format_status_report({
+        "prediction_bias": "STRONG_LONG",
+        "confidence_score": 0.72,
+        "bullish_probability": 0.61,
+        "bearish_probability": 0.14,
+        "neutral_probability": 0.25,
+    })
+    assert "Prediction:" in msg
+    assert "Prediction: LONG" in msg
+    assert "Confidence: 0.72" in msg
+    assert "Bull/Bear/Neutral: 0.61 / 0.14 / 0.25" in msg
+
 def test_last_valid_trade_ignores_invalid_btc_prices(tmp_path):
     from src.main import _read_last_valid_trade
     p = tmp_path / "trades.csv"
@@ -2857,3 +2873,166 @@ def test_orderbook_hard_mode_disabled_by_default(monkeypatch):
 
     assert cfg.orderbook_filter_enabled is True
     assert cfg.orderbook_soft_mode is True
+
+from src.prediction_layer import PredictionLayer, PredictionResult
+
+
+def _prediction_result(bias="NEUTRAL", confidence=0.0, score=0.0, available=True):
+    return PredictionResult(
+        available=available,
+        directional_score=score,
+        bullish_probability=0.5 if score > 0 else 0.2,
+        bearish_probability=0.5 if score < 0 else 0.2,
+        neutral_probability=0.3,
+        confidence_score=confidence,
+        prediction_bias=bias,
+        contributing_signals={"momentum_score": score},
+        fallback_reason="" if available else "test_unavailable",
+    )
+
+
+def test_prediction_layer_weighted_scoring_outputs_probabilities():
+    layer = PredictionLayer()
+    candles = pd.DataFrame({
+        "close": [100 + i * 0.2 for i in range(60)],
+        "high": [101 + i * 0.2 for i in range(60)],
+        "low": [99 + i * 0.2 for i in range(60)],
+        "volume": [100 + i for i in range(60)],
+    })
+    signal = RegimeSignal(
+        MarketRegime.TREND_UP,
+        0.8,
+        0.004,
+        0.002,
+        0.01,
+        0.004,
+        0.003,
+        momentum_score=0.8,
+        ema_slope_acceleration_score=0.7,
+    )
+
+    prediction = layer.predict(
+        candles=candles,
+        regime=MarketRegime.TREND_UP,
+        regime_confidence=0.8,
+        regime_signal=signal,
+        orderbook={"available": True, "stale": False, "pressure_score": 0.8},
+        ema_slope_threshold_pct=0.003,
+    )
+
+    assert prediction.available is True
+    assert prediction.directional_score > 0
+    assert prediction.bullish_probability > prediction.bearish_probability
+    assert prediction.prediction_bias in {"LONG", "STRONG_LONG"}
+    assert pytest.approx(prediction.bullish_probability + prediction.bearish_probability + prediction.neutral_probability) == 1.0
+
+
+def test_prediction_unavailable_strategy_unchanged(tmp_path):
+    cfg = BotConfig.from_env()
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "pred_unavailable.json", paper_mode=True, enable_live_trading=False))
+    unavailable = _prediction_result(available=False)
+
+    entry = orch._apply_prediction_entry_filter(
+        allow_buys=True,
+        allow_sells=True,
+        position_side="FLAT",
+        regime=MarketRegime.TREND_UP,
+        prediction=unavailable,
+        force_reduce_only=False,
+    )
+    plan = GridManager().build_grid(100, 4, 0.01, 0.0, MarketRegime.RANGE, 1.0, 0.0, 0.0, GridMode.NEUTRAL)
+    before = (len(plan.long_levels), len(plan.short_levels), [lvl.size for lvl in plan.long_levels], [lvl.size for lvl in plan.short_levels])
+    grid = orch._apply_prediction_grid_bias(plan, price=100, prediction=unavailable, position_side="FLAT", max_one_side_notional=1000)
+    after = (len(plan.long_levels), len(plan.short_levels), [lvl.size for lvl in plan.long_levels], [lvl.size for lvl in plan.short_levels])
+
+    assert entry["allow_buys"] is True
+    assert entry["allow_sells"] is True
+    assert entry["prediction_entry_action"] == "fallback_existing_strategy"
+    assert before == after
+    assert grid["prediction_grid_action"] == "fallback_existing_strategy"
+
+
+def test_range_long_prediction_keeps_both_sides_and_biases_long(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.prediction_max_level_bias_pct = 0.5
+    cfg.prediction_max_size_multiplier = 1.25
+    cfg.prediction_min_size_multiplier = 0.75
+    cfg.max_order_size = 10
+    cfg.max_notional_per_trade_usd = 1000
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "pred_range_long.json", paper_mode=True, enable_live_trading=False))
+    plan = GridManager().build_grid(100, 4, 0.01, 0.0, MarketRegime.RANGE, 1.0, 0.0, 0.0, GridMode.NEUTRAL)
+
+    context = orch._apply_prediction_grid_bias(plan, price=100, prediction=_prediction_result("LONG", 0.8, 0.4), position_side="FLAT", max_one_side_notional=1000)
+
+    assert len(plan.long_levels) > 0
+    assert len(plan.short_levels) > 0
+    assert len(plan.long_levels) == 4
+    assert len(plan.short_levels) < 4
+    assert plan.long_levels[0].size > 1.0
+    assert plan.short_levels[0].size < 1.0
+    assert context["prediction_grid_action"] == "range_long_bias"
+
+
+def test_range_short_prediction_keeps_both_sides_and_biases_short(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.max_order_size = 10
+    cfg.max_notional_per_trade_usd = 1000
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "pred_range_short.json", paper_mode=True, enable_live_trading=False))
+    plan = GridManager().build_grid(100, 4, 0.01, 0.0, MarketRegime.RANGE, 1.0, 0.0, 0.0, GridMode.NEUTRAL)
+
+    context = orch._apply_prediction_grid_bias(plan, price=100, prediction=_prediction_result("SHORT", 0.8, -0.4), position_side="FLAT", max_one_side_notional=1000)
+
+    assert len(plan.long_levels) > 0
+    assert len(plan.short_levels) > 0
+    assert len(plan.short_levels) == 4
+    assert len(plan.long_levels) < 4
+    assert plan.short_levels[0].size > 1.0
+    assert plan.long_levels[0].size < 1.0
+    assert context["prediction_grid_action"] == "range_short_bias"
+
+
+def test_trend_up_does_not_allow_shorts_unless_strong_short_prediction(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.prediction_soft_mode = False
+    cfg.prediction_confidence_threshold = 0.65
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "pred_trend_up.json", paper_mode=True, enable_live_trading=False))
+
+    weak = orch._apply_prediction_entry_filter(allow_buys=True, allow_sells=True, position_side="FLAT", regime=MarketRegime.TREND_UP, prediction=_prediction_result("SHORT", 0.65, -0.4), force_reduce_only=False)
+    strong = orch._apply_prediction_entry_filter(allow_buys=True, allow_sells=False, position_side="FLAT", regime=MarketRegime.TREND_UP, prediction=_prediction_result("STRONG_SHORT", 0.9, -0.8), force_reduce_only=False)
+
+    assert weak["allow_sells"] is False
+    assert strong["allow_sells"] is True
+
+
+def test_trend_down_does_not_allow_longs_unless_strong_long_prediction(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.prediction_soft_mode = False
+    cfg.prediction_confidence_threshold = 0.65
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "pred_trend_down.json", paper_mode=True, enable_live_trading=False))
+
+    weak = orch._apply_prediction_entry_filter(allow_buys=True, allow_sells=True, position_side="FLAT", regime=MarketRegime.TREND_DOWN, prediction=_prediction_result("LONG", 0.65, 0.4), force_reduce_only=False)
+    strong = orch._apply_prediction_entry_filter(allow_buys=False, allow_sells=True, position_side="FLAT", regime=MarketRegime.TREND_DOWN, prediction=_prediction_result("STRONG_LONG", 0.9, 0.8), force_reduce_only=False)
+
+    assert weak["allow_buys"] is False
+    assert strong["allow_buys"] is True
+
+
+def test_prediction_layer_cannot_produce_zero_order_flat_state(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.prediction_soft_mode = True
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "pred_no_zero.json", paper_mode=True, enable_live_trading=False))
+    entry = orch._apply_prediction_entry_filter(
+        allow_buys=False,
+        allow_sells=False,
+        position_side="FLAT",
+        regime=MarketRegime.TREND_UP,
+        prediction=_prediction_result("LONG", 0.9, 0.8),
+        force_reduce_only=False,
+    )
+    plan = GridManager().build_grid(100, 1, 0.01, 0.0, MarketRegime.RANGE, 1.0, 0.0, 0.0, GridMode.NEUTRAL)
+    orch._apply_prediction_grid_bias(plan, price=100, prediction=_prediction_result("STRONG_LONG", 1.0, 0.9), position_side="FLAT", max_one_side_notional=1000)
+
+    assert entry["allow_buys"] is False
+    assert entry["allow_sells"] is False
+    assert len(plan.long_levels) >= 1
+    assert len(plan.short_levels) >= 1
