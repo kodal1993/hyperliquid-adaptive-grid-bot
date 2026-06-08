@@ -102,6 +102,8 @@ class BotConfig:
     stale_position_max_hours: float
     min_residual_notional_usd: float
     dust_position_notional_usd: float
+    dust_cleanup_mode: str
+    dust_cleanup_cooldown_seconds: int
     auto_dust_cleanup_usd: float
     exclude_dust_from_performance_stats: bool
     no_fill_cycles_before_recenter: int
@@ -244,6 +246,8 @@ class BotConfig:
             stale_position_max_hours=float(os.getenv("STALE_POSITION_MAX_HOURS", "12")),
             min_residual_notional_usd=float(os.getenv("MIN_RESIDUAL_NOTIONAL_USD", "10")),
             dust_position_notional_usd=float(os.getenv("DUST_POSITION_NOTIONAL_USD", "2.0")),
+            dust_cleanup_mode=os.getenv("DUST_CLEANUP_MODE", "hold").strip().lower(),
+            dust_cleanup_cooldown_seconds=int(os.getenv("DUST_CLEANUP_COOLDOWN_SECONDS", "300")),
             auto_dust_cleanup_usd=float(os.getenv("AUTO_DUST_CLEANUP_USD", "5")),
             exclude_dust_from_performance_stats=os.getenv("EXCLUDE_DUST_FROM_PERFORMANCE_STATS", "true").lower() == "true",
             no_fill_cycles_before_recenter=int(os.getenv("NO_FILL_CYCLES_BEFORE_RECENTER", "360")),

@@ -26,6 +26,7 @@ class ExecutionEngineProtocol(Protocol):
     def cancel_all_orders(self, symbol: str): ...
     def flatten_position(self, symbol: str, mark_price: float): ...
     def place_reduce_only_orders(self, symbol: str, position_size: float, mark_price: float, order_size: float, levels: int = 3): ...
+    def ensure_reduce_only_close_order(self, symbol: str, position_size: float, mark_price: float, replace_threshold_pct: float = 0.0015): ...
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,8 @@ class StrategyOrchestrator:
         self.anti_chop_trigger_count = 0
         self.anti_chop_cooldown_until: datetime | None = None
         self._last_anti_chop_signature: tuple[float, ...] = ()
+        self.dust_cleanup_in_progress = False
+        self.last_dust_cleanup_ts: float | None = None
 
     def on_tick(self, candles: pd.DataFrame, equity: float, daily_pnl_pct: float, symbol: str, position_notional: float = 0.0, order_book_snapshot: dict | None = None) -> dict:
         regime_signal = self.detector.detect_signal(candles, trend_lookback_candles=self.config.trend_lookback_candles, trend_move_threshold_pct=self.config.trend_move_threshold_pct, ema_slope_threshold_pct=self.config.ema_slope_threshold_pct, trend_strength_threshold=self.config.trend_strength_threshold)
@@ -142,6 +145,16 @@ class StrategyOrchestrator:
             else:
                 neutral_entries_blocked = True
 
+        if self.dust_cleanup_in_progress and abs(pos_size) < 1e-12:
+            self.dust_cleanup_in_progress = False
+            logger.info(
+                "dust_cleanup_completed remaining_qty=%.8f remaining_notional=%.8f",
+                pos_size,
+                raw_position_notional,
+            )
+            dust_context["dust_cleanup_action"] = "completed"
+            dust_context["dust_cleanup_in_progress"] = False
+
         if is_dust_position:
             dust_cleanup_action = "hold_for_next_normal_reduce_only_close"
             logger.info(
@@ -152,6 +165,71 @@ class StrategyOrchestrator:
                 dust_threshold_usd,
             )
             dust_context["dust_cleanup_action"] = dust_cleanup_action
+
+            if str(getattr(self.config, "dust_cleanup_mode", "hold")).lower() == "reduce_only_once":
+                now_ts = time.time()
+                cooldown_seconds = max(int(getattr(self.config, "dust_cleanup_cooldown_seconds", 300)), 0)
+                seconds_since_cleanup = None if self.last_dust_cleanup_ts is None else now_ts - self.last_dust_cleanup_ts
+                cooldown_active = (
+                    not self.dust_cleanup_in_progress
+                    and self.last_dust_cleanup_ts is not None
+                    and seconds_since_cleanup is not None
+                    and seconds_since_cleanup < cooldown_seconds
+                )
+                dust_context.update({
+                    "dust_cleanup_mode": "reduce_only_once",
+                    "dust_cleanup_in_progress": self.dust_cleanup_in_progress,
+                    "dust_cleanup_cooldown_seconds": cooldown_seconds,
+                    "seconds_since_dust_cleanup": seconds_since_cleanup,
+                    "remaining_qty": pos_size,
+                    "remaining_notional": raw_position_notional,
+                    "reduce_only": True,
+                })
+                if cooldown_active:
+                    seconds_remaining = max(cooldown_seconds - float(seconds_since_cleanup or 0.0), 0.0)
+                    logger.info(
+                        "dust_cleanup_skipped_cooldown remaining_qty=%.8f remaining_notional=%.8f cooldown_seconds=%s seconds_remaining=%.1f reduce_only=true",
+                        pos_size,
+                        raw_position_notional,
+                        cooldown_seconds,
+                        seconds_remaining,
+                    )
+                    dust_context.update({"dust_cleanup_action": "skipped_cooldown", "dust_cleanup_cooldown_remaining_seconds": seconds_remaining})
+                    return {"status": "managing_position", "regime": regime.value, "risk": None, "mode": mode.value, "reason": "dust_cleanup_skipped_cooldown", "allowed_to_trade": False, "allowed_to_reduce": True, "state_source": account_state.state_source, **dust_context}
+
+                cleanup_result = self.execution_engine.ensure_reduce_only_close_order(symbol, pos_size, price, replace_threshold_pct=0.0015)
+                active_cleanup_orders = int(cleanup_result.get("active_cleanup_orders", 0) or 0)
+                self.dust_cleanup_in_progress = bool(cleanup_result.get("submitted") or active_cleanup_orders > 0)
+                if cleanup_result.get("submitted") or not self.dust_cleanup_in_progress:
+                    self.last_dust_cleanup_ts = now_ts
+                if cleanup_result.get("submitted"):
+                    logger.info(
+                        "dust_cleanup_submitted remaining_qty=%.8f remaining_notional=%.8f price=%s reduce_only=true canceled_orders=%s active_cleanup_orders=%s",
+                        pos_size,
+                        raw_position_notional,
+                        cleanup_result.get("price"),
+                        cleanup_result.get("canceled", 0),
+                        active_cleanup_orders,
+                    )
+                    dust_cleanup_action = "submitted"
+                else:
+                    logger.info(
+                        "dust_cleanup_in_progress remaining_qty=%.8f remaining_notional=%.8f active_cleanup_orders=%s price=%s reduce_only=true reason=%s price_moved=%s",
+                        pos_size,
+                        raw_position_notional,
+                        active_cleanup_orders,
+                        cleanup_result.get("price"),
+                        cleanup_result.get("reason"),
+                        cleanup_result.get("price_moved", False),
+                    )
+                    dust_cleanup_action = "in_progress"
+                dust_context.update({
+                    "dust_cleanup_action": dust_cleanup_action,
+                    "dust_cleanup_in_progress": self.dust_cleanup_in_progress,
+                    "dust_cleanup_result": cleanup_result,
+                    "active_dust_cleanup_orders": active_cleanup_orders,
+                })
+                return {"status": "managing_position", "regime": regime.value, "risk": None, "mode": mode.value, "reason": "dust_cleanup", "allowed_to_trade": False, "allowed_to_reduce": True, "state_source": account_state.state_source, **dust_context}
 
         trend_flip_detected = False
         if regime in {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN}:

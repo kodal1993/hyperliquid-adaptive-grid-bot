@@ -212,6 +212,41 @@ class PaperExecutionEngine:
             placed += 1
         return placed
 
+    def ensure_reduce_only_close_order(self, symbol: str, position_size: float, mark_price: float, replace_threshold_pct: float = 0.0015) -> dict[str, object]:
+        self._require_paper_execution("ensure_reduce_only_close_order")
+        side = "buy" if position_size < 0 else "sell"
+        remaining_qty = abs(position_size)
+        if remaining_qty < 1e-12:
+            return {"submitted": False, "active_cleanup_orders": 0, "canceled": 0, "reason": "flat"}
+        target_price = mark_price * 1.002 if side == "buy" else mark_price * 0.998
+        before = len(self.open_orders)
+        self.open_orders = [
+            o for o in self.open_orders
+            if o.get("symbol") != symbol or (bool(o.get("reduce_only", False)) and o.get("side") == side)
+        ]
+        canceled = before - len(self.open_orders)
+        active = [o for o in self.open_orders if o.get("symbol") == symbol and bool(o.get("reduce_only", False)) and o.get("side") == side]
+        keep = active[:1]
+        extra_ids = {id(o) for o in active[1:]}
+        if extra_ids:
+            self.open_orders = [o for o in self.open_orders if id(o) not in extra_ids]
+            canceled += len(extra_ids)
+        existing = keep[0] if keep else None
+        price_moved = False
+        size_changed = False
+        if existing is not None:
+            existing_price = float(existing.get("price", 0.0) or 0.0)
+            existing_size = float(existing.get("size", 0.0) or 0.0)
+            price_moved = abs(target_price - existing_price) / max(existing_price, 1e-9) > replace_threshold_pct
+            size_changed = abs(existing_size - remaining_qty) > 1e-12
+            if price_moved or size_changed:
+                self.open_orders = [o for o in self.open_orders if o is not existing]
+                canceled += 1
+            else:
+                return {"submitted": False, "active_cleanup_orders": 1, "canceled": canceled, "price": existing_price, "size": existing_size, "reason": "existing_order_kept", "price_moved": False}
+        self.open_orders.append({"symbol": symbol, "side": side, "price": target_price, "size": remaining_qty, "reduce_only": True, "dust_cleanup": True, "created_ts": time.time()})
+        return {"submitted": True, "active_cleanup_orders": 1, "canceled": canceled, "price": target_price, "size": remaining_qty, "reason": "submitted", "price_moved": price_moved, "size_changed": size_changed}
+
     def flatten_position(self, symbol: str, mark_price: float) -> bool:
         self._require_paper_execution("flatten_position")
         if abs(self.paper.position_size) < 1e-12:
@@ -716,6 +751,55 @@ class LiveExecutionEngine:
             remaining -= size
         self.sync_open_orders(symbol)
         return placed
+
+    def ensure_reduce_only_close_order(self, symbol: str, position_size: float, mark_price: float, replace_threshold_pct: float = 0.0015) -> dict[str, object]:
+        self.sync_account(symbol, mark_price)
+        live_position_size = self.state.position_size
+        side = "buy" if live_position_size < 0 else "sell"
+        remaining_qty = abs(live_position_size)
+        if remaining_qty < 1e-12:
+            return {"submitted": False, "active_cleanup_orders": 0, "canceled": 0, "reason": "flat"}
+        target_price = mark_price * 1.002 if side == "buy" else mark_price * 0.998
+        canceled = 0
+        active_cleanup: list[dict] = []
+        for order in list(self.open_orders):
+            if order.get("symbol") != symbol:
+                continue
+            is_close_side_reduce_only = bool(order.get("reduce_only", False)) and order.get("side") == side
+            oid = order.get("oid")
+            if not is_close_side_reduce_only:
+                if oid is not None:
+                    self.client.cancel_order(symbol, int(oid))
+                    canceled += 1
+            else:
+                active_cleanup.append(order)
+        active_cleanup.sort(key=lambda o: float(o.get("created_ts") or 0.0))
+        keep = active_cleanup[:1]
+        for order in active_cleanup[1:]:
+            oid = order.get("oid")
+            if oid is not None:
+                self.client.cancel_order(symbol, int(oid))
+                canceled += 1
+        existing = keep[0] if keep else None
+        price_moved = False
+        size_changed = False
+        if existing is not None:
+            existing_price = float(existing.get("price", 0.0) or 0.0)
+            existing_size = float(existing.get("size", 0.0) or 0.0)
+            price_moved = abs(target_price - existing_price) / max(existing_price, 1e-9) > replace_threshold_pct
+            size_changed = abs(existing_size - remaining_qty) > 1e-12
+            if price_moved or size_changed:
+                oid = existing.get("oid")
+                if oid is not None:
+                    self.client.cancel_order(symbol, int(oid))
+                    canceled += 1
+            else:
+                self.sync_open_orders(symbol)
+                return {"submitted": False, "active_cleanup_orders": 1, "canceled": canceled, "price": existing_price, "size": existing_size, "reason": "existing_order_kept", "price_moved": False}
+        submitted = self._submit_live_limit(symbol, side, remaining_qty, target_price, reduce_only=True)
+        self.sync_open_orders(symbol)
+        active_count = sum(1 for o in self.open_orders if o.get("symbol") == symbol and bool(o.get("reduce_only", False)) and o.get("side") == side)
+        return {"submitted": submitted, "active_cleanup_orders": active_count, "canceled": canceled, "price": target_price, "size": remaining_qty, "reason": "submitted" if submitted else "submit_failed", "price_moved": price_moved, "size_changed": size_changed}
 
     def flatten_position(self, symbol: str, mark_price: float) -> bool:
         self.sync_account(symbol, mark_price)

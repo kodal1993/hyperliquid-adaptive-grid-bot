@@ -1235,6 +1235,71 @@ def test_dust_position_is_held_for_next_normal_reduce_only_close(tmp_path):
     assert eng.state.position_size == pytest.approx(0.00003)
 
 
+def test_dust_cleanup_reduce_only_once_keeps_one_order_and_respects_replace_threshold(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.dust_cleanup_mode = "reduce_only_once"
+    cfg.dust_position_notional_usd = 2.0
+    cfg.dust_cleanup_cooldown_seconds = 300
+    cfg.allow_long_biased = False
+    cfg.allow_short_biased = False
+    eng = make_test_engine(tmp_path, "dust_reduce_once.json", paper_mode=True, enable_live_trading=False)
+    eng.paper.position_size = 0.00001
+    eng.open_orders = [
+        {"symbol": "BTC", "side": "buy", "price": 59000, "size": 0.001, "reduce_only": False},
+        {"symbol": "BTC", "side": "sell", "price": 60000, "size": 0.001, "reduce_only": False},
+    ]
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [60000.0 for _ in range(80)], "high": [60001.0 for _ in range(80)], "low": [59999.0 for _ in range(80)]})
+
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status["reason"] == "dust_cleanup"
+    assert status["dust_cleanup_action"] == "submitted"
+    assert status["dust_cleanup_in_progress"] is True
+    assert status["reduce_only"] is True
+    assert len(eng.open_orders) == 1
+    assert eng.open_orders[0]["reduce_only"] is True
+    assert eng.open_orders[0]["side"] == "sell"
+    assert eng.open_orders[0]["size"] == pytest.approx(0.00001)
+
+    status2 = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status2["dust_cleanup_action"] == "in_progress"
+    assert status2["active_dust_cleanup_orders"] == 1
+    assert len(eng.open_orders) == 1
+    assert eng.open_orders[0]["price"] == pytest.approx(60000.0 * 0.998)
+
+    moved_candles = pd.DataFrame({"close": [60100.0 for _ in range(80)], "high": [60101.0 for _ in range(80)], "low": [60099.0 for _ in range(80)]})
+    status3 = orch.on_tick(moved_candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status3["dust_cleanup_action"] == "submitted"
+    assert len(eng.open_orders) == 1
+    assert eng.open_orders[0]["price"] == pytest.approx(60100.0 * 0.998)
+
+    eng.paper.position_size = 0.0
+    status4 = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status4["dust_cleanup_in_progress"] is False
+    assert status4["is_dust_position"] is False
+
+
+def test_dust_cleanup_reduce_only_once_cooldown_prevents_resubmit(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.dust_cleanup_mode = "reduce_only_once"
+    cfg.dust_position_notional_usd = 2.0
+    cfg.dust_cleanup_cooldown_seconds = 300
+    eng = make_test_engine(tmp_path, "dust_cooldown.json", paper_mode=True, enable_live_trading=False)
+    eng.paper.position_size = 0.00001
+    orch = StrategyOrchestrator(cfg, eng)
+    orch.last_dust_cleanup_ts = time.time()
+    candles = pd.DataFrame({"close": [60000.0 for _ in range(80)], "high": [60001.0 for _ in range(80)], "low": [59999.0 for _ in range(80)]})
+
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status["reason"] == "dust_cleanup_skipped_cooldown"
+    assert status["dust_cleanup_action"] == "skipped_cooldown"
+    assert eng.open_orders == []
+
 def test_live_submit_sends_normalized_btc_wire_values_and_not_raw_floats(tmp_path):
     from hyperliquid.utils.signing import float_to_wire
     from src.execution_engine import LiveExecutionEngine
