@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import subprocess
@@ -3091,3 +3092,84 @@ def test_analyze_closed_trades_report_answers_required_questions():
     assert "2. Are winners too small?" in report
     assert "3. Are losers too large?" in report
     assert "4. What parameter change would improve expectancy most?" in report
+
+
+def test_trade_expectancy_report_reconstructs_windows_and_groups(tmp_path):
+    from scripts.trade_expectancy_report import read_ledger, reconstruct_closed_trades, build_report, summarize
+
+    ledger = tmp_path / "trades.jsonl"
+    rows = [
+        {
+            "timestamp": "2026-01-01T05:00:00+00:00",
+            "symbol": "BTC",
+            "side": "buy",
+            "price": 100.0,
+            "qty": 1.0,
+            "notional": 100.0,
+            "fee": 0.10,
+            "regime": "RANGE",
+            "orderbook_classification": "Bullish",
+            "prediction_bias": "LONG",
+        },
+        {
+            "timestamp": "2026-01-01T05:30:00+00:00",
+            "symbol": "BTC",
+            "side": "sell",
+            "price": 101.0,
+            "qty": 1.0,
+            "notional": 101.0,
+            "fee": 0.10,
+            "realized_pnl_delta": 1.0,
+            "regime": "RANGE",
+            "orderbook_classification": "Bullish",
+            "prediction_bias": "LONG",
+        },
+        {
+            "timestamp": "2026-01-01T06:00:00+00:00",
+            "symbol": "BTC",
+            "side": "sell",
+            "price": 100.0,
+            "qty": 1.0,
+            "notional": 9.0,
+            "fee": 0.10,
+            "regime": "TREND_DOWN",
+            "orderbook_classification": "Bearish",
+            "prediction_bias": "SHORT",
+        },
+        {
+            "timestamp": "2026-01-01T06:45:00+00:00",
+            "symbol": "BTC",
+            "side": "buy",
+            "price": 101.0,
+            "qty": 1.0,
+            "notional": 1.5,
+            "fee": 0.10,
+            "realized_pnl_delta": -1.0,
+            "regime": "TREND_DOWN",
+            "orderbook_classification": "Bearish",
+            "prediction_bias": "SHORT",
+        },
+    ]
+    ledger.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    loaded_rows = read_ledger(ledger)
+    trades = reconstruct_closed_trades(loaded_rows)
+    metrics = summarize(trades, len(loaded_rows))
+    report = build_report(loaded_rows, trades, [2], True)
+
+    assert metrics["closed_trade_count"] == 2
+    assert metrics["win_rate"] == pytest.approx(0.5)
+    assert metrics["average_winner"] == pytest.approx(0.8)
+    assert metrics["average_loser"] == pytest.approx(-1.2)
+    assert metrics["long_only_pnl"] == pytest.approx(0.8)
+    assert metrics["short_only_pnl"] == pytest.approx(-1.2)
+    assert metrics["dust_trade_count_under_2_usd"] == 1
+    assert metrics["below_min_notional_fill_count_under_10_usd"] == 1
+    assert "## Window: last 2" in report
+    assert "## Telegram/performance report section" in report
+    assert "## Recommendation" in report
+    assert "### By side" in report
+    assert "### By hour of day (UTC)" in report
+    assert "### By regime" in report
+    assert "### By orderbook classification" in report
+    assert "### By prediction bias" in report
