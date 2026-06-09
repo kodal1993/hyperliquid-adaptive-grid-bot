@@ -1,28 +1,30 @@
-Closed-trade expectancy diagnostics (last 300 requested)
+# Trade Expectancy Diagnostics
 
-Trade ledger not found: logs/trades.csv
-No closed trades could be analyzed in this workspace. Provide --ledger pointing to trades.csv or trades.jsonl from the running bot.
+Use the read-only expectancy reporter to explain why the live Hyperliquid adaptive grid bot can remain net negative even when the headline win rate is near 52%.
 
-Metrics:
-- Average winner: n/a
-- Average loser: n/a
-- Median winner: n/a
-- Median loser: n/a
-- Expectancy: n/a
-- Profit factor: n/a
-- Profit factor after fees: n/a
-- Average hold time: n/a
-- Average winner hold time: n/a
-- Average loser hold time: n/a
+```bash
+python -m scripts.trade_expectancy_report --limit 300
+```
 
-1. What causes net negative expectancy?
-- Cannot determine without a trade ledger containing closed trades.
+By default the reporter reads `logs/trades.jsonl`, reconstructs closed lots from the fill ledger, and prints the most recent closed-trade window plus an all-trades window. To print the requested rolling windows together, run:
 
-2. Are winners too small?
-- Cannot determine without closed winner rows.
+```bash
+python -m scripts.trade_expectancy_report --windows 100,200,300
+```
 
-3. Are losers too large?
-- Cannot determine without closed loser rows.
+Optional flags:
 
-4. What parameter change would improve expectancy most?
-- No parameter change is recommended from absent data; run this diagnostic against the production ledger first.
+- `--ledger PATH` points at a different `trades.jsonl` or `trades.csv` file.
+- `--output docs/trade_expectancy_diagnostics.md` writes the Markdown report to disk.
+- `--no-all` suppresses the all-trades window.
+
+The report includes:
+
+- Core expectancy metrics: closed count, win rate, average/median winner and loser, largest win/loss, gross profit factor, profit factor after fees, gross PnL, net PnL, fees, expectancy per trade, and fee drag.
+- Hold-time diagnostics when the ledger contains enough entry/exit timing to reconstruct them.
+- Fill-quality diagnostics: dust trades under $2 and below-min-notional fills under $10.
+- Segment tables grouped by side, UTC hour of day, regime, orderbook classification, and prediction bias when those fields are present in the ledger.
+- A Telegram/performance `EXPECTANCY` block with average win, average loss, win/loss ratio, profit factor after fees, fee drag, and dust count.
+- A recommendation section identifying whether the issue is win rate, average win/loss ratio, fee drag, dust fills, or the weaker side.
+
+This utility does not modify orders, positions, strategy parameters, or live trading behavior.
