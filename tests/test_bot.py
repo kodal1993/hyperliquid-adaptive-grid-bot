@@ -3036,3 +3036,58 @@ def test_prediction_layer_cannot_produce_zero_order_flat_state(tmp_path):
     assert entry["allow_sells"] is False
     assert len(plan.long_levels) >= 1
     assert len(plan.short_levels) >= 1
+
+
+def test_analyze_closed_trades_reconstructs_fifo_fees_and_hold_times(tmp_path):
+    import importlib.util
+    import sys
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "analyze_closed_trades.py"
+    spec = importlib.util.spec_from_file_location("analyze_closed_trades", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00+00:00", "symbol": "BTC", "side": "buy", "qty": "1", "fee": "0.10", "realized_pnl_delta": "0", "regime": "RANGE"},
+        {"timestamp": "2026-01-01T01:00:00+00:00", "symbol": "BTC", "side": "sell", "qty": "0.5", "fee": "0.05", "realized_pnl_delta": "5", "regime": "RANGE"},
+        {"timestamp": "2026-01-01T02:00:00+00:00", "symbol": "BTC", "side": "sell", "qty": "0.5", "fee": "0.05", "realized_pnl_delta": "-2", "regime": "TREND_DOWN"},
+    ]
+
+    trades = module.reconstruct_closed_trades(rows)
+
+    assert len(trades) == 2
+    assert trades[0].gross_pnl == 5
+    assert trades[0].entry_fee == pytest.approx(0.05)
+    assert trades[0].exit_fee == pytest.approx(0.05)
+    assert trades[0].net_pnl == pytest.approx(4.90)
+    assert trades[0].hold_seconds == 3600
+    assert trades[1].net_pnl == pytest.approx(-2.10)
+    assert trades[1].hold_seconds == 7200
+
+
+def test_analyze_closed_trades_report_answers_required_questions():
+    import importlib.util
+    import sys
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "analyze_closed_trades.py"
+    spec = importlib.util.spec_from_file_location("analyze_closed_trades", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    trades = [
+        module.ClosedTrade(None, "BTC", "long", 1, 1.0, 0.1, 0.1, 60, "RANGE", "NEUTRAL", "OK", "grid_fill", "maker", ""),
+        module.ClosedTrade(None, "BTC", "long", 1, -3.0, 0.1, 0.1, 120, "TREND_DOWN", "NEUTRAL", "OK", "grid_fill", "maker", ""),
+    ]
+
+    report = module.build_report(trades, 300)
+
+    assert "Average winner" in report
+    assert "Profit factor after fees" in report
+    assert "1. What causes net negative expectancy?" in report
+    assert "2. Are winners too small?" in report
+    assert "3. Are losers too large?" in report
+    assert "4. What parameter change would improve expectancy most?" in report
