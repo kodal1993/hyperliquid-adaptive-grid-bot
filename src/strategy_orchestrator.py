@@ -49,6 +49,7 @@ class StrategyOrchestrator:
         self.orderbook_bullish_entries = 0
         self.orderbook_bearish_entries = 0
         self.orderbook_filtered_entries = 0
+        self.dust_cleanup_count = 0
         self.last_recenter_ts: datetime | None = None
         self.last_trend_regime: MarketRegime | None = None
         self.pending_regime: MarketRegime | None = None
@@ -220,12 +221,30 @@ class StrategyOrchestrator:
                     dust_context.update({"dust_cleanup_action": "skipped_cooldown", "dust_cleanup_cooldown_remaining_seconds": seconds_remaining})
                     return {"status": "managing_position", "regime": regime.value, "risk": None, "mode": mode.value, "reason": "dust_cleanup_skipped_cooldown", "allowed_to_trade": False, "allowed_to_reduce": True, "state_source": account_state.state_source, **dust_context}
 
+                min_dust_cleanup_notional = 5.0
+                if raw_position_notional + 1e-9 < min_dust_cleanup_notional:
+                    logger.info(
+                        "dust_cleanup_skipped_min_notional remaining_qty=%.8f remaining_notional=%.8f min_dust_cleanup_notional=%.2f source=dust_cleanup",
+                        pos_size,
+                        raw_position_notional,
+                        min_dust_cleanup_notional,
+                    )
+                    dust_context.update({
+                        "dust_cleanup_action": "skipped_below_5_usd",
+                        "dust_cleanup_min_notional_usd": min_dust_cleanup_notional,
+                        "dust_cleanup_in_progress": self.dust_cleanup_in_progress,
+                        "order_source": "dust_cleanup",
+                    })
+                    return {"status": "managing_position", "regime": regime.value, "risk": None, "mode": mode.value, "reason": "dust_cleanup_below_min_notional", "allowed_to_trade": False, "allowed_to_reduce": True, "state_source": account_state.state_source, **dust_context}
+
                 cleanup_result = self.execution_engine.ensure_reduce_only_close_order(symbol, pos_size, price, replace_threshold_pct=0.0015)
                 active_cleanup_orders = int(cleanup_result.get("active_cleanup_orders", 0) or 0)
                 self.dust_cleanup_in_progress = bool(cleanup_result.get("submitted") or active_cleanup_orders > 0)
                 if cleanup_result.get("submitted") or not self.dust_cleanup_in_progress:
                     self.last_dust_cleanup_ts = now_ts
                 if cleanup_result.get("submitted"):
+                    self.dust_cleanup_count += 1
+                    dust_context["dust_cleanup_count"] = self.dust_cleanup_count
                     logger.info(
                         "dust_cleanup_submitted remaining_qty=%.8f remaining_notional=%.8f price=%s reduce_only=true canceled_orders=%s active_cleanup_orders=%s",
                         pos_size,
@@ -485,6 +504,18 @@ class StrategyOrchestrator:
         )
         allow_buys = prediction_filter_context.pop("allow_buys")
         allow_sells = prediction_filter_context.pop("allow_sells")
+
+        long_selectivity_context = self._apply_long_side_selectivity(
+            allow_buys=allow_buys,
+            allow_sells=allow_sells,
+            position_side=effective_position_side,
+            regime=regime,
+            prediction=prediction,
+            orderbook=orderbook_context,
+            force_reduce_only=force_reduce_only,
+        )
+        allow_buys = long_selectivity_context.pop("allow_buys")
+        allow_sells = long_selectivity_context.pop("allow_sells")
 
         allow_buys_before_stress = allow_buys
         allow_sells_before_stress = allow_sells
@@ -939,6 +970,11 @@ class StrategyOrchestrator:
             position_side=effective_position_side,
             max_one_side_notional=threshold,
         )
+        range_orderbook_long_context = self._apply_range_orderbook_long_level_reduction(
+            plan,
+            position_side=effective_position_side,
+            orderbook=orderbook_context,
+        )
         after_min_notional = len(plan.long_levels) + len(plan.short_levels)
         after_dust_filter = after_min_notional
         after_anti_chop = after_min_notional
@@ -1103,6 +1139,8 @@ class StrategyOrchestrator:
             "skip_reason": no_grid_orders_generated_reason or "none",
             "anti_chop_trigger_count": self.anti_chop_trigger_count,
             **prediction_bias_context,
+            **long_selectivity_context,
+            **range_orderbook_long_context,
             **anti_chop_context,
         }
         try:
@@ -1120,6 +1158,82 @@ class StrategyOrchestrator:
             canceled = self.execution_engine.cancel_all_orders(symbol)
             return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **market_stress_context, **recenter_context, **edge_context, **level_decision_context}
         return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **market_stress_context, **recenter_context, **edge_context, **level_decision_context}
+
+    def _apply_long_side_selectivity(
+        self,
+        *,
+        allow_buys: bool,
+        allow_sells: bool,
+        position_side: str,
+        regime: MarketRegime,
+        prediction: PredictionResult,
+        orderbook: dict,
+        force_reduce_only: bool,
+    ) -> dict:
+        context = {
+            "allow_buys": allow_buys,
+            "allow_sells": allow_sells,
+            "long_selectivity_action": "none",
+            "long_selectivity_blocked": False,
+        }
+        if force_reduce_only or position_side == "SHORT" or not allow_buys:
+            return context
+        if regime not in {MarketRegime.TREND_DOWN, MarketRegime.TREND_DOWN_PULLBACK}:
+            return context
+
+        classification = str(orderbook.get("classification") or "")
+        bullish_orderbook = classification in {"Bullish", "Strong Bullish"}
+        prediction_long = prediction.available and prediction.prediction_bias in {"LONG", "STRONG_LONG"}
+        confidence_ok = float(getattr(prediction, "confidence_score", 0.0) or 0.0) > 0.70
+        if prediction_long and confidence_ok and bullish_orderbook:
+            context["long_selectivity_action"] = "allow_trend_down_long_exception"
+            return context
+
+        context.update({
+            "allow_buys": False,
+            "long_selectivity_action": "block_new_long_in_trend_down",
+            "long_selectivity_blocked": True,
+            "long_selectivity_reason": "requires_long_prediction_confidence_gt_0_70_and_bullish_orderbook",
+        })
+        logger.info(
+            "long_selectivity_blocked regime=%s position_side=%s prediction_bias=%s confidence=%.4f orderbook_classification=%s",
+            regime.value,
+            position_side,
+            getattr(prediction, "prediction_bias", ""),
+            float(getattr(prediction, "confidence_score", 0.0) or 0.0),
+            classification or "Unavailable",
+        )
+        return context
+
+    def _apply_range_orderbook_long_level_reduction(self, plan: GridPlan, *, position_side: str, orderbook: dict) -> dict:
+        context = {
+            "range_orderbook_long_reduction_pct": 0.0,
+            "range_long_levels_before": len(plan.long_levels),
+            "range_long_levels_after": len(plan.long_levels),
+            "range_orderbook_long_action": "none",
+        }
+        if plan.regime != MarketRegime.RANGE or position_side != "FLAT" or not plan.long_levels:
+            return context
+        if not bool(orderbook.get("available")) or not bool(orderbook.get("ready")) or bool(orderbook.get("stale")):
+            context["range_orderbook_long_action"] = "fallback_existing_strategy"
+            return context
+        classification = str(orderbook.get("classification") or "Neutral")
+        if classification not in {"Neutral", "Bearish", "Strong Bearish"}:
+            return context
+        keep = max(1, int(round(len(plan.long_levels) * 0.75)))
+        del plan.long_levels[keep:]
+        context.update({
+            "range_orderbook_long_reduction_pct": 0.25,
+            "range_long_levels_after": len(plan.long_levels),
+            "range_orderbook_long_action": "reduce_long_levels_25pct",
+        })
+        logger.info(
+            "range_orderbook_long_level_reduction classification=%s before=%s after=%s reduction_pct=0.25",
+            classification,
+            context["range_long_levels_before"],
+            context["range_long_levels_after"],
+        )
+        return context
 
     def _build_prediction(
         self,
