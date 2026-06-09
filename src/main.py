@@ -328,6 +328,27 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
         "avg_net_profit_per_closed_trade": 0.0,
         "avg_fee_per_trade": 0.0,
         "profit_factor_after_fees": 0.0,
+        "net_pnl_after_fees": 0.0,
+        "average_winner": 0.0,
+        "average_loser": 0.0,
+        "win_loss_ratio": 0.0,
+        "expectancy_per_trade": 0.0,
+        "long_trade_count": 0,
+        "short_trade_count": 0,
+        "long_pnl": 0.0,
+        "short_pnl": 0.0,
+        "long_profit_factor": 0.0,
+        "short_profit_factor": 0.0,
+        "avg_expected_profit": 0.0,
+        "avg_realized_profit": 0.0,
+        "avg_realized_loss": 0.0,
+        "fills_under_10_usd": 0,
+        "fills_under_5_usd": 0,
+        "dust_cleanup_count": 0,
+        "sub_10_fill_sources": {},
+        "sub_5_fill_sources": {},
+        "bullish_entry_pnl": 0.0,
+        "bearish_entry_pnl": 0.0,
         "min_notional_blocked_count": 0,
         "anti_chop_trigger_count": 0,
         "performance_by_side": {},
@@ -370,6 +391,15 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
     previous_position_size = 0.0
     orderbook_bullish_pnls: list[float] = []
     orderbook_bearish_pnls: list[float] = []
+    net_winners: list[float] = []
+    net_losers: list[float] = []
+    expected_profits: list[float] = []
+    sub_10_sources: Counter[str] = Counter()
+    sub_5_sources: Counter[str] = Counter()
+    long_gross_profit = 0.0
+    long_gross_loss = 0.0
+    short_gross_profit = 0.0
+    short_gross_loss = 0.0
 
     with csv_path.open(encoding="utf-8") as f:
         for row in csv.DictReader(f):
@@ -379,12 +409,24 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
             fee = _safe_float(row.get("fee")) or 0.0
             notional = _safe_float(row.get("notional")) or 0.0
             is_dust = _is_truthy(row.get("dust_fill")) or (0.0 < notional < 1.0)
+            order_source = str(row.get("order_source") or row.get("reason") or "unknown")
+            if 0.0 < notional < 10.0:
+                analytics["fills_under_10_usd"] += 1
+                sub_10_sources[order_source] += 1
+            if 0.0 < notional < 5.0:
+                analytics["fills_under_5_usd"] += 1
+                sub_5_sources[order_source] += 1
+            if order_source == "dust_cleanup":
+                analytics["dust_cleanup_count"] += 1
             if is_dust:
                 analytics["dust_trade_count"] += 1
                 analytics["dust_volume"] += notional
             if exclude_dust and is_dust:
                 continue
             realized = _safe_float(row.get("realized_pnl_delta")) or 0.0
+            expected_profit = _safe_float(row.get("expected_net_edge"))
+            if expected_profit is not None:
+                expected_profits.append(expected_profit)
             net = realized - fee
             orderbook_classification = str(row.get("orderbook_classification") or "")
             if "Bullish" in orderbook_classification:
@@ -433,14 +475,24 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
                 analytics["long_trades"] += 1
                 analytics["pnl_long_trades"] += net
                 long_outcomes.append(net)
+                if net > 0:
+                    long_gross_profit += net
+                elif net < 0:
+                    long_gross_loss += abs(net)
             elif side == "sell":
                 analytics["short_trades"] += 1
                 analytics["pnl_short_trades"] += net
                 short_outcomes.append(net)
+                if net > 0:
+                    short_gross_profit += net
+                elif net < 0:
+                    short_gross_loss += abs(net)
             if net > 0:
                 net_gross_profit += net
+                net_winners.append(net)
             elif net < 0:
                 net_gross_loss += abs(net)
+                net_losers.append(net)
             if realized > 0:
                 winners.append(realized)
                 if ts is not None and ts < cutover_ts:
@@ -476,6 +528,22 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
     analytics["gross_pnl_before_fees"] = net_pnl + total_fees
     analytics["total_fees"] = total_fees
     analytics["net_pnl"] = net_pnl
+    analytics["net_pnl_after_fees"] = net_pnl
+    analytics["average_winner"] = analytics["avg_winner"]
+    analytics["average_loser"] = analytics["avg_loser"]
+    analytics["win_loss_ratio"] = abs(analytics["avg_winner"] / analytics["avg_loser"]) if abs(analytics["avg_loser"]) > 1e-12 else (analytics["avg_winner"] if analytics["avg_winner"] > 0 else 0.0)
+    analytics["expectancy_per_trade"] = analytics["expectancy"]
+    analytics["long_trade_count"] = analytics["long_trades"]
+    analytics["short_trade_count"] = analytics["short_trades"]
+    analytics["long_pnl"] = analytics["pnl_long_trades"]
+    analytics["short_pnl"] = analytics["pnl_short_trades"]
+    analytics["long_profit_factor"] = long_gross_profit / long_gross_loss if long_gross_loss > 1e-12 else (long_gross_profit if long_gross_profit > 0 else 0.0)
+    analytics["short_profit_factor"] = short_gross_profit / short_gross_loss if short_gross_loss > 1e-12 else (short_gross_profit if short_gross_profit > 0 else 0.0)
+    analytics["avg_expected_profit"] = sum(expected_profits) / len(expected_profits) if expected_profits else 0.0
+    analytics["avg_realized_profit"] = sum(net_winners) / len(net_winners) if net_winners else 0.0
+    analytics["avg_realized_loss"] = sum(net_losers) / len(net_losers) if net_losers else 0.0
+    analytics["sub_10_fill_sources"] = dict(sub_10_sources)
+    analytics["sub_5_fill_sources"] = dict(sub_5_sources)
     analytics["avg_net_profit_per_closed_trade"] = net_pnl / trade_count if trade_count else 0.0
     analytics["avg_fee_per_trade"] = total_fees / trade_count if trade_count else 0.0
     analytics["average_holding_time_seconds"] = sum(holding_times) / len(holding_times) if holding_times else 0.0
@@ -500,6 +568,8 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
         analytics["trades_per_day"] = trade_count / days
     analytics["avg_winner_before"] = sum(winner_before_cutover) / len(winner_before_cutover) if winner_before_cutover else 0.0
     analytics["avg_winner_after"] = sum(winner_after_cutover) / len(winner_after_cutover) if winner_after_cutover else analytics["avg_winner"]
+    analytics["bullish_entry_pnl"] = sum(orderbook_bullish_pnls)
+    analytics["bearish_entry_pnl"] = sum(orderbook_bearish_pnls)
     analytics["avg_pnl_bullish_entries"] = sum(orderbook_bullish_pnls) / len(orderbook_bullish_pnls) if orderbook_bullish_pnls else 0.0
     analytics["avg_pnl_bearish_entries"] = sum(orderbook_bearish_pnls) / len(orderbook_bearish_pnls) if orderbook_bearish_pnls else 0.0
     return analytics
@@ -924,6 +994,27 @@ def run() -> None:
                 "avg_net_profit_per_closed_trade": trade_analytics["avg_net_profit_per_closed_trade"],
                 "avg_fee_per_trade": trade_analytics["avg_fee_per_trade"],
                 "profit_factor_after_fees": trade_analytics["profit_factor_after_fees"],
+                "net_pnl_after_fees": trade_analytics["net_pnl_after_fees"],
+                "average_winner": trade_analytics["average_winner"],
+                "average_loser": trade_analytics["average_loser"],
+                "win_loss_ratio": trade_analytics["win_loss_ratio"],
+                "expectancy_per_trade": trade_analytics["expectancy_per_trade"],
+                "long_trade_count": trade_analytics["long_trade_count"],
+                "short_trade_count": trade_analytics["short_trade_count"],
+                "long_pnl": trade_analytics["long_pnl"],
+                "short_pnl": trade_analytics["short_pnl"],
+                "long_profit_factor": trade_analytics["long_profit_factor"],
+                "short_profit_factor": trade_analytics["short_profit_factor"],
+                "avg_expected_profit": trade_analytics["avg_expected_profit"] or (status.get("expected_net_edge") or 0.0),
+                "avg_realized_profit": trade_analytics["avg_realized_profit"],
+                "avg_realized_loss": trade_analytics["avg_realized_loss"],
+                "fills_under_10_usd": trade_analytics["fills_under_10_usd"],
+                "fills_under_5_usd": trade_analytics["fills_under_5_usd"],
+                "dust_cleanup_count": max(int(trade_analytics.get("dust_cleanup_count", 0) or 0), int(status.get("dust_cleanup_count", 0) or 0)),
+                "sub_10_fill_sources": trade_analytics["sub_10_fill_sources"],
+                "sub_5_fill_sources": trade_analytics["sub_5_fill_sources"],
+                "bullish_entry_pnl": trade_analytics["bullish_entry_pnl"],
+                "bearish_entry_pnl": trade_analytics["bearish_entry_pnl"],
                 "min_notional_blocked_count": max(int(status.get("min_notional_blocked_count", 0) or 0), int(getattr(engine, "min_notional_blocked_count", 0) or 0)),
                 "anti_chop_trigger_count": status.get("anti_chop_trigger_count", 0),
                 "anti_chop_cooldown_active": status.get("anti_chop_cooldown_active", False),

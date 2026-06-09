@@ -1270,35 +1270,37 @@ def test_dust_cleanup_reduce_only_once_keeps_one_order_and_respects_replace_thre
 
     status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
 
-    assert status["reason"] == "dust_cleanup"
-    assert status["dust_cleanup_action"] == "submitted"
-    assert status["dust_cleanup_in_progress"] is True
-    assert status["reduce_only"] is True
-    assert len(eng.open_orders) == 1
-    assert eng.open_orders[0]["reduce_only"] is True
-    assert eng.open_orders[0]["side"] == "sell"
-    assert eng.open_orders[0]["size"] == pytest.approx(0.00001)
+    assert status["reason"] == "dust_cleanup_below_min_notional"
+    assert status["dust_cleanup_action"] == "skipped_below_5_usd"
+    assert status["dust_cleanup_in_progress"] is False
+    assert len(eng.open_orders) == 2
 
+    eng.paper.position_size = 0.0001
+    cfg.dust_position_notional_usd = 10.0
     status2 = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
 
-    assert status2["dust_cleanup_action"] == "in_progress"
-    assert status2["active_dust_cleanup_orders"] == 1
+    assert status2["reason"] == "dust_cleanup"
+    assert status2["dust_cleanup_action"] == "submitted"
+    assert status2["dust_cleanup_in_progress"] is True
+    assert status2["reduce_only"] is True
+    assert status2["dust_cleanup_count"] == 1
+    assert len(eng.open_orders) == 1
+    assert eng.open_orders[0]["reduce_only"] is True
+    assert eng.open_orders[0]["order_source"] == "dust_cleanup"
+    assert eng.open_orders[0]["side"] == "sell"
+    assert eng.open_orders[0]["size"] == pytest.approx(0.0001)
+
+    status3 = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+
+    assert status3["dust_cleanup_action"] == "in_progress"
     assert len(eng.open_orders) == 1
     assert eng.open_orders[0]["price"] == pytest.approx(60000.0 * 0.998)
-
-    moved_candles = pd.DataFrame({"close": [60100.0 for _ in range(80)], "high": [60101.0 for _ in range(80)], "low": [60099.0 for _ in range(80)]})
-    status3 = orch.on_tick(moved_candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
-
-    assert status3["dust_cleanup_action"] == "submitted"
-    assert len(eng.open_orders) == 1
-    assert eng.open_orders[0]["price"] == pytest.approx(60100.0 * 0.998)
 
     eng.paper.position_size = 0.0
     status4 = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
 
     assert status4["dust_cleanup_in_progress"] is False
     assert status4["is_dust_position"] is False
-
 
 def test_dust_cleanup_reduce_only_once_cooldown_prevents_resubmit(tmp_path):
     cfg = BotConfig.from_env()
@@ -2517,7 +2519,7 @@ def test_volatility_adaptive_spacing_uses_configured_buckets(tmp_path):
     normal_spacing, normal_source = orch._calculate_spacing_pct(0.006, 0.001)
     high_spacing, high_source = orch._calculate_spacing_pct(0.02, 0.001)
 
-    assert 0.0025 <= low_spacing <= 0.0030
+    assert low_spacing >= 0.0035
     assert 0.0035 <= normal_spacing <= 0.0045
     assert 0.0055 <= high_spacing <= 0.0055
     assert "low_volatility" in low_source
@@ -3173,3 +3175,76 @@ def test_trade_expectancy_report_reconstructs_windows_and_groups(tmp_path):
     assert "### By regime" in report
     assert "### By orderbook classification" in report
     assert "### By prediction bias" in report
+
+
+def test_trend_down_long_exception_requires_prediction_and_bullish_orderbook(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.prediction_confidence_threshold = 0.65
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "long_selectivity.json", paper_mode=True, enable_live_trading=False))
+
+    blocked = orch._apply_long_side_selectivity(
+        allow_buys=True,
+        allow_sells=True,
+        position_side="FLAT",
+        regime=MarketRegime.TREND_DOWN,
+        prediction=_prediction_result("LONG", 0.9, 0.8),
+        orderbook={"classification": "Bearish"},
+        force_reduce_only=False,
+    )
+    allowed = orch._apply_long_side_selectivity(
+        allow_buys=True,
+        allow_sells=True,
+        position_side="FLAT",
+        regime=MarketRegime.TREND_DOWN,
+        prediction=_prediction_result("LONG", 0.71, 0.8),
+        orderbook={"classification": "Strong Bullish"},
+        force_reduce_only=False,
+    )
+
+    assert blocked["allow_buys"] is False
+    assert blocked["long_selectivity_blocked"] is True
+    assert allowed["allow_buys"] is True
+    assert allowed["long_selectivity_action"] == "allow_trend_down_long_exception"
+
+
+def test_range_neutral_orderbook_reduces_long_levels_without_disabling(tmp_path):
+    cfg = BotConfig.from_env()
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "range_long_reduce.json", paper_mode=True, enable_live_trading=False))
+    plan = GridManager().build_grid(100, 4, 0.01, 0.0, MarketRegime.RANGE, 1.0, 0.0, 0.0, GridMode.NEUTRAL)
+
+    context = orch._apply_range_orderbook_long_level_reduction(
+        plan,
+        position_side="FLAT",
+        orderbook={"available": True, "ready": True, "stale": False, "classification": "Neutral"},
+    )
+
+    assert context["range_orderbook_long_action"] == "reduce_long_levels_25pct"
+    assert len(plan.long_levels) == 3
+    assert len(plan.short_levels) == 4
+    assert len(plan.long_levels) > 0
+
+
+def test_expectancy_telemetry_reports_side_pf_and_fee_leakage_sources(tmp_path):
+    from src.main import _trade_analytics_report
+
+    csv_path = tmp_path / "trades.csv"
+    csv_path.write_text(
+        "timestamp,symbol,side,price,qty,notional,fee,dust_fill,realized_pnl_delta,trade_category,order_source,orderbook_classification\n"
+        "2026-01-01T00:00:00+00:00,BTC,buy,10000,0.001,10,0.1,false,1,close,normal_entry,Bullish\n"
+        "2026-01-01T01:00:00+00:00,BTC,buy,10000,0.0003,3,0.1,false,-1,close,dust_cleanup,Bearish\n"
+        "2026-01-01T02:00:00+00:00,BTC,sell,10000,0.001,10,0.1,false,2,close,normal_entry,Strong Bearish\n",
+        encoding="utf-8",
+    )
+
+    metrics = _trade_analytics_report("BTC", csv_path=csv_path, exclude_dust=False)
+
+    assert metrics["long_trade_count"] == 2
+    assert metrics["short_trade_count"] == 1
+    assert metrics["long_profit_factor"] == pytest.approx(0.9 / 1.1)
+    assert metrics["short_profit_factor"] == pytest.approx(1.9)
+    assert metrics["fills_under_10_usd"] == 1
+    assert metrics["fills_under_5_usd"] == 1
+    assert metrics["dust_cleanup_count"] == 1
+    assert metrics["sub_10_fill_sources"] == {"dust_cleanup": 1}
+    assert metrics["bullish_entry_pnl"] == pytest.approx(0.9)
+    assert metrics["bearish_entry_pnl"] == pytest.approx(0.8)

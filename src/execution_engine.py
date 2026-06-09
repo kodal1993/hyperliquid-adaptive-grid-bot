@@ -184,7 +184,7 @@ class PaperExecutionEngine:
                     self.min_order_notional_usd,
                 )
                 continue
-            orders.append({"symbol": symbol, "side": o.side, "price": o.price, "size": o.size, "created_ts": now_ts})
+            orders.append({"symbol": symbol, "side": o.side, "price": o.price, "size": o.size, "created_ts": now_ts, "order_source": "normal_entry"})
         self.open_orders = orders
         return {"canceled": 0, "placed": len(self.open_orders), "symbol": symbol}
 
@@ -207,7 +207,7 @@ class PaperExecutionEngine:
                 break
             sz = min(per_level, remaining)
             px = mark_price * (1 - 0.001 * (i + 1)) if side == "buy" else mark_price * (1 + 0.001 * (i + 1))
-            self.open_orders.append({"symbol": symbol, "side": side, "price": px, "size": sz, "reduce_only": True, "created_ts": time.time()})
+            self.open_orders.append({"symbol": symbol, "side": side, "price": px, "size": sz, "reduce_only": True, "created_ts": time.time(), "order_source": "reduce_only"})
             remaining -= sz
             placed += 1
         return placed
@@ -244,7 +244,7 @@ class PaperExecutionEngine:
                 canceled += 1
             else:
                 return {"submitted": False, "active_cleanup_orders": 1, "canceled": canceled, "price": existing_price, "size": existing_size, "reason": "existing_order_kept", "price_moved": False}
-        self.open_orders.append({"symbol": symbol, "side": side, "price": target_price, "size": remaining_qty, "reduce_only": True, "dust_cleanup": True, "created_ts": time.time()})
+        self.open_orders.append({"symbol": symbol, "side": side, "price": target_price, "size": remaining_qty, "reduce_only": True, "dust_cleanup": True, "created_ts": time.time(), "order_source": "dust_cleanup"})
         return {"submitted": True, "active_cleanup_orders": 1, "canceled": canceled, "price": target_price, "size": remaining_qty, "reason": "submitted", "price_moved": price_moved, "size_changed": size_changed}
 
     def flatten_position(self, symbol: str, mark_price: float) -> bool:
@@ -252,7 +252,7 @@ class PaperExecutionEngine:
         if abs(self.paper.position_size) < 1e-12:
             return False
         side = "buy" if self.paper.position_size < 0 else "sell"
-        self._apply_fill({"symbol": symbol, "side": side, "price": mark_price, "size": abs(self.paper.position_size), "created_ts": time.time()})
+        self._apply_fill({"symbol": symbol, "side": side, "price": mark_price, "size": abs(self.paper.position_size), "created_ts": time.time(), "order_source": "reduce_only"})
         return True
 
     def on_candle(self, candle: dict, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", strategy_status: str = "running", orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None) -> list[dict]:
@@ -459,6 +459,9 @@ class PaperExecutionEngine:
             "risk_state": risk_state,
             "pause_reason": pause_reason,
             "reason": reason,
+            "order_source": fill.get("order_source") or ("dust_cleanup" if fill.get("dust_cleanup") else ("reduce_only" if fill.get("reduce_only") else "normal_entry")),
+            "sub_10_usd_fill": 0.0 < notional < 10.0,
+            "sub_5_usd_fill": 0.0 < notional < 5.0,
             "orderbook_classification": orderbook_classification,
             "orderbook_imbalance_ratio": orderbook_imbalance_ratio,
             "orderbook_pressure_score": orderbook_pressure_score,
@@ -530,7 +533,7 @@ class PaperExecutionEngine:
 
     def _append_trade_ledger(self, entry: dict) -> None:
         self.trade_ledger_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "fill_liquidity", "is_maker_fill", "is_taker_fill", "dust_fill", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason", "orderbook_classification", "orderbook_imbalance_ratio", "orderbook_pressure_score"]
+        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "fill_liquidity", "is_maker_fill", "is_taker_fill", "dust_fill", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason", "order_source", "sub_10_usd_fill", "sub_5_usd_fill", "orderbook_classification", "orderbook_imbalance_ratio", "orderbook_pressure_score"]
         write_header = not self.trade_ledger_csv.exists()
         with self.trade_ledger_csv.open("a", encoding="utf-8") as f:
             if write_header:
@@ -846,7 +849,7 @@ class LiveExecutionEngine:
 
     def _append_trade_ledger(self, entry: dict) -> None:
         self.trade_ledger_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "fill_liquidity", "is_maker_fill", "is_taker_fill", "dust_fill", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason", "orderbook_classification", "orderbook_imbalance_ratio", "orderbook_pressure_score"]
+        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "fill_liquidity", "is_maker_fill", "is_taker_fill", "dust_fill", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason", "order_source", "sub_10_usd_fill", "sub_5_usd_fill", "orderbook_classification", "orderbook_imbalance_ratio", "orderbook_pressure_score"]
         write_header = not self.trade_ledger_csv.exists()
         with self.trade_ledger_csv.open("a", encoding="utf-8") as f:
             if write_header:
@@ -880,7 +883,7 @@ class LiveExecutionEngine:
         normalized_price = normalize_price(symbol, price)
         normalized_size = normalize_size(symbol, size)
         notional_decimal = abs(Decimal(str(normalized_size)) * Decimal(str(normalized_price)))
-        min_notional_decimal = Decimal(str(self.min_order_notional_usd if not reduce_only else self.min_notional_usd))
+        min_notional_decimal = Decimal(str(self.min_order_notional_usd if not reduce_only else min(self.min_notional_usd, 5.0)))
         max_notional_decimal = Decimal(str(self.max_notional_per_trade_usd))
 
         if normalized_price <= 0 or normalized_size <= 0:
@@ -997,6 +1000,9 @@ class LiveExecutionEngine:
             "risk_state": risk_state,
             "pause_reason": pause_reason,
             "reason": "exchange_fill",
+            "order_source": raw.get("order_source") or ("reduce_only" if bool(raw.get("reduceOnly", raw.get("reduce_only", False))) else "normal_entry"),
+            "sub_10_usd_fill": 0.0 < notional < 10.0,
+            "sub_5_usd_fill": 0.0 < notional < 5.0,
             "orderbook_classification": orderbook_classification,
             "orderbook_imbalance_ratio": orderbook_imbalance_ratio,
             "orderbook_pressure_score": orderbook_pressure_score,
