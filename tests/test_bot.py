@@ -4058,3 +4058,31 @@ def test_bot_config_websocket_flag_from_env(monkeypatch, tmp_path):
     cfg = BotConfig.from_env()
 
     assert cfg.use_websocket is False
+
+
+def test_size_multiplier_floors_at_min_order_notional(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.min_order_notional_usd = 10.0
+    cfg.max_notional_per_trade_usd = 12.0
+    cfg.max_order_size = 10.0
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "floor.json"))
+    plan = GridManager().build_grid(100, 1, 0.005, 0, MarketRegime.RANGE, 0.12, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    orch._apply_orderbook_size_multipliers(plan, 100.0, 1.0, 0.75)
+
+    sell = plan.short_levels[0]
+    assert sell.price * sell.size == pytest.approx(10.0, rel=1e-6)
+    buy = plan.long_levels[0]
+    assert buy.price * buy.size == pytest.approx(0.12 * buy.price, rel=1e-6)
+
+
+def test_size_floor_helper_keeps_orders_above_min_notional(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.min_order_notional_usd = 10.0
+    cfg.max_notional_per_trade_usd = 12.0
+    cfg.max_order_size = 10.0
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "floor_helper.json"))
+
+    assert orch._floor_size_to_min_order_notional(100.0, 0.09) == pytest.approx(0.10)
+    assert orch._floor_size_to_min_order_notional(100.0, 0.11) == pytest.approx(0.11)
+    assert orch._floor_size_to_min_order_notional(100.0, 0.0) == 0.0

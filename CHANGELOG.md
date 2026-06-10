@@ -1,5 +1,9 @@
 # Changelog
 
+## Size-multiplier floor at exchange minimum notional
+
+- Orderbook/prediction bias multipliers (e.g. 0.75x short-side reduction) could shrink a $12 grid order below Hyperliquid's $10 minimum notional, silently erasing the level instead of reducing it (observed live as repeated `min_notional_blocked` on the sell side). Multiplied sizes are now floored back to the configured minimum order notional while respecting the per-trade cap.
+
 ## Paired take-profit and WebSocket market data
 
 - Added paired take-profit: every opening grid fill immediately places a reduce-only `Gtc` take-profit one grid spacing away (`PAIRED_TAKE_PROFIT_ENABLED=true`, `PAIRED_TP_SPACING_MULTIPLIER=1.0`), realizing grid roundtrips directly instead of waiting for a regime flip or recenter. Engines record the active plan spacing on every regrid for TP pricing; TP submission failures never break fill ingestion.
