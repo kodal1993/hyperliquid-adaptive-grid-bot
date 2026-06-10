@@ -94,6 +94,7 @@ class HyperliquidClient:
             else "https://api.hyperliquid.xyz"
         )
         self.retry_delays_seconds = _DEFAULT_RETRY_DELAYS_SECONDS
+        self.consecutive_api_errors: int = 0
 
     def connect(self) -> None:
         try:
@@ -122,10 +123,48 @@ class HyperliquidClient:
     def _is_retryable_exception(self, exc: BaseException) -> bool:
         if isinstance(exc, requests.exceptions.HTTPError):
             status_code = exc.response.status_code if exc.response is not None else None
-            return status_code in _RETRYABLE_HTTP_STATUSES
-        return isinstance(
-            exc, (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout)
-        )
+            return status_code is not None and 500 <= status_code < 600
+        return isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout))
+
+    def _with_retry(
+        self,
+        fn: Callable[..., _R],
+        *args: Any,
+        max_attempts: int = 3,
+        base_delay: float = 1.0,
+        operation_name: str | None = None,
+        **kwargs: Any,
+    ) -> _R:
+        """Exponential backoff retry. Raises the last exception after all attempts fail."""
+        name = operation_name or getattr(fn, "__name__", "hyperliquid_api_call")
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = fn(*args, **kwargs)
+                self.consecutive_api_errors = 0
+                return result
+            except Exception as exc:
+                if not self._is_retryable_exception(exc):
+                    raise
+                self.consecutive_api_errors += 1
+                if self.consecutive_api_errors >= 5:
+                    logger.critical(
+                        "consecutive_hyperliquid_api_errors count=%s operation=%s",
+                        self.consecutive_api_errors,
+                        name,
+                    )
+                if attempt >= max_attempts:
+                    raise
+                delay_seconds = base_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    "Retryable Hyperliquid API error during %s attempt=%s/%s retry_in_seconds=%s error=%s",
+                    name,
+                    attempt,
+                    max_attempts,
+                    delay_seconds,
+                    exc,
+                )
+                time.sleep(delay_seconds)
+        raise RuntimeError("unreachable Hyperliquid retry state")
 
     def _retry_hyperliquid_api(
         self, operation_name: str, operation: Callable[[], _R]
@@ -133,9 +172,20 @@ class HyperliquidClient:
         attempts = len(self.retry_delays_seconds) + 1
         for attempt in range(1, attempts + 1):
             try:
-                return operation()
+                result = operation()
+                self.consecutive_api_errors = 0
+                return result
             except Exception as exc:
-                if attempt >= attempts or not self._is_retryable_exception(exc):
+                if not self._is_retryable_exception(exc):
+                    raise
+                self.consecutive_api_errors += 1
+                if self.consecutive_api_errors >= 5:
+                    logger.critical(
+                        "consecutive_hyperliquid_api_errors count=%s operation=%s",
+                        self.consecutive_api_errors,
+                        operation_name,
+                    )
+                if attempt >= attempts:
                     raise
                 delay_seconds = self.retry_delays_seconds[attempt - 1]
                 logger.warning(
@@ -239,6 +289,10 @@ class HyperliquidClient:
             )
         return {}
 
+
+    def get_account_state(self) -> dict[str, Any]:
+        return self.get_user_state()
+
     def get_account_summary(self) -> dict[str, Any]:
         state = self.get_user_state()
         margin = state.get("marginSummary", {}) if isinstance(state, dict) else {}
@@ -317,24 +371,19 @@ class HyperliquidClient:
             normalized_price,
             reduce_only,
         )
-        return self._retry_hyperliquid_api(
-            "Exchange.order",
-            lambda: self.exchange.order(
-                symbol,
-                side.lower() == "buy",
-                normalized_size,
-                normalized_price,
-                {"limit": {"tif": "Gtc"}},
-                reduce_only=reduce_only,
-            ),
+        return self.exchange.order(
+            symbol,
+            side.lower() == "buy",
+            normalized_size,
+            normalized_price,
+            {"limit": {"tif": "Gtc"}},
+            reduce_only=reduce_only,
         )
 
     def cancel_order(self, symbol: str, oid: int) -> Any:
         self.require_live_execution_support()
         assert self.exchange is not None
-        return self._retry_hyperliquid_api(
-            "Exchange.cancel", lambda: self.exchange.cancel(symbol, int(oid))
-        )
+        return self.exchange.cancel(symbol, int(oid))
 
     def cancel_all_orders(self, symbol: str) -> int:
         canceled = 0

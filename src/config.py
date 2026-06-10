@@ -168,7 +168,7 @@ class BotConfig:
             profile_loaded,
         )
 
-        return cls(
+        cfg = cls(
             env_profile=env_profile,
             hl_network=os.getenv("HL_NETWORK", "testnet"),
             private_key=os.getenv("HL_PRIVATE_KEY", ""),
@@ -303,3 +303,24 @@ class BotConfig:
             min_order_lifetime_seconds=int(os.getenv("MIN_ORDER_LIFETIME_SECONDS", "90")),
             min_reprice_distance_pct=float(os.getenv("MIN_REPRICE_DISTANCE_PCT", "0.0015")),
         )
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        errors = []
+        if self.grid_levels < 1:
+            errors.append(f"grid_levels must be >= 1, got {self.grid_levels}")
+        if not (0.0 < self.max_drawdown_pct <= 1.0):
+            errors.append(f"max_drawdown_pct must be in (0, 1], got {self.max_drawdown_pct}")
+        if not (0.0 < self.daily_loss_limit_pct <= 1.0):
+            errors.append(f"daily_loss_limit_pct must be in (0, 1], got {self.daily_loss_limit_pct}")
+        if self.base_leverage < 1 or self.base_leverage > 50:
+            errors.append(f"base_leverage must be 1-50, got {self.base_leverage}")
+        if self.order_notional_usd <= 0:
+            errors.append(f"order_notional_usd must be > 0, got {self.order_notional_usd}")
+        if self.grid_spacing_pct <= 0:
+            errors.append(f"grid_spacing_pct must be > 0, got {self.grid_spacing_pct}")
+        if self.tick_seconds < 1:
+            errors.append(f"tick_seconds must be >= 1, got {self.tick_seconds}")
+        if errors:
+            raise ValueError("BotConfig validation failed:\n" + "\n".join(f"  - {e}" for e in errors))

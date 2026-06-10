@@ -3480,3 +3480,201 @@ def test_no_fill_watchdog_never_creates_zero_order_flat_state(tmp_path):
 
     assert status["no_fill_watchdog_active"] is True
     assert len(eng.open_orders) > 0
+
+from src.analytics_service import AnalyticsService
+from src.position_manager import PositionManager
+
+
+def test_risk_blocks_at_max_drawdown():
+    rm = RiskManager(max_drawdown_pct=0.20, daily_loss_limit_pct=0.05)
+    rm.peak_equity = 1000.0
+    result = rm.evaluate(equity=799.0, daily_pnl_pct=0.0, stop_file="/tmp/nonexistent_stop_for_test")
+    assert result.can_trade is False
+    assert result.reason == "max_drawdown"
+
+
+def test_risk_allows_just_below_drawdown():
+    rm = RiskManager(max_drawdown_pct=0.20, daily_loss_limit_pct=0.05)
+    rm.peak_equity = 1000.0
+    result = rm.evaluate(equity=801.0, daily_pnl_pct=0.0, stop_file="/tmp/nonexistent_stop_for_test")
+    assert result.can_trade is True
+
+
+def test_risk_blocks_daily_loss():
+    rm = RiskManager(max_drawdown_pct=0.20, daily_loss_limit_pct=0.05)
+    result = rm.evaluate(equity=1000.0, daily_pnl_pct=-0.06, stop_file="/tmp/nonexistent_stop_for_test")
+    assert result.can_trade is False
+    assert result.reason == "daily_loss"
+
+
+def test_risk_emergency_stop_file(tmp_path):
+    stop_file = tmp_path / "STOP"
+    stop_file.write_text("")
+    rm = RiskManager(max_drawdown_pct=0.20, daily_loss_limit_pct=0.05)
+    result = rm.evaluate(equity=1000.0, daily_pnl_pct=0.0, stop_file=str(stop_file))
+    assert result.reason == "emergency_stop"
+
+
+def test_grid_symmetric_in_range_mode():
+    gm = GridManager()
+    plan = gm.build_grid(mid_price=100.0, levels=4, base_spacing_pct=0.005,
+                         volatility=0.0, regime=MarketRegime.RANGE,
+                         order_size=0.01, regrid_threshold_pct=0.01,
+                         min_grid_profit_over_fees_pct=0.001,
+                         mode=GridMode.NEUTRAL)
+    assert len(plan.long_levels) == 4
+    assert len(plan.short_levels) == 4
+
+
+def test_grid_long_biased_has_more_buys():
+    gm = GridManager()
+    plan = gm.build_grid(mid_price=100.0, levels=6, base_spacing_pct=0.005,
+                         volatility=0.0, regime=MarketRegime.TREND_UP,
+                         order_size=0.01, regrid_threshold_pct=0.01,
+                         min_grid_profit_over_fees_pct=0.001,
+                         mode=GridMode.LONG_BIASED, trend_bias=0.7)
+    assert len(plan.long_levels) > len(plan.short_levels)
+
+
+def test_grid_prices_below_mid_for_buys():
+    gm = GridManager()
+    plan = gm.build_grid(mid_price=50000.0, levels=3, base_spacing_pct=0.002,
+                         volatility=0.0, regime=MarketRegime.RANGE,
+                         order_size=0.001, regrid_threshold_pct=0.01,
+                         min_grid_profit_over_fees_pct=0.0005,
+                         mode=GridMode.NEUTRAL)
+    for level in plan.long_levels:
+        assert level.price < 50000.0
+    for level in plan.short_levels:
+        assert level.price > 50000.0
+
+
+def test_position_classify_side_long_short_flat():
+    pm = PositionManager()
+    assert pm.classify_side(0.1) == "LONG"
+    assert pm.classify_side(-0.1) == "SHORT"
+    assert pm.classify_side(0.0) == "FLAT"
+
+
+def test_position_is_dust_edges():
+    pm = PositionManager()
+    assert pm.is_dust(5.0, 10.0) is True
+    assert pm.is_dust(0.0, 10.0) is False
+    assert pm.is_dust(10.0, 10.0) is False
+
+
+def test_effective_state_dust():
+    pm = PositionManager()
+    size, notional, side = pm.effective_state(0.001, 5.0, dust_threshold_usd=10.0)
+    assert size == 0.0 and notional == 0.0 and side == "FLAT"
+
+
+def test_effective_state_normal_long():
+    pm = PositionManager()
+    size, notional, side = pm.effective_state(0.5, 25000.0, dust_threshold_usd=10.0)
+    assert size == 0.5
+    assert notional == 25000.0
+    assert side == "LONG"
+
+
+def test_position_unrealized_pnl_pct_long_short_flat():
+    pm = PositionManager()
+    assert pm.unrealized_pnl_pct(1.0, 100.0, 110.0) == pytest.approx(0.10)
+    assert pm.unrealized_pnl_pct(-1.0, 100.0, 90.0) == pytest.approx(0.10)
+    assert pm.unrealized_pnl_pct(0.0, 100.0, 110.0) == 0.0
+
+
+def test_position_exposure_pct_edges():
+    pm = PositionManager()
+    assert pm.exposure_pct(250.0, 1000.0) == pytest.approx(0.25)
+    assert pm.exposure_pct(250.0, 0.0) == 0.0
+
+
+def test_analytics_30m_window_excludes_older_rows(tmp_path):
+    now = datetime.now(timezone.utc)
+    trades_csv = tmp_path / "trades.csv"
+    trades_csv.write_text(
+        "timestamp,symbol,side,price,qty,notional,fee,realized_pnl_delta\n"
+        f"{(now - timedelta(minutes=45)).isoformat()},BTC,buy,50000,0.001,50,0.01,1\n"
+        f"{(now - timedelta(minutes=90)).isoformat()},BTC,sell,51000,0.001,51,0.02,2\n",
+        encoding="utf-8",
+    )
+    service = AnalyticsService(trades_csv, tmp_path / "risk.csv", "BTC")
+    stats_30m = service.trade_stats_window(now_ts=now.timestamp(), window_seconds=1800)
+    stats_1h = service.trade_stats_window(now_ts=now.timestamp(), window_seconds=3600)
+    assert stats_30m["trades_count"] == 0
+    assert stats_1h["trades_count"] == 1
+
+
+def test_analytics_cache_incremental_append(tmp_path):
+    now = datetime.now(timezone.utc)
+    trades_csv = tmp_path / "trades.csv"
+    trades_csv.write_text(
+        "timestamp,symbol,side,price,qty,notional,fee,realized_pnl_delta\n"
+        f"{now.isoformat()},BTC,buy,50000,0.001,50,0.01,1\n",
+        encoding="utf-8",
+    )
+    service = AnalyticsService(trades_csv, tmp_path / "risk.csv", "BTC")
+    assert service.trade_analytics_report()["long_trades"] == 1
+    with trades_csv.open("a", encoding="utf-8") as f:
+        f.write(f"{now.isoformat()},BTC,sell,51000,0.001,51,0.02,-1\n")
+    assert service.trade_analytics_report()["short_trades"] == 1
+    assert len(service._trades_cache) == 2
+
+
+def test_hyperliquid_with_retry_succeeds_after_two_connection_errors(monkeypatch):
+    client = HyperliquidClient("", "")
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    calls = {"count": 0}
+
+    def flaky():
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise requests.exceptions.ConnectionError("temporary")
+        return {"ok": True}
+
+    assert client._with_retry(flaky) == {"ok": True}
+    assert calls["count"] == 3
+    assert client.consecutive_api_errors == 0
+
+
+def test_hyperliquid_with_retry_propagates_after_three_errors(monkeypatch):
+    client = HyperliquidClient("", "")
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    def always_fails():
+        raise requests.exceptions.ConnectionError("down")
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        client._with_retry(always_fails)
+    assert client.consecutive_api_errors == 3
+
+
+def test_hyperliquid_with_retry_does_not_retry_4xx():
+    client = HyperliquidClient("", "")
+    response = requests.Response()
+    response.status_code = 400
+    err = requests.exceptions.HTTPError(response=response)
+    with pytest.raises(requests.exceptions.HTTPError):
+        client._with_retry(lambda: (_ for _ in ()).throw(err))
+    assert client.consecutive_api_errors == 0
+
+
+def test_bot_config_validate_rejects_invalid_grid_levels(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GRID_LEVELS", "0")
+    with pytest.raises(ValueError, match="grid_levels"):
+        BotConfig.from_env()
+
+
+def test_bot_config_validate_rejects_invalid_risk_values(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MAX_DRAWDOWN_PCT", "-0.1")
+    with pytest.raises(ValueError, match="max_drawdown_pct"):
+        BotConfig.from_env()
+
+
+def test_bot_config_validate_accepts_defaults(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    cfg = BotConfig.from_env()
+    cfg.validate()

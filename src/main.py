@@ -5,14 +5,14 @@ import logging
 import os
 import time
 import traceback
-from collections import Counter
-import csv
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 import fcntl
 
 import pandas as pd
 
+from .analytics_service import AnalyticsService
 from .config import BotConfig
 from .execution_engine import AccountState, LiveExecutionEngine
 from .hyperliquid_client import HyperliquidClient
@@ -131,486 +131,6 @@ def _safe_float(value: object) -> float | None:
         return None
 
 
-def _read_last_row(csv_path: Path) -> dict:
-    if not csv_path.exists():
-        return {}
-    last: dict = {}
-    with csv_path.open(encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            last = row
-    return last
-
-
-def _is_valid_trade_row(row: dict, expected_symbol: str) -> bool:
-    symbol = str(row.get("symbol", "")).upper().strip()
-    if not symbol or symbol != expected_symbol.upper():
-        return False
-    price = _safe_float(row.get("price"))
-    qty = _safe_float(row.get("qty"))
-    if price is None or qty is None or qty <= 0:
-        return False
-    if symbol == "BTC" and price < 1000:
-        return False
-    return True
-
-
-def _read_last_valid_trade(csv_path: Path, expected_symbol: str) -> dict:
-    if not csv_path.exists():
-        return {}
-    last: dict = {}
-    with csv_path.open(encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            if _is_valid_trade_row(row, expected_symbol):
-                last = row
-    return last
-
-
-def _sanitize_trade_csv_row(row: dict) -> dict:
-    sanitized = {key: value for key, value in row.items() if key is not None}
-    if len(sanitized) != len(row):
-        logger.warning("malformed_trade_csv_row_skipped_or_sanitized")
-    return sanitized
-
-
-def _write_last_100_real_trades(csv_path: Path, out_path: Path, expected_symbol: str) -> None:
-    if not csv_path.exists():
-        return
-    rows: list[dict] = []
-    fields: list[str] = []
-    with csv_path.open(encoding="utf-8") as f:
-        for raw_row in csv.DictReader(f):
-            row = _sanitize_trade_csv_row(raw_row)
-            if _is_valid_trade_row(row, expected_symbol):
-                rows.append(row)
-                for key in row:
-                    if key not in fields:
-                        fields.append(key)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if not fields:
-        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_size", "position_notional", "regime", "mode", "risk_state", "pause_reason", "reason"]
-    with out_path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows[-100:])
-
-
-def _risk_block_stats_window(now_ts: float, window_seconds: int = 3600) -> tuple[int, dict[str, int], str]:
-    if not RISK_DECISIONS_CSV.exists():
-        return 0, {}, ""
-    window_start = now_ts - window_seconds
-    reason_counts: Counter[str] = Counter()
-    last_block_reason = ""
-    blocked_count = 0
-    with RISK_DECISIONS_CSV.open(encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            if row.get("decision") != "block":
-                continue
-            ts_raw = row.get("timestamp", "")
-            try:
-                dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-            ts = dt.timestamp()
-            if ts < window_start:
-                continue
-            blocked_count += 1
-            reason = row.get("block_reason") or "unknown"
-            reason_counts[reason] += 1
-            if ts >= window_start:
-                last_block_reason = reason
-    return blocked_count, dict(reason_counts), last_block_reason
-
-
-def _trade_stats_window(now_ts: float, expected_symbol: str, window_seconds: int = 3600) -> dict:
-    stats = {"trades_count": 0, "buy_count": 0, "sell_count": 0, "volume_usd": 0.0, "fees": 0.0, "realized_pnl_delta": 0.0, "last_trade_ts": "", "candidate_fills_count": 0, "no_orders_touched_count": 0, "maker_trades": 0, "taker_trades": 0, "maker_fee_total": 0.0, "taker_fee_total": 0.0, "dust_trade_count": 0, "dust_volume": 0.0}
-    if TRADES_CSV.exists():
-        window_start = now_ts - window_seconds
-        with TRADES_CSV.open(encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                if not _is_valid_trade_row(row, expected_symbol):
-                    continue
-                try:
-                    dt = datetime.fromisoformat(str(row.get("timestamp", "")).replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-                if dt.timestamp() < window_start:
-                    continue
-                stats["trades_count"] += 1
-                side = str(row.get("side", "")).lower()
-                if side == "buy":
-                    stats["buy_count"] += 1
-                elif side == "sell":
-                    stats["sell_count"] += 1
-                notional = _safe_float(row.get("notional")) or 0.0
-                fee = _safe_float(row.get("fee")) or 0.0
-                stats["volume_usd"] += notional
-                stats["fees"] += fee
-                stats["realized_pnl_delta"] += _safe_float(row.get("realized_pnl_delta")) or 0.0
-                liquidity = str(row.get("fill_liquidity") or "maker").lower()
-                if liquidity == "taker":
-                    stats["taker_trades"] += 1
-                    stats["taker_fee_total"] += fee
-                else:
-                    stats["maker_trades"] += 1
-                    stats["maker_fee_total"] += fee
-                if _is_truthy(row.get("dust_fill")) or (0.0 < notional < 1.0):
-                    stats["dust_trade_count"] += 1
-                    stats["dust_volume"] += notional
-                stats["last_trade_ts"] = row.get("timestamp", "")
-    return stats
-
-
-
-def _is_truthy(value: object) -> bool:
-    return str(value).strip().lower() in {"1", "true", "yes", "y"}
-
-
-def _empty_regime_stats() -> dict:
-    return {"trades": 0, "wins": 0, "losses": 0, "winrate_pct": 0.0, "pnl": 0.0, "gross_profit": 0.0, "gross_loss": 0.0, "profit_factor": 0.0}
-
-
-def _update_group_stats(groups: dict[str, dict], key: str, pnl: float) -> None:
-    stats = groups.setdefault(key, _empty_regime_stats())
-    stats["trades"] += 1
-    stats["pnl"] += pnl
-    if pnl > 0:
-        stats["wins"] += 1
-        stats["gross_profit"] += pnl
-    elif pnl < 0:
-        stats["losses"] += 1
-        stats["gross_loss"] += abs(pnl)
-
-
-def _finalize_group_stats(groups: dict[str, dict]) -> dict[str, dict]:
-    for stats in groups.values():
-        stats["winrate_pct"] = (stats["wins"] / stats["trades"] * 100.0) if stats["trades"] else 0.0
-        stats["profit_factor"] = stats["gross_profit"] / stats["gross_loss"] if stats["gross_loss"] > 1e-12 else (stats["gross_profit"] if stats["gross_profit"] > 0 else 0.0)
-    return groups
-
-
-def _volatility_bucket_from_row(row: dict) -> str:
-    explicit = str(row.get("volatility_bucket") or row.get("volatility_mode") or "").strip()
-    if explicit:
-        return explicit
-    atr_pct = _safe_float(row.get("atr_pct"))
-    return_vol_pct = _safe_float(row.get("return_vol_pct"))
-    volatility = max(atr_pct or 0.0, return_vol_pct or 0.0)
-    if volatility <= 0:
-        return "unknown"
-    if volatility <= 0.003:
-        return "low"
-    if volatility >= 0.012:
-        return "high"
-    return "normal"
-
-
-def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *, exclude_dust: bool = True) -> dict:
-    analytics = {
-        "avg_profit_per_trade": 0.0,
-        "avg_profit_per_winner": 0.0,
-        "avg_loss_per_loser": 0.0,
-        "trades_per_day": 0.0,
-        "avg_winner": 0.0,
-        "avg_loser": 0.0,
-        "profit_factor": 0.0,
-        "expectancy": 0.0,
-        "fee_gross_profit_ratio": 0.0,
-        "average_holding_time_seconds": 0.0,
-        "pnl_by_regime": {},
-        "trades_by_regime": {},
-        "winrate_by_regime": {},
-        "profit_factor_by_regime": {},
-        "regime_performance": {},
-        "pnl_by_trade_category": {},
-        "flip_trade_count": 0,
-        "flip_trade_pnl": 0.0,
-        "pnl_long_trades": 0.0,
-        "pnl_short_trades": 0.0,
-        "long_trades": 0,
-        "short_trades": 0,
-        "long_winrate_pct": 0.0,
-        "short_winrate_pct": 0.0,
-        "maker_trades": 0,
-        "taker_trades": 0,
-        "maker_fee_total": 0.0,
-        "taker_fee_total": 0.0,
-        "maker_ratio_pct": 0.0,
-        "taker_ratio_pct": 0.0,
-        "dust_trade_count": 0,
-        "dust_volume": 0.0,
-        "exclude_dust_from_performance_stats": exclude_dust,
-        "avg_winner_before": 0.0,
-        "avg_winner_after": 0.0,
-        "gross_pnl_before_fees": 0.0,
-        "total_fees": 0.0,
-        "net_pnl": 0.0,
-        "fee_to_gross_profit_ratio": 0.0,
-        "avg_net_profit_per_closed_trade": 0.0,
-        "avg_fee_per_trade": 0.0,
-        "profit_factor_after_fees": 0.0,
-        "net_pnl_after_fees": 0.0,
-        "average_winner": 0.0,
-        "average_loser": 0.0,
-        "win_loss_ratio": 0.0,
-        "expectancy_per_trade": 0.0,
-        "long_trade_count": 0,
-        "short_trade_count": 0,
-        "long_pnl": 0.0,
-        "short_pnl": 0.0,
-        "long_profit_factor": 0.0,
-        "short_profit_factor": 0.0,
-        "avg_expected_profit": 0.0,
-        "avg_realized_profit": 0.0,
-        "avg_realized_loss": 0.0,
-        "fills_under_10_usd": 0,
-        "fills_under_5_usd": 0,
-        "dust_cleanup_count": 0,
-        "sub_10_fill_sources": {},
-        "sub_5_fill_sources": {},
-        "bullish_entry_pnl": 0.0,
-        "bearish_entry_pnl": 0.0,
-        "min_notional_blocked_count": 0,
-        "anti_chop_trigger_count": 0,
-        "performance_by_side": {},
-        "performance_by_regime": {},
-        "performance_by_hour": {},
-        "performance_by_volatility_bucket": {},
-        "orderbook_bullish_entries": 0,
-        "orderbook_bearish_entries": 0,
-        "orderbook_filtered_entries": 0,
-        "avg_pnl_bullish_entries": 0.0,
-        "avg_pnl_bearish_entries": 0.0,
-        "pnl_when_prediction_long": 0.0,
-        "pnl_when_prediction_short": 0.0,
-        "pnl_when_prediction_neutral": 0.0,
-        "trades_when_prediction_long": 0,
-        "trades_when_prediction_short": 0,
-        "trades_when_prediction_neutral": 0,
-    }
-    if not csv_path.exists():
-        return analytics
-
-    winners: list[float] = []
-    losers: list[float] = []
-    gross_profit = 0.0
-    gross_loss = 0.0
-    net_gross_profit = 0.0
-    net_gross_loss = 0.0
-    total_fees = 0.0
-    net_pnl = 0.0
-    trade_count = 0
-    pnl_by_regime: Counter[str] = Counter()
-    regime_stats: dict[str, dict] = {}
-    side_stats: dict[str, dict] = {}
-    hour_stats: dict[str, dict] = {}
-    volatility_bucket_stats: dict[str, dict] = {}
-    pnl_by_trade_category: Counter[str] = Counter()
-    long_outcomes: list[float] = []
-    short_outcomes: list[float] = []
-    first_ts: datetime | None = None
-    last_ts: datetime | None = None
-    winner_before_cutover: list[float] = []
-    winner_after_cutover: list[float] = []
-    cutover_ts = datetime.now(timezone.utc)
-    holding_times: list[float] = []
-    open_position_started_at: datetime | None = None
-    previous_position_size = 0.0
-    orderbook_bullish_pnls: list[float] = []
-    orderbook_bearish_pnls: list[float] = []
-    net_winners: list[float] = []
-    net_losers: list[float] = []
-    expected_profits: list[float] = []
-    sub_10_sources: Counter[str] = Counter()
-    sub_5_sources: Counter[str] = Counter()
-    long_gross_profit = 0.0
-    long_gross_loss = 0.0
-    short_gross_profit = 0.0
-    short_gross_loss = 0.0
-
-    with csv_path.open(encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            if not _is_valid_trade_row(row, expected_symbol):
-                continue
-            ts = _parse_iso_utc(str(row.get("timestamp", "")))
-            fee = _safe_float(row.get("fee")) or 0.0
-            notional = _safe_float(row.get("notional")) or 0.0
-            is_dust = _is_truthy(row.get("dust_fill")) or (0.0 < notional < 1.0)
-            order_source = str(row.get("order_source") or row.get("reason") or "unknown")
-            if 0.0 < notional < 10.0:
-                analytics["fills_under_10_usd"] += 1
-                sub_10_sources[order_source] += 1
-            if 0.0 < notional < 5.0:
-                analytics["fills_under_5_usd"] += 1
-                sub_5_sources[order_source] += 1
-            if order_source == "dust_cleanup":
-                analytics["dust_cleanup_count"] += 1
-            if is_dust:
-                analytics["dust_trade_count"] += 1
-                analytics["dust_volume"] += notional
-            if exclude_dust and is_dust:
-                continue
-            realized = _safe_float(row.get("realized_pnl_delta")) or 0.0
-            expected_profit = _safe_float(row.get("expected_net_edge"))
-            if expected_profit is not None:
-                expected_profits.append(expected_profit)
-            net = realized - fee
-            prediction_bias = str(row.get("prediction_bias") or "NEUTRAL").upper()
-            if "LONG" in prediction_bias:
-                analytics["pnl_when_prediction_long"] += net
-                analytics["trades_when_prediction_long"] += 1
-            elif "SHORT" in prediction_bias:
-                analytics["pnl_when_prediction_short"] += net
-                analytics["trades_when_prediction_short"] += 1
-            else:
-                analytics["pnl_when_prediction_neutral"] += net
-                analytics["trades_when_prediction_neutral"] += 1
-            orderbook_classification = str(row.get("orderbook_classification") or "")
-            if "Bullish" in orderbook_classification:
-                analytics["orderbook_bullish_entries"] += 1
-                orderbook_bullish_pnls.append(net)
-            elif "Bearish" in orderbook_classification:
-                analytics["orderbook_bearish_entries"] += 1
-                orderbook_bearish_pnls.append(net)
-            total_fees += fee
-            net_pnl += net
-            trade_count += 1
-            if ts is not None:
-                first_ts = ts if first_ts is None or ts < first_ts else first_ts
-                last_ts = ts if last_ts is None or ts > last_ts else last_ts
-            liquidity = str(row.get("fill_liquidity") or "maker").lower()
-            if liquidity == "taker":
-                analytics["taker_trades"] += 1
-                analytics["taker_fee_total"] += fee
-            else:
-                analytics["maker_trades"] += 1
-                analytics["maker_fee_total"] += fee
-            regime = str(row.get("regime") or "unknown")
-            pnl_by_regime[regime] += net
-            rstats = regime_stats.setdefault(regime, _empty_regime_stats())
-            rstats["trades"] += 1
-            rstats["pnl"] += net
-            if net > 0:
-                rstats["wins"] += 1
-                rstats["gross_profit"] += net
-            elif net < 0:
-                rstats["losses"] += 1
-                rstats["gross_loss"] += abs(net)
-            trade_category = str(row.get("trade_category") or "unknown")
-            pnl_by_trade_category[trade_category] += net
-            is_flip_trade = str(row.get("is_flip_trade", "")).lower() == "true" or trade_category == "flip"
-            if is_flip_trade:
-                analytics["flip_trade_count"] += 1
-                analytics["flip_trade_pnl"] += net
-            side = str(row.get("side", "")).lower()
-            side_key = side or "unknown"
-            _update_group_stats(side_stats, side_key, net)
-            if ts is not None:
-                _update_group_stats(hour_stats, f"{ts.hour:02d}:00", net)
-            _update_group_stats(volatility_bucket_stats, _volatility_bucket_from_row(row), net)
-            if side == "buy":
-                analytics["long_trades"] += 1
-                analytics["pnl_long_trades"] += net
-                long_outcomes.append(net)
-                if net > 0:
-                    long_gross_profit += net
-                elif net < 0:
-                    long_gross_loss += abs(net)
-            elif side == "sell":
-                analytics["short_trades"] += 1
-                analytics["pnl_short_trades"] += net
-                short_outcomes.append(net)
-                if net > 0:
-                    short_gross_profit += net
-                elif net < 0:
-                    short_gross_loss += abs(net)
-            if net > 0:
-                net_gross_profit += net
-                net_winners.append(net)
-            elif net < 0:
-                net_gross_loss += abs(net)
-                net_losers.append(net)
-            if realized > 0:
-                winners.append(realized)
-                if ts is not None and ts < cutover_ts:
-                    winner_before_cutover.append(realized)
-                else:
-                    winner_after_cutover.append(realized)
-                gross_profit += realized
-            elif realized < 0:
-                losers.append(realized)
-                gross_loss += abs(realized)
-
-            position_size = _safe_float(row.get("position_size"))
-            if position_size is not None and ts is not None:
-                if abs(previous_position_size) < 1e-12 and abs(position_size) > 1e-12:
-                    open_position_started_at = ts
-                if open_position_started_at is not None and abs(previous_position_size) > 1e-12 and (
-                    abs(position_size) < 1e-12 or previous_position_size * position_size < 0 or realized != 0
-                ):
-                    holding_times.append(max((ts - open_position_started_at).total_seconds(), 0.0))
-                    open_position_started_at = ts if abs(position_size) > 1e-12 else None
-                previous_position_size = position_size
-
-    analytics["avg_winner"] = sum(winners) / len(winners) if winners else 0.0
-    analytics["avg_loser"] = sum(losers) / len(losers) if losers else 0.0
-    analytics["avg_profit_per_trade"] = net_pnl / trade_count if trade_count else 0.0
-    analytics["avg_profit_per_winner"] = analytics["avg_winner"]
-    analytics["avg_loss_per_loser"] = analytics["avg_loser"]
-    analytics["profit_factor"] = gross_profit / gross_loss if gross_loss > 1e-12 else (gross_profit if gross_profit > 0 else 0.0)
-    analytics["profit_factor_after_fees"] = net_gross_profit / net_gross_loss if net_gross_loss > 1e-12 else (net_gross_profit if net_gross_profit > 0 else 0.0)
-    analytics["expectancy"] = net_pnl / trade_count if trade_count else 0.0
-    analytics["fee_gross_profit_ratio"] = total_fees / gross_profit if gross_profit > 1e-12 else 0.0
-    analytics["fee_to_gross_profit_ratio"] = analytics["fee_gross_profit_ratio"]
-    analytics["gross_pnl_before_fees"] = net_pnl + total_fees
-    analytics["total_fees"] = total_fees
-    analytics["net_pnl"] = net_pnl
-    analytics["net_pnl_after_fees"] = net_pnl
-    analytics["average_winner"] = analytics["avg_winner"]
-    analytics["average_loser"] = analytics["avg_loser"]
-    analytics["win_loss_ratio"] = abs(analytics["avg_winner"] / analytics["avg_loser"]) if abs(analytics["avg_loser"]) > 1e-12 else (analytics["avg_winner"] if analytics["avg_winner"] > 0 else 0.0)
-    analytics["expectancy_per_trade"] = analytics["expectancy"]
-    analytics["long_trade_count"] = analytics["long_trades"]
-    analytics["short_trade_count"] = analytics["short_trades"]
-    analytics["long_pnl"] = analytics["pnl_long_trades"]
-    analytics["short_pnl"] = analytics["pnl_short_trades"]
-    analytics["long_profit_factor"] = long_gross_profit / long_gross_loss if long_gross_loss > 1e-12 else (long_gross_profit if long_gross_profit > 0 else 0.0)
-    analytics["short_profit_factor"] = short_gross_profit / short_gross_loss if short_gross_loss > 1e-12 else (short_gross_profit if short_gross_profit > 0 else 0.0)
-    analytics["avg_expected_profit"] = sum(expected_profits) / len(expected_profits) if expected_profits else 0.0
-    analytics["avg_realized_profit"] = sum(net_winners) / len(net_winners) if net_winners else 0.0
-    analytics["avg_realized_loss"] = sum(net_losers) / len(net_losers) if net_losers else 0.0
-    analytics["sub_10_fill_sources"] = dict(sub_10_sources)
-    analytics["sub_5_fill_sources"] = dict(sub_5_sources)
-    analytics["avg_net_profit_per_closed_trade"] = net_pnl / trade_count if trade_count else 0.0
-    analytics["avg_fee_per_trade"] = total_fees / trade_count if trade_count else 0.0
-    analytics["average_holding_time_seconds"] = sum(holding_times) / len(holding_times) if holding_times else 0.0
-    analytics["pnl_by_regime"] = dict(pnl_by_regime)
-    _finalize_group_stats(regime_stats)
-    analytics["regime_performance"] = regime_stats
-    analytics["performance_by_regime"] = regime_stats
-    analytics["performance_by_side"] = _finalize_group_stats(side_stats)
-    analytics["performance_by_hour"] = _finalize_group_stats(hour_stats)
-    analytics["performance_by_volatility_bucket"] = _finalize_group_stats(volatility_bucket_stats)
-    analytics["trades_by_regime"] = {k: v["trades"] for k, v in regime_stats.items()}
-    analytics["winrate_by_regime"] = {k: v["winrate_pct"] for k, v in regime_stats.items()}
-    analytics["profit_factor_by_regime"] = {k: v["profit_factor"] for k, v in regime_stats.items()}
-    analytics["pnl_by_trade_category"] = dict(pnl_by_trade_category)
-    analytics["long_winrate_pct"] = (sum(1 for x in long_outcomes if x > 0) / len(long_outcomes) * 100.0) if long_outcomes else 0.0
-    analytics["short_winrate_pct"] = (sum(1 for x in short_outcomes if x > 0) / len(short_outcomes) * 100.0) if short_outcomes else 0.0
-    total_liquidity_trades = analytics["maker_trades"] + analytics["taker_trades"]
-    analytics["maker_ratio_pct"] = analytics["maker_trades"] / total_liquidity_trades * 100.0 if total_liquidity_trades else 0.0
-    analytics["taker_ratio_pct"] = analytics["taker_trades"] / total_liquidity_trades * 100.0 if total_liquidity_trades else 0.0
-    if first_ts is not None and last_ts is not None:
-        days = max((last_ts - first_ts).total_seconds() / 86400.0, 1.0)
-        analytics["trades_per_day"] = trade_count / days
-    analytics["avg_winner_before"] = sum(winner_before_cutover) / len(winner_before_cutover) if winner_before_cutover else 0.0
-    analytics["avg_winner_after"] = sum(winner_after_cutover) / len(winner_after_cutover) if winner_after_cutover else analytics["avg_winner"]
-    analytics["bullish_entry_pnl"] = sum(orderbook_bullish_pnls)
-    analytics["bearish_entry_pnl"] = sum(orderbook_bearish_pnls)
-    analytics["avg_pnl_bullish_entries"] = sum(orderbook_bullish_pnls) / len(orderbook_bullish_pnls) if orderbook_bullish_pnls else 0.0
-    analytics["avg_pnl_bearish_entries"] = sum(orderbook_bearish_pnls) / len(orderbook_bearish_pnls) if orderbook_bearish_pnls else 0.0
-    return analytics
-
-
 def _parse_iso_utc(ts_raw: str) -> datetime | None:
     if not ts_raw:
         return None
@@ -627,12 +147,33 @@ def _resolve_last_real_trade_ts(expected_symbol: str, fallback: str = "") -> str
         TRADES_CSV,
     ]
     for csv_path in candidates:
-        last_trade = _read_last_valid_trade(csv_path, expected_symbol)
+        service = AnalyticsService(csv_path, RISK_DECISIONS_CSV, expected_symbol)
+        last_trade = service._read_last_valid_trade(csv_path)
         ts = str(last_trade.get("timestamp", "")).strip()
         if _parse_iso_utc(ts):
             return ts
     return fallback
 
+
+
+def _read_last_valid_trade(csv_path: Path, expected_symbol: str) -> dict:
+    return AnalyticsService(csv_path, RISK_DECISIONS_CSV, expected_symbol)._read_last_valid_trade(csv_path)
+
+
+def _write_last_100_real_trades(csv_path: Path, out_path: Path, expected_symbol: str) -> None:
+    AnalyticsService(csv_path, RISK_DECISIONS_CSV, expected_symbol).write_last_100_real_trades(out_path)
+
+
+def _trade_stats_window(now_ts: float, expected_symbol: str, window_seconds: int = 3600) -> dict:
+    return AnalyticsService(TRADES_CSV, RISK_DECISIONS_CSV, expected_symbol).trade_stats_window(now_ts, window_seconds)
+
+
+def _risk_block_stats_window(now_ts: float, window_seconds: int = 3600) -> tuple[int, dict[str, int], str]:
+    return AnalyticsService(TRADES_CSV, RISK_DECISIONS_CSV, "BTC").risk_block_stats_window(now_ts, window_seconds)
+
+
+def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *, exclude_dust: bool = True) -> dict:
+    return AnalyticsService(csv_path, RISK_DECISIONS_CSV, expected_symbol).trade_analytics_report(exclude_dust=exclude_dust)
 
 def _send_startup_failure_telegram(cfg: BotConfig, tg: TelegramHandler, error_code: str, exc: BaseException) -> str:
     message = "\n".join([
@@ -693,6 +234,8 @@ def run() -> None:
     logger.info("Startup profile=%s execution_mode=live_only live_execution_enabled=%s", cfg.env_profile, cfg.live_execution_enabled)
     logger.info("risk_settings max_position_notional_usd=%s soft_exposure_cap_pct=%s hard_exposure_cap_pct=%s absolute_exposure_cap_pct=%s execution_mode=live_only enable_live_trading=%s live_execution_enabled=%s", cfg.max_position_notional_usd, cfg.soft_exposure_cap_pct, cfg.hard_exposure_cap_pct, cfg.absolute_exposure_cap_pct, cfg.enable_live_trading, cfg.live_execution_enabled)
     tg = TelegramHandler(cfg.telegram_bot_token, cfg.telegram_chat_id)
+    analytics_service = AnalyticsService(TRADES_CSV, RISK_DECISIONS_CSV, cfg.default_symbol)
+    recent_trades: deque[dict] = deque(maxlen=10)
     try:
         run_startup_validation(cfg)
     except RuntimeError as exc:
@@ -802,6 +345,7 @@ def run() -> None:
         daily_metrics = calculate_daily_pnl_metrics(current_equity=equity, daily_start_equity=daily_start_equity, realized_pnl_total=account_state.realized_pnl, daily_start_realized_pnl=daily_start_realized_pnl, unrealized_pnl=unrealized_pnl, fees_paid_total=account_state.fees_paid, daily_start_fees_paid=daily_start_fees_paid)
 
         for tr in trade_events:
+            recent_trades.append(tr)
             logger.info("trade_event side=%s symbol=%s price=%.6f qty=%.8f", tr["side"], tr["symbol"], tr["price"], tr["qty"])
             if cfg.telegram_send_fills:
                 msg = tg.format_fill_alert(tr, mode_name="LIVE")
@@ -852,14 +396,16 @@ def run() -> None:
             "telegram_status": telegram_status,
         }
 
-        last_trade = _read_last_valid_trade(TRADES_CSV, cfg.default_symbol)
+        last_trade = analytics_service._read_last_valid_trade(TRADES_CSV)
         try:
-            _write_last_100_real_trades(TRADES_CSV, LAST_100_REAL_TRADES_CSV, cfg.default_symbol)
+            analytics_service.write_last_100_real_trades(LAST_100_REAL_TRADES_CSV)
         except Exception:
             logger.exception("last_100_real_trades_export_failed")
-        blocked_1h, blocked_by_reason_1h, last_block_reason = _risk_block_stats_window(now_ts=time.time())
-        trade_stats_1h = _trade_stats_window(now_ts=time.time(), expected_symbol=cfg.default_symbol)
-        trade_analytics = _trade_analytics_report(cfg.default_symbol, exclude_dust=cfg.exclude_dust_from_performance_stats)
+        blocked_1h, blocked_by_reason_1h, last_block_reason = analytics_service.risk_block_stats_window(now_ts=time.time())
+        stats_now_ts = time.time()
+        trade_stats_1h = analytics_service.trade_stats_window(now_ts=stats_now_ts)
+        trade_stats_30m = analytics_service.trade_stats_window(now_ts=stats_now_ts, window_seconds=1800)
+        trade_analytics = analytics_service.trade_analytics_report(exclude_dust=cfg.exclude_dust_from_performance_stats)
         position_side = "FLAT"
         if account_state.position_size > 0:
             position_side = "LONG"
@@ -982,12 +528,12 @@ def run() -> None:
                 "taker_fee_total_1h": trade_stats_1h["taker_fee_total"],
                 "dust_trade_count_1h": trade_stats_1h["dust_trade_count"],
                 "dust_volume_1h": trade_stats_1h["dust_volume"],
-                "trades_30m": trade_stats_1h["trades_count"],
-                "buy_count_30m": trade_stats_1h["buy_count"],
-                "sell_count_30m": trade_stats_1h["sell_count"],
-                "volume_usd_30m": trade_stats_1h["volume_usd"],
-                "fees_30m": trade_stats_1h["fees"],
-                "realized_pnl_delta_30m": trade_stats_1h["realized_pnl_delta"],
+                "trades_30m": trade_stats_30m["trades_count"],
+                "buy_count_30m": trade_stats_30m["buy_count"],
+                "sell_count_30m": trade_stats_30m["sell_count"],
+                "volume_usd_30m": trade_stats_30m["volume_usd"],
+                "fees_30m": trade_stats_30m["fees"],
+                "realized_pnl_delta_30m": trade_stats_30m["realized_pnl_delta"],
                 "no_fill_cycles": engine.no_fill_cycles,
                 "avg_profit_per_trade": trade_analytics["avg_profit_per_trade"],
                 "avg_profit_per_winner": trade_analytics["avg_profit_per_winner"],
@@ -1181,14 +727,13 @@ def run() -> None:
                 elif text.startswith("/risk"):
                     tg.send(f"risk_state: {status_payload.get('risk_state')}\npause_reason: {status_payload.get('pause_reason') or 'none'}\nlast_block_reason: {status_payload.get('last_block_reason') or 'none'}\nblocked_risk_decisions_1h: {status_payload.get('blocked_risk_decisions_1h', 0)}\nallowed_to_trade: {status_payload.get('allowed_to_trade')}")
                 elif text.startswith("/trades"):
-                    lines = ["Utolsó 5 trade:"]
-                    rows = []
-                    if TRADES_CSV.exists():
-                        with TRADES_CSV.open(encoding="utf-8") as f:
-                            rows = [r for r in csv.DictReader(f)][-5:]
-                    for r in rows:
-                        lines.append(f"{r.get('timestamp','')} | {r.get('side','').upper()} {r.get('qty','')} @ {r.get('price','')} | pnlΔ {r.get('realized_pnl_delta','0')}")
-                    tg.send("\n".join(lines))
+                    lines = ["Utolsó trades:"]
+                    for r in list(recent_trades)[-5:]:
+                        lines.append(
+                            f"{r.get('timestamp','')} | {r.get('side','').upper()} "
+                            f"{r.get('qty','')} @ {r.get('price','')} | pnlΔ {r.get('realized_pnl_delta','0')}"
+                        )
+                    tg.send("\n".join(lines) if len(lines) > 1 else "Még nincs trade ebben a sessionben.")
 
         now_ts = time.time()
         if cfg.telegram_send_periodic_status and (now_ts - last_telegram_report_ts) >= cfg.telegram_report_interval_seconds:
