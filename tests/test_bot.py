@@ -3859,3 +3859,115 @@ def test_bot_config_fee_fields_from_env(monkeypatch, tmp_path):
     assert cfg.maker_fee_rate == pytest.approx(0.0002)
     assert cfg.taker_fee_rate == pytest.approx(0.0006)
     assert cfg.use_alo_orders is False
+
+
+def test_live_opening_fill_places_paired_reduce_only_tp(tmp_path):
+    client = _StatefulLiveClient()
+    eng = _live_engine(tmp_path, client)
+    eng.last_grid_spacing_pct = 0.005
+    client.get_user_fills = lambda symbol=None: [
+        {"coin": "BTC", "px": "100.0", "sz": "1.0", "side": "B", "dir": "Open Long", "fee": "0.015", "closedPnl": "0", "tid": 1, "time": 1700000000000},
+    ]
+
+    entries = eng.sync_user_fills("BTC")
+
+    assert len(entries) == 1
+    assert entries[0]["paired_tp_placed"] is True
+    assert eng.paired_tp_placed_count == 1
+    tp_orders = [p for p in client.placed if p["reduce_only"]]
+    assert len(tp_orders) == 1
+    assert tp_orders[0]["side"] == "sell"
+    assert tp_orders[0]["price"] == pytest.approx(100.5)
+    assert tp_orders[0]["post_only"] is False
+
+
+def test_live_closing_fill_does_not_place_paired_tp(tmp_path):
+    client = _StatefulLiveClient()
+    eng = _live_engine(tmp_path, client)
+    client.get_user_fills = lambda symbol=None: [
+        {"coin": "BTC", "px": "100.5", "sz": "1.0", "side": "A", "dir": "Close Long", "fee": "0.015", "closedPnl": "0.5", "tid": 2, "time": 1700000001000},
+    ]
+
+    entries = eng.sync_user_fills("BTC")
+
+    assert len(entries) == 1
+    assert entries[0]["paired_tp_placed"] is False
+    assert eng.paired_tp_placed_count == 0
+    assert not [p for p in client.placed if p["reduce_only"]]
+
+
+def test_live_paired_tp_short_entry_places_buy_below(tmp_path):
+    client = _StatefulLiveClient()
+    eng = _live_engine(tmp_path, client)
+    eng.last_grid_spacing_pct = 0.004
+    client.get_user_fills = lambda symbol=None: [
+        {"coin": "BTC", "px": "100.0", "sz": "1.0", "side": "A", "dir": "Open Short", "fee": "0.015", "closedPnl": "0", "tid": 3, "time": 1700000002000},
+    ]
+
+    eng.sync_user_fills("BTC")
+
+    tp_orders = [p for p in client.placed if p["reduce_only"]]
+    assert len(tp_orders) == 1
+    assert tp_orders[0]["side"] == "buy"
+    assert tp_orders[0]["price"] == pytest.approx(99.6)
+
+
+def test_live_paired_tp_disabled_via_flag(tmp_path):
+    client = _StatefulLiveClient()
+    eng = _live_engine(tmp_path, client, paired_take_profit_enabled=False)
+    client.get_user_fills = lambda symbol=None: [
+        {"coin": "BTC", "px": "100.0", "sz": "1.0", "side": "B", "dir": "Open Long", "fee": "0.015", "closedPnl": "0", "tid": 4, "time": 1700000003000},
+    ]
+
+    eng.sync_user_fills("BTC")
+
+    assert eng.paired_tp_placed_count == 0
+    assert not [p for p in client.placed if p["reduce_only"]]
+
+
+def test_paper_opening_fill_places_paired_tp_order(tmp_path):
+    eng = make_test_engine(tmp_path, "paper_tp.json", paper_mode=True, min_order_lifetime_seconds=0)
+    eng.last_grid_spacing_pct = 0.005
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 1.0, "created_ts": time.time() - 600}]
+
+    fills = eng.on_candle({"symbol": "BTC", "open": 100.0, "high": 100.5, "low": 98.5, "close": 99.5})
+
+    assert len(fills) == 1
+    tp_orders = [o for o in eng.open_orders if o.get("order_source") == "paired_tp"]
+    assert len(tp_orders) == 1
+    assert tp_orders[0]["side"] == "sell"
+    assert tp_orders[0]["reduce_only"] is True
+    assert tp_orders[0]["price"] == pytest.approx(99.0 * 1.005)
+    assert eng.paired_tp_placed_count == 1
+
+
+def test_paper_closing_fill_does_not_place_paired_tp(tmp_path):
+    eng = make_test_engine(tmp_path, "paper_tp_close.json", paper_mode=True, min_order_lifetime_seconds=0)
+    eng.paper.position_size = 1.0
+    eng.paper.avg_entry = 99.0
+    eng.open_orders = [{"symbol": "BTC", "side": "sell", "price": 99.5, "size": 1.0, "reduce_only": True, "created_ts": time.time() - 600}]
+
+    fills = eng.on_candle({"symbol": "BTC", "open": 99.0, "high": 100.0, "low": 99.0, "close": 99.8})
+
+    assert len(fills) == 1
+    assert eng.paired_tp_placed_count == 0
+    assert not [o for o in eng.open_orders if o.get("order_source") == "paired_tp"]
+
+
+def test_cancel_replace_grid_records_plan_spacing(tmp_path):
+    eng = make_test_engine(tmp_path, "spacing_record.json", min_order_lifetime_seconds=0)
+    plan = GridManager().build_grid(100, 1, 0.0123, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    eng.cancel_replace_grid("BTC", plan)
+
+    assert eng.last_grid_spacing_pct == pytest.approx(0.0123)
+
+
+def test_bot_config_paired_tp_fields_from_env(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PAIRED_TAKE_PROFIT_ENABLED", "false")
+    monkeypatch.setenv("PAIRED_TP_SPACING_MULTIPLIER", "1.5")
+    cfg = BotConfig.from_env()
+
+    assert cfg.paired_take_profit_enabled is False
+    assert cfg.paired_tp_spacing_multiplier == pytest.approx(1.5)

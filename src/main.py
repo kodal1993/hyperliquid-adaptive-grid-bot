@@ -255,8 +255,8 @@ def run() -> None:
 
     client = HyperliquidClient(cfg.private_key, cfg.account_address, cfg.hl_network)
     client.connect()
-    engine = LiveExecutionEngine(client=client, state_file=cfg.state_file, start_balance=0.0, max_position_notional_usd=cfg.max_position_notional_usd, allow_position_flip=cfg.allow_position_flip, max_notional_per_trade_usd=cfg.max_notional_per_trade_usd, min_notional_usd=cfg.min_notional_usd, min_order_notional_usd=cfg.min_order_notional_usd, dust_position_notional_usd=cfg.dust_position_notional_usd, leverage=cfg.base_leverage, min_order_lifetime_seconds=cfg.min_order_lifetime_seconds, min_reprice_distance_pct=cfg.min_reprice_distance_pct, maker_fee_rate=cfg.maker_fee_rate, taker_fee_rate=cfg.taker_fee_rate, use_alo_orders=cfg.use_alo_orders)
-    logger.info("fee_model maker_fee_rate=%s taker_fee_rate=%s use_alo_orders=%s", cfg.maker_fee_rate, cfg.taker_fee_rate, cfg.use_alo_orders)
+    engine = LiveExecutionEngine(client=client, state_file=cfg.state_file, start_balance=0.0, max_position_notional_usd=cfg.max_position_notional_usd, allow_position_flip=cfg.allow_position_flip, max_notional_per_trade_usd=cfg.max_notional_per_trade_usd, min_notional_usd=cfg.min_notional_usd, min_order_notional_usd=cfg.min_order_notional_usd, dust_position_notional_usd=cfg.dust_position_notional_usd, leverage=cfg.base_leverage, min_order_lifetime_seconds=cfg.min_order_lifetime_seconds, min_reprice_distance_pct=cfg.min_reprice_distance_pct, maker_fee_rate=cfg.maker_fee_rate, taker_fee_rate=cfg.taker_fee_rate, use_alo_orders=cfg.use_alo_orders, paired_take_profit_enabled=cfg.paired_take_profit_enabled, paired_tp_spacing_multiplier=cfg.paired_tp_spacing_multiplier)
+    logger.info("fee_model maker_fee_rate=%s taker_fee_rate=%s use_alo_orders=%s paired_take_profit_enabled=%s paired_tp_spacing_multiplier=%s", cfg.maker_fee_rate, cfg.taker_fee_rate, cfg.use_alo_orders, cfg.paired_take_profit_enabled, cfg.paired_tp_spacing_multiplier)
     logger.info("execution_mode=live_only")
     client.set_leverage(cfg.default_symbol, cfg.base_leverage)
     orchestrator = StrategyOrchestrator(config=cfg, execution_engine=engine)
