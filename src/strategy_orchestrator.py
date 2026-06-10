@@ -963,6 +963,23 @@ class StrategyOrchestrator:
             no_grid_orders_generated_reason = "no_allowed_sides"
         raw_buy_levels, raw_sell_levels = self.grid_manager._level_counts(max(effective_grid_levels, 1), mode, trend_bias=trend_bias)
         raw_grid_orders = (raw_buy_levels if allow_buys_before_min_notional else 0) + (raw_sell_levels if allow_sells_before_min_notional else 0)
+        no_fill_watchdog_context = self._no_fill_watchdog_context(
+            symbol=symbol,
+            price=price,
+            risk_can_trade=bool(risk_state.can_trade),
+            pause_reason="none",
+            position_notional=effective_position_notional,
+        )
+        if no_fill_watchdog_context["no_fill_watchdog_active"]:
+            before_watchdog_spacing = final_spacing_pct
+            final_spacing_pct = max(final_spacing_pct * 0.80, float(self.config.min_grid_profit_over_fees_pct))
+            spacing_source = f"{spacing_source}_no_fill_watchdog"
+            force_recenter = True
+            recenter_context["force_recenter"] = True
+            recenter_context["forced_rebuild"] = True
+            recenter_context["rebuild_reason"] = "no_fill_watchdog"
+            logger.info("maker_fill_proximity_mode enabled=true spacing_pct_before=%.6f spacing_pct_after=%.6f fee_safe_min_pct=%.6f", before_watchdog_spacing, final_spacing_pct, float(self.config.min_grid_profit_over_fees_pct))
+        recenter_context.update(no_fill_watchdog_context)
         plan: GridPlan = self.grid_manager.build_grid(price, max(effective_grid_levels, 1), final_spacing_pct, 0.0, regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=build_allow_buys, allow_sells=build_allow_sells, force_recenter=force_recenter, spacing_source=spacing_source, atr_pct=atr_pct, trend_bias=trend_bias, regime_confidence=regime_confidence)
         if effective_position_side == "FLAT" and orderbook_analysis.available and orderbook_analysis.ready:
             self._apply_orderbook_size_multipliers(plan, price, orderbook_analysis.long_size_multiplier, orderbook_analysis.short_size_multiplier)
@@ -1161,6 +1178,47 @@ class StrategyOrchestrator:
             canceled = self.execution_engine.cancel_all_orders(symbol)
             return {"status": "paused", "regime": regime.value, "risk": risk_state, "reason": "neutral_blocked_in_trend", "canceled_orders": canceled, "allowed_to_trade": False, "allowed_to_reduce": False, "position_management_action": "none", "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **market_stress_context, **recenter_context, **edge_context, **level_decision_context}
         return {"status": "running", "regime": regime.value, "risk": risk_state, "orders": result, "mode": mode.value, "order_size": order_size, "order_notional": order_notional, "allow_buys": allow_buys, "allow_sells": allow_sells, "allowed_to_trade": True, "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"}, "state_source": account_state.state_source, "regime_confidence": regime_confidence, "grid_spacing_pct": final_spacing_pct, "spacing_source": spacing_source, "atr_pct": atr_pct, "grid_levels": effective_grid_levels, "volatility_grid_levels": volatility_grid_levels, "trend_bias": trend_bias, **dust_context, **market_stress_context, **recenter_context, **edge_context, **level_decision_context}
+
+    def _nearest_order_distances(self, symbol: str, mid_price: float) -> tuple[float | None, float | None]:
+        orders = [o for o in getattr(self.execution_engine, "open_orders", []) if str(o.get("symbol", symbol)).upper() == symbol.upper()]
+        buys = [float(o.get("price", 0.0) or 0.0) for o in orders if str(o.get("side", "")).lower() == "buy"]
+        sells = [float(o.get("price", 0.0) or 0.0) for o in orders if str(o.get("side", "")).lower() == "sell"]
+        nearest_buy = max(buys) if buys else None
+        nearest_sell = min(sells) if sells else None
+        buy_dist = ((mid_price - nearest_buy) / mid_price) if nearest_buy else None
+        sell_dist = ((nearest_sell - mid_price) / mid_price) if nearest_sell else None
+        return buy_dist, sell_dist
+
+    def _no_fill_watchdog_context(self, *, symbol: str, price: float, risk_can_trade: bool, pause_reason: str, position_notional: float) -> dict:
+        enabled = bool(getattr(self.config, "no_fill_watchdog_enabled", True))
+        max_minutes = float(getattr(self.config, "no_fill_max_minutes", 60))
+        max_nearest = float(getattr(self.config, "no_fill_max_nearest_distance_pct", 0.004))
+        buy_dist, sell_dist = self._nearest_order_distances(symbol, price)
+        distances = [d for d in (buy_dist, sell_dist) if d is not None]
+        nearest_distance = min(distances) if distances else None
+        last_fill_minutes = None
+        if getattr(self.execution_engine, "last_real_trade_ts", None) is not None:
+            last_fill_minutes = (datetime.now(timezone.utc) - self.execution_engine.last_real_trade_ts).total_seconds() / 60.0
+        cycle_minutes = float(getattr(self.execution_engine, "no_fill_cycles", 0) or 0) * float(getattr(self.config, "tick_seconds", 10)) / 60.0
+        effective_no_fill_minutes = max(last_fill_minutes if last_fill_minutes is not None else 0.0, cycle_minutes)
+        if last_fill_minutes is None and cycle_minutes <= 0:
+            effective_no_fill_minutes = max_minutes + 1.0
+        open_orders_exist = any(str(o.get("symbol", symbol)).upper() == symbol.upper() for o in getattr(self.execution_engine, "open_orders", []))
+        low_exposure = position_notional <= max(float(getattr(self.config, "max_position_notional_usd", 0.0)) * 0.25, float(getattr(self.config, "dust_position_notional_usd", 0.0)))
+        active = bool(enabled and risk_can_trade and pause_reason == "none" and low_exposure and open_orders_exist and effective_no_fill_minutes > max_minutes and nearest_distance is not None and nearest_distance > max_nearest)
+        if active:
+            logger.warning("no_fill_watchdog_triggered no_fill_minutes=%.2f max_minutes=%.2f nearest_distance_pct=%.6f max_nearest_distance_pct=%.6f open_orders_exist=%s low_exposure=%s", effective_no_fill_minutes, max_minutes, nearest_distance, max_nearest, open_orders_exist, low_exposure)
+        return {
+            "no_fill_watchdog_active": active,
+            "no_fill_watchdog_enabled": enabled,
+            "no_fill_minutes": effective_no_fill_minutes,
+            "no_fill_max_minutes": max_minutes,
+            "no_fill_max_nearest_distance_pct": max_nearest,
+            "nearest_buy_distance_pct": buy_dist,
+            "nearest_sell_distance_pct": sell_dist,
+            "nearest_order_distance_pct": nearest_distance,
+            "no_fill_watchdog_reason": "active" if active else "conditions_not_met",
+        }
 
     def _apply_long_side_selectivity(
         self,

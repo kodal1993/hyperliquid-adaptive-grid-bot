@@ -3305,3 +3305,142 @@ def test_expectancy_telemetry_reports_side_pf_and_fee_leakage_sources(tmp_path):
     assert metrics["sub_10_fill_sources"] == {"dust_cleanup": 1}
     assert metrics["bullish_entry_pnl"] == pytest.approx(0.9)
     assert metrics["bearish_entry_pnl"] == pytest.approx(0.8)
+
+
+def _candles_for_watchdog(price: float = 100.0, rows: int = 80) -> pd.DataFrame:
+    return pd.DataFrame({"open": [price] * rows, "high": [price * 1.001] * rows, "low": [price * 0.999] * rows, "close": [price] * rows})
+
+
+def test_no_fill_watchdog_narrows_spacing_after_timeout(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.no_fill_watchdog_enabled = True
+    cfg.no_fill_max_minutes = 60
+    cfg.no_fill_max_nearest_distance_pct = 0.004
+    cfg.tick_seconds = 60
+    cfg.min_order_notional_usd = 1
+    cfg.min_notional_usd = 1
+    cfg.order_notional_usd = 10
+    cfg.max_notional_per_trade_usd = 10
+    cfg.min_order_size = 0
+    cfg.grid_spacing_pct = 0.01
+    cfg.grid_spacing_pct_min = 0.001
+    cfg.grid_spacing_low_vol_min_pct = 0.006
+    cfg.grid_spacing_low_vol_max_pct = 0.012
+    cfg.min_grid_profit_over_fees_pct = 0.0005
+    cfg.regrid_threshold_pct = 0
+    cfg.min_order_lifetime_seconds = 0
+    cfg.stale_order_max_age_sec = 999999
+    eng = make_test_engine(tmp_path, "watchdog.json", paper_mode=True, min_order_lifetime_seconds=0)
+    eng.open_orders = [
+        {"symbol": "BTC", "side": "buy", "price": 99.0, "size": 0.1, "created_ts": time.time() - 3600},
+        {"symbol": "BTC", "side": "sell", "price": 101.0, "size": 0.1, "created_ts": time.time() - 3600},
+    ]
+    eng.no_fill_cycles = 61
+    orch = StrategyOrchestrator(cfg, eng)
+
+    status = orch.on_tick(_candles_for_watchdog(100.0), equity=500, daily_pnl_pct=0, symbol="BTC")
+
+    assert status["no_fill_watchdog_active"] is True
+    assert status["grid_spacing_pct"] < 0.012
+    assert len(eng.open_orders) > 0
+    assert all(float(o["price"]) * float(o["size"]) >= cfg.min_order_notional_usd for o in eng.open_orders)
+
+
+def test_reprice_does_not_happen_before_minimum_lifetime(tmp_path):
+    eng = make_test_engine(tmp_path, "reprice_age.json", min_order_lifetime_seconds=90, min_reprice_distance_pct=0.0015)
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 1.0, "created_ts": time.time()}]
+    plan = GridManager().build_grid(100, 1, 0.005, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, allow_sells=False, force_recenter=True)
+
+    result = eng.cancel_replace_grid("BTC", plan)
+
+    assert result["reprice_decision"] == "skip"
+    assert result["reprice_reason"] == "min_order_lifetime"
+    assert eng.open_orders[0]["price"] == 99.0
+
+
+def test_reprice_only_happens_if_price_delta_exceeds_threshold(tmp_path):
+    eng = make_test_engine(tmp_path, "reprice_delta.json", min_order_lifetime_seconds=0, min_reprice_distance_pct=0.0015)
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 1.0, "created_ts": time.time() - 120}]
+    plan = GridManager().build_grid(100, 1, 0.0105, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, allow_sells=False, force_recenter=True)
+    result = eng.cancel_replace_grid("BTC", plan)
+    assert result["reprice_decision"] == "skip"
+    assert result["reprice_reason"] == "min_reprice_distance"
+
+    plan = GridManager().build_grid(100, 1, 0.013, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, allow_sells=False, force_recenter=True)
+    result = eng.cancel_replace_grid("BTC", plan)
+    assert result["reprice_decision"] == "replace"
+    assert result["canceled"] == 1
+    assert eng.open_orders[0]["price"] == pytest.approx(98.7)
+
+
+def test_emergency_risk_reduce_orders_bypass_lifetime_rule(tmp_path):
+    eng = make_test_engine(tmp_path, "reduce_bypass.json", min_order_lifetime_seconds=9999)
+    eng.paper.position_size = 1.0
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 1.0, "created_ts": time.time()}]
+
+    placed = eng.place_reduce_only_orders("BTC", position_size=1.0, mark_price=100.0, order_size=0.5, levels=1)
+
+    assert placed == 1
+    assert any(o.get("reduce_only") and o["side"] == "sell" for o in eng.open_orders)
+
+
+def test_no_fill_watchdog_never_creates_below_min_notional_order(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.no_fill_watchdog_enabled = True
+    cfg.no_fill_max_minutes = 60
+    cfg.no_fill_max_nearest_distance_pct = 0.004
+    cfg.tick_seconds = 60
+    cfg.min_order_notional_usd = 50
+    cfg.min_notional_usd = 50
+    cfg.order_notional_usd = 10
+    cfg.max_notional_per_trade_usd = 10
+    cfg.min_order_size = 0
+    cfg.grid_spacing_pct = 0.01
+    cfg.grid_spacing_pct_min = 0.001
+    cfg.grid_spacing_low_vol_min_pct = 0.006
+    cfg.grid_spacing_low_vol_max_pct = 0.012
+    cfg.min_grid_profit_over_fees_pct = 0.0005
+    cfg.regrid_threshold_pct = 0
+    cfg.min_order_lifetime_seconds = 0
+    cfg.stale_order_max_age_sec = 999999
+    eng = make_test_engine(tmp_path, "watchdog_min.json", paper_mode=True, min_order_lifetime_seconds=0, min_order_notional_usd=50)
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 1.0, "created_ts": time.time() - 3600}]
+    eng.no_fill_cycles = 61
+    orch = StrategyOrchestrator(cfg, eng)
+
+    orch.on_tick(_candles_for_watchdog(100.0), equity=500, daily_pnl_pct=0, symbol="BTC")
+
+    assert all(float(o["price"]) * float(o["size"]) >= cfg.min_order_notional_usd for o in eng.open_orders)
+
+
+def test_no_fill_watchdog_never_creates_zero_order_flat_state(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.no_fill_watchdog_enabled = True
+    cfg.no_fill_max_minutes = 60
+    cfg.no_fill_max_nearest_distance_pct = 0.004
+    cfg.tick_seconds = 60
+    cfg.min_order_notional_usd = 1
+    cfg.min_notional_usd = 1
+    cfg.order_notional_usd = 10
+    cfg.max_notional_per_trade_usd = 10
+    cfg.min_order_size = 0
+    cfg.grid_spacing_pct = 0.01
+    cfg.grid_spacing_pct_min = 0.001
+    cfg.grid_spacing_low_vol_min_pct = 0.006
+    cfg.grid_spacing_low_vol_max_pct = 0.012
+    cfg.min_grid_profit_over_fees_pct = 0.0005
+    cfg.regrid_threshold_pct = 0
+    cfg.min_order_lifetime_seconds = 0
+    cfg.stale_order_max_age_sec = 999999
+    eng = make_test_engine(tmp_path, "watchdog_zero.json", paper_mode=True, min_order_lifetime_seconds=0, min_order_notional_usd=1)
+    eng.open_orders = [
+        {"symbol": "BTC", "side": "buy", "price": 99.0, "size": 0.1, "created_ts": time.time() - 3600},
+        {"symbol": "BTC", "side": "sell", "price": 101.0, "size": 0.1, "created_ts": time.time() - 3600},
+    ]
+    eng.no_fill_cycles = 61
+    orch = StrategyOrchestrator(cfg, eng)
+
+    status = orch.on_tick(_candles_for_watchdog(100.0), equity=500, daily_pnl_pct=0, symbol="BTC")
+
+    assert status["no_fill_watchdog_active"] is True
+    assert len(eng.open_orders) > 0

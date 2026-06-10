@@ -138,6 +138,11 @@ class BotConfig:
     prediction_max_level_bias_pct: float
     prediction_max_size_multiplier: float
     prediction_min_size_multiplier: float
+    no_fill_watchdog_enabled: bool
+    no_fill_max_minutes: int
+    no_fill_max_nearest_distance_pct: float
+    min_order_lifetime_seconds: int
+    min_reprice_distance_pct: float
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -290,4 +295,9 @@ class BotConfig:
             prediction_max_level_bias_pct=float(os.getenv("PREDICTION_MAX_LEVEL_BIAS_PCT", "0.35")),
             prediction_max_size_multiplier=float(os.getenv("PREDICTION_MAX_SIZE_MULTIPLIER", "1.20")),
             prediction_min_size_multiplier=float(os.getenv("PREDICTION_MIN_SIZE_MULTIPLIER", "0.80")),
+            no_fill_watchdog_enabled=os.getenv("NO_FILL_WATCHDOG_ENABLED", "true").lower() == "true",
+            no_fill_max_minutes=int(os.getenv("NO_FILL_MAX_MINUTES", "60")),
+            no_fill_max_nearest_distance_pct=float(os.getenv("NO_FILL_MAX_NEAREST_DISTANCE_PCT", "0.004")),
+            min_order_lifetime_seconds=int(os.getenv("MIN_ORDER_LIFETIME_SECONDS", "90")),
+            min_reprice_distance_pct=float(os.getenv("MIN_REPRICE_DISTANCE_PCT", "0.0015")),
         )

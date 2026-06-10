@@ -692,7 +692,7 @@ def run() -> None:
 
     client = HyperliquidClient(cfg.private_key, cfg.account_address, cfg.hl_network)
     client.connect()
-    engine = LiveExecutionEngine(client=client, state_file=cfg.state_file, start_balance=0.0, max_position_notional_usd=cfg.max_position_notional_usd, allow_position_flip=cfg.allow_position_flip, max_notional_per_trade_usd=cfg.max_notional_per_trade_usd, min_notional_usd=cfg.min_notional_usd, min_order_notional_usd=cfg.min_order_notional_usd, dust_position_notional_usd=cfg.dust_position_notional_usd, leverage=cfg.base_leverage)
+    engine = LiveExecutionEngine(client=client, state_file=cfg.state_file, start_balance=0.0, max_position_notional_usd=cfg.max_position_notional_usd, allow_position_flip=cfg.allow_position_flip, max_notional_per_trade_usd=cfg.max_notional_per_trade_usd, min_notional_usd=cfg.min_notional_usd, min_order_notional_usd=cfg.min_order_notional_usd, dust_position_notional_usd=cfg.dust_position_notional_usd, leverage=cfg.base_leverage, min_order_lifetime_seconds=cfg.min_order_lifetime_seconds, min_reprice_distance_pct=cfg.min_reprice_distance_pct)
     logger.info("execution_mode=live_only")
     client.set_leverage(cfg.default_symbol, cfg.base_leverage)
     orchestrator = StrategyOrchestrator(config=cfg, execution_engine=engine)
@@ -1056,6 +1056,11 @@ def run() -> None:
                 "stale_order_detected": bool(status.get("stale_order_detected", False)),
                 "cleanup_canceled_orders": status.get("cleanup_canceled_orders", 0),
                 "state_uncertain_skip_cycle": bool(status.get("state_uncertain_skip_cycle", False)),
+                "no_fill_watchdog_active": bool(status.get("no_fill_watchdog_active", False)),
+                "no_fill_watchdog_enabled": bool(status.get("no_fill_watchdog_enabled", False)),
+                "no_fill_minutes": status.get("no_fill_minutes"),
+                "no_fill_max_minutes": status.get("no_fill_max_minutes"),
+                "no_fill_max_nearest_distance_pct": status.get("no_fill_max_nearest_distance_pct"),
             }
         )
         last_trade_ts = _resolve_last_real_trade_ts(cfg.default_symbol, fallback=(engine.last_real_trade_ts.isoformat() if engine.last_real_trade_ts else ""))
@@ -1100,12 +1105,37 @@ def run() -> None:
         status_payload.update({"last_real_trade_ts": last_trade_ts, "last_real_trade_age_hours": last_trade_age_hours, "next_order_side": next_order["side"] if next_order else None, "next_order_price": next_order["price"] if next_order else None, "next_exit_side": next_exit_side, "next_exit_price": next_exit_price, "take_profit_price": next_exit_price, "stop_price": None, "trailing_stop_price": None})
         nearest_buy = float(buys[0]["price"]) if buys else None
         nearest_sell = float(sells[0]["price"]) if sells else None
+        fill_rate_metrics = engine.fill_rate_metrics(mark_price, symbol=cfg.default_symbol) if hasattr(engine, "fill_rate_metrics") else {}
+        one_hour_fill_rate = fill_rate_metrics.get("1h", {}) if isinstance(fill_rate_metrics.get("1h", {}), dict) else {}
+        logger.info(
+            "fill_rate_state orders_submitted=%s orders_cancelled=%s orders_filled=%s cancel_to_fill_ratio=%s nearest_buy_distance_pct=%s nearest_sell_distance_pct=%s avg_order_lifetime_seconds=%s avg_order_distance_to_mid_pct=%s spacing_pct=%s reprice_decision=%s reprice_reason=%s no_fill_watchdog_active=%s",
+            one_hour_fill_rate.get("orders_submitted", 0),
+            one_hour_fill_rate.get("orders_cancelled", 0),
+            one_hour_fill_rate.get("orders_filled", 0),
+            one_hour_fill_rate.get("cancel_to_fill_ratio", 0.0),
+            fill_rate_metrics.get("nearest_buy_distance_pct"),
+            fill_rate_metrics.get("nearest_sell_distance_pct"),
+            one_hour_fill_rate.get("average_order_lifetime_seconds", 0.0),
+            fill_rate_metrics.get("average_distance_to_mid_pct"),
+            status_payload.get("grid_spacing_pct"),
+            (status.get("orders", {}) or {}).get("reprice_decision") if isinstance(status.get("orders", {}), dict) else None,
+            (status.get("orders", {}) or {}).get("reprice_reason") if isinstance(status.get("orders", {}), dict) else None,
+            status.get("no_fill_watchdog_active", False),
+        )
         status_payload.update(
             {
                 "nearest_buy_price": nearest_buy,
                 "nearest_sell_price": nearest_sell,
                 "distance_to_buy_pct": ((mark_price - nearest_buy) / mark_price) if nearest_buy else None,
                 "distance_to_sell_pct": ((nearest_sell - mark_price) / mark_price) if nearest_sell else None,
+                "fill_rate": fill_rate_metrics,
+                "fill_rate_1h": one_hour_fill_rate,
+                "fill_rate_6h": fill_rate_metrics.get("6h", {}),
+                "fill_rate_24h": fill_rate_metrics.get("24h", {}),
+                "average_distance_to_mid_pct": fill_rate_metrics.get("average_distance_to_mid_pct"),
+                "nearest_buy_distance_pct": fill_rate_metrics.get("nearest_buy_distance_pct"),
+                "nearest_sell_distance_pct": fill_rate_metrics.get("nearest_sell_distance_pct"),
+                "time_since_last_fill_minutes": fill_rate_metrics.get("time_since_last_fill_minutes"),
                 "active_buy_orders": len(buys),
                 "active_sell_orders": len(sells),
                 "one_sided_grid_due_to_dust": bool(is_dust_position and ((len(buys) == 0) ^ (len(sells) == 0)) and (len(buys) + len(sells) > 0)),
