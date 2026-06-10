@@ -41,6 +41,7 @@ def _validate_micro_live_limits(config: BotConfig) -> None:
 
 
 def run_startup_validation(config: BotConfig) -> dict:
+    config.validate()
     if config.hl_network not in {"testnet", "mainnet"}:
         raise ValueError("HL_NETWORK must be testnet or mainnet")
     validate_live_execution_gate(config)
