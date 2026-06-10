@@ -42,6 +42,9 @@ class BotConfig:
     maker_fee_rate: float
     taker_fee_rate: float
     use_alo_orders: bool
+    paired_take_profit_enabled: bool
+    paired_tp_spacing_multiplier: float
+    use_websocket: bool
     order_notional_usd: float
     max_active_exposure_usd: float
     regrid_threshold_pct: float
@@ -203,6 +206,9 @@ class BotConfig:
             maker_fee_rate=float(os.getenv("MAKER_FEE_RATE", "0.00015")),
             taker_fee_rate=float(os.getenv("TAKER_FEE_RATE", "0.00045")),
             use_alo_orders=os.getenv("USE_ALO_ORDERS", "true").lower() == "true",
+            paired_take_profit_enabled=os.getenv("PAIRED_TAKE_PROFIT_ENABLED", "true").lower() == "true",
+            paired_tp_spacing_multiplier=float(os.getenv("PAIRED_TP_SPACING_MULTIPLIER", "1.0")),
+            use_websocket=os.getenv("USE_WEBSOCKET", "true").lower() == "true",
             order_notional_usd=float(os.getenv("ORDER_NOTIONAL_USD", os.getenv("MAX_NOTIONAL_PER_TRADE_USD", "10"))),
             max_active_exposure_usd=float(os.getenv("MAX_ACTIVE_EXPOSURE_USD", "50")),
             regrid_threshold_pct=float(os.getenv("REGRID_THRESHOLD_PCT", "0.003")),
@@ -332,5 +338,7 @@ class BotConfig:
             errors.append(f"maker_fee_rate must be in [0, 0.01], got {self.maker_fee_rate}")
         if self.taker_fee_rate < 0 or self.taker_fee_rate > 0.01:
             errors.append(f"taker_fee_rate must be in [0, 0.01], got {self.taker_fee_rate}")
+        if self.paired_tp_spacing_multiplier <= 0:
+            errors.append(f"paired_tp_spacing_multiplier must be > 0, got {self.paired_tp_spacing_multiplier}")
         if errors:
             raise ValueError("BotConfig validation failed:\n" + "\n".join(f"  - {e}" for e in errors))

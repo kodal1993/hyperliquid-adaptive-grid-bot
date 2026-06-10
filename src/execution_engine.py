@@ -172,7 +172,7 @@ def trade_category_for_action(exposure_action: str) -> str:
     }.get(exposure_action, exposure_action or "unknown")
 
 class PaperExecutionEngine:
-    def __init__(self, client: HyperliquidClient, state_file: str, paper_mode: bool = True, enable_live_trading: bool = False, fee_rate: float = 0.0004, start_balance: float = 500.0, fill_model: str = "optimistic", max_position_notional_usd: float = 500.0, soft_exposure_cap_pct: float = 0.6, hard_exposure_cap_pct: float = 0.8, absolute_exposure_cap_pct: float = 1.0, allow_position_flip: bool = False, min_order_notional_usd: float | None = None, dust_position_notional_usd: float = 2.0, trade_ledger_csv: str | None = None, trade_ledger_jsonl: str | None = None, risk_decisions_csv: str | None = None, min_order_lifetime_seconds: int = 90, min_reprice_distance_pct: float = 0.0015, maker_fee_rate: float | None = None, taker_fee_rate: float | None = None) -> None:
+    def __init__(self, client: HyperliquidClient, state_file: str, paper_mode: bool = True, enable_live_trading: bool = False, fee_rate: float = 0.0004, start_balance: float = 500.0, fill_model: str = "optimistic", max_position_notional_usd: float = 500.0, soft_exposure_cap_pct: float = 0.6, hard_exposure_cap_pct: float = 0.8, absolute_exposure_cap_pct: float = 1.0, allow_position_flip: bool = False, min_order_notional_usd: float | None = None, dust_position_notional_usd: float = 2.0, trade_ledger_csv: str | None = None, trade_ledger_jsonl: str | None = None, risk_decisions_csv: str | None = None, min_order_lifetime_seconds: int = 90, min_reprice_distance_pct: float = 0.0015, maker_fee_rate: float | None = None, taker_fee_rate: float | None = None, paired_take_profit_enabled: bool = True, paired_tp_spacing_multiplier: float = 1.0) -> None:
         self.client = client
         self.paper_mode = paper_mode
         self.enable_live_trading = enable_live_trading
@@ -203,6 +203,10 @@ class PaperExecutionEngine:
         self.last_flip_trade_ts: datetime | None = None
         self.min_order_lifetime_seconds = max(int(min_order_lifetime_seconds), 0)
         self.min_reprice_distance_pct = max(float(min_reprice_distance_pct), 0.0)
+        self.paired_take_profit_enabled = bool(paired_take_profit_enabled)
+        self.paired_tp_spacing_multiplier = max(float(paired_tp_spacing_multiplier), 0.0)
+        self.paired_tp_placed_count = 0
+        self.last_grid_spacing_pct = 0.003
         self.order_events: list[dict] = []
 
     def _record_order_event(self, event_type: str, *, symbol: str = "", side: str = "", price: float | None = None, size: float | None = None, lifetime_seconds: float | None = None) -> None:
@@ -288,6 +292,8 @@ class PaperExecutionEngine:
 
     def cancel_replace_grid(self, symbol: str, plan: GridPlan) -> dict[str, int | str]:
         self._require_paper_execution("cancel_replace_grid")
+        if plan.spacing_pct and plan.spacing_pct > 0:
+            self.last_grid_spacing_pct = float(plan.spacing_pct)
         if not plan.should_regrid:
             return {"canceled": 0, "placed": 0, "symbol": symbol, "reprice_decision": "skip", "reprice_reason": "regrid_not_required"}
         can_replace, reprice_reason = self._can_replace_grid_now(symbol, plan)
@@ -450,11 +456,31 @@ class PaperExecutionEngine:
             )
             executed_fills.append(fill)
             self.open_orders.remove(original_fill)
+            self._maybe_place_paper_paired_take_profit(fill, position_before)
         if executed_fills:
             self.no_fill_cycles = 0
             self.last_real_trade_ts = datetime.now(timezone.utc)
         self.save_state()
         return executed_fills
+
+    def _maybe_place_paper_paired_take_profit(self, fill: dict, position_before: float) -> bool:
+        """Pair an executed opening grid fill with a reduce-only TP one spacing away."""
+        if not self.paired_take_profit_enabled or bool(fill.get("reduce_only")):
+            return False
+        if abs(self.paper.position_size) <= abs(position_before) + 1e-12:
+            return False
+        spacing = max(float(self.last_grid_spacing_pct), 0.0) * self.paired_tp_spacing_multiplier
+        price = float(fill.get("price", 0.0) or 0.0)
+        size = float(fill.get("size", 0.0) or 0.0)
+        if spacing <= 0 or price <= 0 or size <= 0:
+            return False
+        side = str(fill.get("side", "")).lower()
+        tp_side = "sell" if side == "buy" else "buy"
+        tp_price = price * (1.0 + spacing) if side == "buy" else price * (1.0 - spacing)
+        self.open_orders.append({"symbol": fill.get("symbol", ""), "side": tp_side, "price": tp_price, "size": size, "reduce_only": True, "created_ts": time.time(), "order_source": "paired_tp"})
+        self.paired_tp_placed_count += 1
+        logger.info("paired_tp_submitted mode=paper entry_side=%s entry_price=%s qty=%s tp_side=%s tp_price=%s spacing_pct=%s paired_tp_placed_count=%s", side, price, size, tp_side, tp_price, spacing, self.paired_tp_placed_count)
+        return True
 
     def _resize_close_only_fill(self, fill: dict, mark_price: float) -> dict | None:
         side = str(fill["side"]).lower()
@@ -730,6 +756,8 @@ class LiveExecutionEngine:
         maker_fee_rate: float | None = None,
         taker_fee_rate: float | None = None,
         use_alo_orders: bool = True,
+        paired_take_profit_enabled: bool = True,
+        paired_tp_spacing_multiplier: float = 1.0,
         **kwargs,
     ) -> None:
         self.client = client
@@ -759,6 +787,10 @@ class LiveExecutionEngine:
         self.taker_fee_rate = float(taker_fee_rate if taker_fee_rate is not None else fee_rate)
         self.use_alo_orders = bool(use_alo_orders)
         self.alo_rejected_count = 0
+        self.paired_take_profit_enabled = bool(paired_take_profit_enabled)
+        self.paired_tp_spacing_multiplier = max(float(paired_tp_spacing_multiplier), 0.0)
+        self.paired_tp_placed_count = 0
+        self.last_grid_spacing_pct = 0.003
         self._seen_fill_ids: set[str] = set()
         self._load_live_seen_fills()
         self.min_order_lifetime_seconds = max(int(kwargs.pop("min_order_lifetime_seconds", 90)), 0)
@@ -918,6 +950,8 @@ class LiveExecutionEngine:
 
     def cancel_replace_grid(self, symbol: str, plan: GridPlan) -> dict[str, int | str]:
         self.sync_open_orders(symbol)
+        if plan.spacing_pct and plan.spacing_pct > 0:
+            self.last_grid_spacing_pct = float(plan.spacing_pct)
         if not plan.should_regrid:
             return {"canceled": 0, "placed": 0, "symbol": symbol, "reprice_decision": "skip", "reprice_reason": "regrid_not_required"}
         can_replace, reprice_reason = self._can_replace_grid_now(symbol, plan)
@@ -1072,6 +1106,7 @@ class LiveExecutionEngine:
             entry["realized_pnl_total"] = self.state.realized_pnl
             entry["fees_paid"] = self.state.fees_paid
             self._record_order_event("filled", symbol=str(entry.get("symbol", symbol or "")), side=str(entry.get("side", "")), price=float(entry.get("price", 0.0) or 0.0), size=float(entry.get("qty", 0.0) or 0.0))
+            entry["paired_tp_placed"] = self._maybe_place_paired_take_profit(str(entry.get("symbol") or symbol or ""), entry, raw)
             self.trade_log.append(entry)
             self._append_trade_ledger(entry)
             new_entries.append(entry)
@@ -1197,6 +1232,53 @@ class LiveExecutionEngine:
         if not reduce_only:
             self._record_order_event("submitted", symbol=symbol, side=side, price=normalized_price, size=normalized_size)
         return True
+
+    def _is_opening_fill(self, raw: dict, entry: dict) -> bool:
+        if bool(raw.get("reduceOnly", raw.get("reduce_only", False))):
+            return False
+        direction = str(raw.get("dir", "")).lower()
+        if direction:
+            return direction.startswith("open")
+        return entry.get("exposure_action") == "increasing"
+
+    def _maybe_place_paired_take_profit(self, symbol: str, entry: dict, raw: dict) -> bool:
+        """Pair an opening grid fill with a reduce-only take-profit one spacing away.
+
+        This realizes the grid roundtrip immediately instead of waiting for a
+        regime flip or recenter to close inventory. The TP is reduce-only and
+        Gtc so it can cross the book if price has already moved past it.
+        """
+        if not self.paired_take_profit_enabled or not symbol:
+            return False
+        if not self._is_opening_fill(raw, entry):
+            return False
+        fill_price = float(entry.get("price", 0.0) or 0.0)
+        fill_qty = float(entry.get("qty", 0.0) or 0.0)
+        spacing = max(float(self.last_grid_spacing_pct), 0.0) * self.paired_tp_spacing_multiplier
+        if fill_price <= 0 or fill_qty <= 0 or spacing <= 0:
+            return False
+        side = str(entry.get("side", "")).lower()
+        tp_side = "sell" if side == "buy" else "buy"
+        tp_price = fill_price * (1.0 + spacing) if side == "buy" else fill_price * (1.0 - spacing)
+        try:
+            submitted = self._submit_live_limit(symbol, tp_side, fill_qty, tp_price, reduce_only=True)
+        except Exception as exc:
+            # TP placement must never break fill ingestion; the next tick's
+            # position management still covers the open inventory.
+            logger.warning("paired_tp_error entry_side=%s tp_side=%s tp_price=%s error=%s", side, tp_side, tp_price, exc)
+            return False
+        if submitted:
+            self.paired_tp_placed_count += 1
+            logger.info(
+                "paired_tp_submitted entry_side=%s entry_price=%s qty=%s tp_side=%s tp_price=%s spacing_pct=%s paired_tp_placed_count=%s",
+                side, fill_price, fill_qty, tp_side, tp_price, spacing, self.paired_tp_placed_count,
+            )
+        else:
+            logger.warning(
+                "paired_tp_skipped entry_side=%s entry_price=%s qty=%s tp_side=%s tp_price=%s spacing_pct=%s reason=submit_failed",
+                side, fill_price, fill_qty, tp_side, tp_price, spacing,
+            )
+        return submitted
 
     def _fill_id(self, raw: dict) -> str:
         for key in ("tid", "hash", "oid"):

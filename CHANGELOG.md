@@ -1,5 +1,10 @@
 # Changelog
 
+## Paired take-profit and WebSocket market data
+
+- Added paired take-profit: every opening grid fill immediately places a reduce-only `Gtc` take-profit one grid spacing away (`PAIRED_TAKE_PROFIT_ENABLED=true`, `PAIRED_TP_SPACING_MULTIPLIER=1.0`), realizing grid roundtrips directly instead of waiting for a regime flip or recenter. Engines record the active plan spacing on every regrid for TP pricing; TP submission failures never break fill ingestion.
+- Added a WebSocket market-data layer (`USE_WEBSOCKET=true`): the client subscribes to `l2Book`, `candle`, and `userFills` streams and serves `get_l2_book`, `get_candles`, and `get_user_fills` from in-memory caches, eliminating most per-tick REST polling. Every getter keeps an automatic REST fallback when the stream is unavailable or stale, candles re-seed from REST every 30 minutes, and user fills do a REST reconcile pass every 30th call.
+
 ## Execution efficiency: maker/taker fee model, post-only grid orders, diff-based regrid
 
 - Split the flat `fee_rate` into `MAKER_FEE_RATE` (default 0.00015) and `TAKER_FEE_RATE` (default 0.00045); edge filters and the spacing fee floor now plan with the maker rate, since post-only grid orders always rest as maker. With default multipliers this lowers the spacing fee floor from ~0.22% to ~0.08% and stops profitable levels being filtered by a taker-fee assumption.
