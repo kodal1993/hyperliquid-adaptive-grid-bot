@@ -360,6 +360,12 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
         "orderbook_filtered_entries": 0,
         "avg_pnl_bullish_entries": 0.0,
         "avg_pnl_bearish_entries": 0.0,
+        "pnl_when_prediction_long": 0.0,
+        "pnl_when_prediction_short": 0.0,
+        "pnl_when_prediction_neutral": 0.0,
+        "trades_when_prediction_long": 0,
+        "trades_when_prediction_short": 0,
+        "trades_when_prediction_neutral": 0,
     }
     if not csv_path.exists():
         return analytics
@@ -428,6 +434,16 @@ def _trade_analytics_report(expected_symbol: str, csv_path: Path = TRADES_CSV, *
             if expected_profit is not None:
                 expected_profits.append(expected_profit)
             net = realized - fee
+            prediction_bias = str(row.get("prediction_bias") or "NEUTRAL").upper()
+            if "LONG" in prediction_bias:
+                analytics["pnl_when_prediction_long"] += net
+                analytics["trades_when_prediction_long"] += 1
+            elif "SHORT" in prediction_bias:
+                analytics["pnl_when_prediction_short"] += net
+                analytics["trades_when_prediction_short"] += 1
+            else:
+                analytics["pnl_when_prediction_neutral"] += net
+                analytics["trades_when_prediction_neutral"] += 1
             orderbook_classification = str(row.get("orderbook_classification") or "")
             if "Bullish" in orderbook_classification:
                 analytics["orderbook_bullish_entries"] += 1
@@ -758,6 +774,7 @@ def run() -> None:
             orderbook_classification=status.get("classification", status.get("orderbook_entry_classification", "")),
             orderbook_imbalance_ratio=status.get("imbalance_ratio"),
             orderbook_pressure_score=status.get("pressure_score"),
+            prediction_bias=status.get("prediction_bias", ""),
         )
         trade_events = engine.consume_trade_log()
         account_state = _account_metrics(cfg, engine, client, latest_close)
@@ -1015,6 +1032,12 @@ def run() -> None:
                 "sub_5_fill_sources": trade_analytics["sub_5_fill_sources"],
                 "bullish_entry_pnl": trade_analytics["bullish_entry_pnl"],
                 "bearish_entry_pnl": trade_analytics["bearish_entry_pnl"],
+                "pnl_when_prediction_long": trade_analytics["pnl_when_prediction_long"],
+                "pnl_when_prediction_short": trade_analytics["pnl_when_prediction_short"],
+                "pnl_when_prediction_neutral": trade_analytics["pnl_when_prediction_neutral"],
+                "trades_when_prediction_long": trade_analytics["trades_when_prediction_long"],
+                "trades_when_prediction_short": trade_analytics["trades_when_prediction_short"],
+                "trades_when_prediction_neutral": trade_analytics["trades_when_prediction_neutral"],
                 "min_notional_blocked_count": max(int(status.get("min_notional_blocked_count", 0) or 0), int(getattr(engine, "min_notional_blocked_count", 0) or 0)),
                 "anti_chop_trigger_count": status.get("anti_chop_trigger_count", 0),
                 "anti_chop_cooldown_active": status.get("anti_chop_cooldown_active", False),

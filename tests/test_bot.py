@@ -2969,8 +2969,10 @@ def test_range_long_prediction_keeps_both_sides_and_biases_long(tmp_path):
 
     assert len(plan.long_levels) > 0
     assert len(plan.short_levels) > 0
-    assert len(plan.long_levels) == 4
+    assert len(plan.long_levels) > 4
     assert len(plan.short_levels) < 4
+    assert context["long_level_multiplier"] > 1.0
+    assert context["short_level_multiplier"] < 1.0
     assert plan.long_levels[0].size > 1.0
     assert plan.short_levels[0].size < 1.0
     assert context["prediction_grid_action"] == "range_long_bias"
@@ -2987,8 +2989,10 @@ def test_range_short_prediction_keeps_both_sides_and_biases_short(tmp_path):
 
     assert len(plan.long_levels) > 0
     assert len(plan.short_levels) > 0
-    assert len(plan.short_levels) == 4
+    assert len(plan.short_levels) > 4
     assert len(plan.long_levels) < 4
+    assert context["short_level_multiplier"] > 1.0
+    assert context["long_level_multiplier"] < 1.0
     assert plan.short_levels[0].size > 1.0
     assert plan.long_levels[0].size < 1.0
     assert context["prediction_grid_action"] == "range_short_bias"
@@ -3040,6 +3044,59 @@ def test_prediction_layer_cannot_produce_zero_order_flat_state(tmp_path):
     assert len(plan.long_levels) >= 1
     assert len(plan.short_levels) >= 1
 
+
+
+def test_strong_long_never_removes_sell_side_while_flat(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.max_order_size = 10
+    cfg.max_notional_per_trade_usd = 1000
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "pred_strong_long_keep_sell.json", paper_mode=True, enable_live_trading=False))
+    plan = GridManager().build_grid(100, 1, 0.01, 0.0, MarketRegime.RANGE, 1.0, 0.0, 0.0, GridMode.NEUTRAL)
+
+    context = orch._apply_prediction_grid_bias(plan, price=100, prediction=_prediction_result("STRONG_LONG", 0.9, 0.8), position_side="FLAT", max_one_side_notional=1000)
+
+    assert len(plan.long_levels) >= 1
+    assert len(plan.short_levels) >= 1
+    assert context["long_size_multiplier"] <= cfg.prediction_max_size_multiplier
+
+
+def test_strong_short_never_removes_buy_side_while_flat(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.max_order_size = 10
+    cfg.max_notional_per_trade_usd = 1000
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "pred_strong_short_keep_buy.json", paper_mode=True, enable_live_trading=False))
+    plan = GridManager().build_grid(100, 1, 0.01, 0.0, MarketRegime.RANGE, 1.0, 0.0, 0.0, GridMode.NEUTRAL)
+
+    context = orch._apply_prediction_grid_bias(plan, price=100, prediction=_prediction_result("STRONG_SHORT", 0.9, -0.8), position_side="FLAT", max_one_side_notional=1000)
+
+    assert len(plan.long_levels) >= 1
+    assert len(plan.short_levels) >= 1
+    assert context["short_size_multiplier"] <= cfg.prediction_max_size_multiplier
+
+
+def test_prediction_size_multipliers_respect_trade_caps(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.max_order_size = 10
+    cfg.max_notional_per_trade_usd = 105
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "pred_size_caps.json", paper_mode=True, enable_live_trading=False))
+    plan = GridManager().build_grid(100, 2, 0.01, 0.0, MarketRegime.RANGE, 1.0, 0.0, 0.0, GridMode.NEUTRAL)
+
+    orch._apply_prediction_grid_bias(plan, price=100, prediction=_prediction_result("STRONG_LONG", 0.9, 0.8), position_side="FLAT", max_one_side_notional=1000)
+
+    assert all(level.size * level.price <= cfg.max_notional_per_trade_usd + 1e-9 for level in plan.long_levels + plan.short_levels)
+
+
+def test_prediction_telemetry_fields_are_present(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.max_order_size = 10
+    cfg.max_notional_per_trade_usd = 1000
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "pred_telemetry.json", paper_mode=True, enable_live_trading=False))
+    plan = GridManager().build_grid(100, 2, 0.01, 0.0, MarketRegime.RANGE, 1.0, 0.0, 0.0, GridMode.NEUTRAL)
+
+    context = orch._apply_prediction_grid_bias(plan, price=100, prediction=_prediction_result("LONG", 0.9, 0.8), position_side="FLAT", max_one_side_notional=1000)
+
+    for field in ["long_level_multiplier", "short_level_multiplier", "long_size_multiplier", "short_size_multiplier"]:
+        assert field in context
 
 def test_analyze_closed_trades_reconstructs_fifo_fees_and_hold_times(tmp_path):
     import importlib.util

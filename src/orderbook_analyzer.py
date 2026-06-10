@@ -33,12 +33,14 @@ class OrderBookAnalysis:
 
 
 class OrderBookAnalyzer:
-    def __init__(self, top_levels: int = 10, smoothing_window: int = 5, min_samples: int = 3, max_age_seconds: float = 5.0, epsilon: float = 1e-9) -> None:
+    def __init__(self, top_levels: int = 10, smoothing_window: int = 5, min_samples: int = 3, max_age_seconds: float = 5.0, epsilon: float = 1e-9, ema_alpha: float = 0.35, min_confidence: float = 0.55) -> None:
         self.top_levels = max(int(top_levels), 1)
         self.smoothing_window = max(int(smoothing_window), 1)
         self.min_samples = max(int(min_samples), 1)
         self.max_age_seconds = max(float(max_age_seconds), 0.0)
         self.epsilon = max(float(epsilon), 1e-12)
+        self.ema_alpha = min(max(float(ema_alpha), 0.0), 1.0)
+        self.min_confidence = min(max(float(min_confidence), 0.0), 1.0)
         self._snapshots: deque[tuple[float, float]] = deque(maxlen=self.smoothing_window)
         self.orderbook_imbalance_ema: float | None = None
 
@@ -78,7 +80,7 @@ class OrderBookAnalyzer:
 
         raw_ratio = bid_volume / max(ask_volume, self.epsilon)
         self._snapshots.append((bid_volume, ask_volume))
-        alpha = 2.0 / (self.smoothing_window + 1.0)
+        alpha = self.ema_alpha
         if self.orderbook_imbalance_ema is None:
             self.orderbook_imbalance_ema = raw_ratio
         else:
@@ -113,13 +115,15 @@ class OrderBookAnalyzer:
     def classify(imbalance_ratio: float) -> str:
         if imbalance_ratio > 1.5:
             return "Strong Bullish"
-        if imbalance_ratio >= 1.15:
+        if imbalance_ratio > 1.15:
             return "Bullish"
-        if imbalance_ratio >= 0.85:
+        if 0.85 <= imbalance_ratio <= 1.15:
             return "Neutral"
-        if imbalance_ratio >= 0.67:
+        if imbalance_ratio < 0.67:
+            return "Strong Bearish"
+        if imbalance_ratio < 0.85:
             return "Bearish"
-        return "Strong Bearish"
+        return "Neutral"
 
     @staticmethod
     def size_multipliers(classification: str) -> tuple[float, float]:

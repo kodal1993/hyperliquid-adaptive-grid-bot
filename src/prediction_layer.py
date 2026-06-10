@@ -23,6 +23,7 @@ class PredictionResult:
     confidence_score: float
     prediction_bias: str
     contributing_signals: dict[str, float] = field(default_factory=dict)
+    signal_weights_used: dict[str, float] = field(default_factory=dict)
     fallback_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -36,18 +37,19 @@ class PredictionResult:
             "confidence_score": self.confidence_score,
             "prediction_bias": self.prediction_bias,
             "contributing_signals": self.contributing_signals,
+            "signal_weights_used": self.signal_weights_used,
             "prediction_fallback_reason": self.fallback_reason,
         }
 
 
 class PredictionLayer:
     DEFAULT_WEIGHTS = {
-        "orderbook_pressure": 0.25,
+        "orderbook_pressure": 0.30,
         "momentum_score": 0.20,
         "ema_slope": 0.15,
         "ema_slope_acceleration": 0.10,
         "vwap_distance": 0.10,
-        "volume_zscore": 0.10,
+        "volume_zscore": 0.05,
         "regime_confidence": 0.10,
     }
 
@@ -64,6 +66,7 @@ class PredictionLayer:
             confidence_score=0.0,
             prediction_bias="NEUTRAL",
             contributing_signals={},
+            signal_weights_used={},
             fallback_reason=reason,
         )
 
@@ -122,12 +125,14 @@ class PredictionLayer:
 
         weighted_sum = 0.0
         used_weight = 0.0
+        raw_weights_used: dict[str, float] = {}
         for name, value in signals.items():
             weight = float(self.weights.get(name, 0.05 if name == "recent_taker_pressure" else 0.0) or 0.0)
             if weight <= 0:
                 continue
             weighted_sum += weight * value
             used_weight += weight
+            raw_weights_used[name] = weight
         if used_weight <= 0:
             return self.unavailable("no_weighted_signals")
 
@@ -144,6 +149,7 @@ class PredictionLayer:
             confidence_score=confidence,
             prediction_bias=bias,
             contributing_signals={k: round(v, 6) for k, v in signals.items()},
+            signal_weights_used={k: round(v / used_weight, 6) for k, v in raw_weights_used.items()},
         )
 
     def _vwap_distance_signal(self, candles: pd.DataFrame) -> float | None:

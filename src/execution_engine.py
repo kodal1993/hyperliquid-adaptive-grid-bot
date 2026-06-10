@@ -255,7 +255,7 @@ class PaperExecutionEngine:
         self._apply_fill({"symbol": symbol, "side": side, "price": mark_price, "size": abs(self.paper.position_size), "created_ts": time.time(), "order_source": "reduce_only"})
         return True
 
-    def on_candle(self, candle: dict, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", strategy_status: str = "running", orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None) -> list[dict]:
+    def on_candle(self, candle: dict, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", strategy_status: str = "running", orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None, prediction_bias: str = "") -> list[dict]:
         self._require_paper_execution("on_candle")
         high, low = float(candle["high"]), float(candle["low"])
         mark_price = float(candle.get("close", candle.get("open", high)))
@@ -299,7 +299,7 @@ class PaperExecutionEngine:
                 logger.info("order_skipped reason=risk_block side=%s price=%s qty=%s", fill["side"], fill["price"], fill["size"])
                 continue
             logger.info("order_submitted mode=paper side=%s price=%s qty=%s", fill["side"], fill["price"], fill["size"])
-            self._apply_fill(fill, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason, orderbook_classification=orderbook_classification, orderbook_imbalance_ratio=orderbook_imbalance_ratio, orderbook_pressure_score=orderbook_pressure_score)
+            self._apply_fill(fill, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason, orderbook_classification=orderbook_classification, orderbook_imbalance_ratio=orderbook_imbalance_ratio, orderbook_pressure_score=orderbook_pressure_score, prediction_bias=prediction_bias)
             logger.info(
                 "fill_executed side=%s price=%s qty=%s position_before=%s position_after=%s",
                 fill["side"],
@@ -393,7 +393,7 @@ class PaperExecutionEngine:
             )
         return emergency_selected
 
-    def _apply_fill(self, fill: dict, reason: str = "grid_fill", regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None) -> None:
+    def _apply_fill(self, fill: dict, reason: str = "grid_fill", regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None, prediction_bias: str = "") -> None:
         self._require_paper_execution("_apply_fill")
         price, size = float(fill["price"]), float(fill["size"])
         position_before = self.paper.position_size
@@ -465,6 +465,7 @@ class PaperExecutionEngine:
             "orderbook_classification": orderbook_classification,
             "orderbook_imbalance_ratio": orderbook_imbalance_ratio,
             "orderbook_pressure_score": orderbook_pressure_score,
+            "prediction_bias": prediction_bias,
         }
         self.trade_log.append(entry)
         self._append_trade_ledger(entry)
@@ -533,7 +534,7 @@ class PaperExecutionEngine:
 
     def _append_trade_ledger(self, entry: dict) -> None:
         self.trade_ledger_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "fill_liquidity", "is_maker_fill", "is_taker_fill", "dust_fill", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason", "order_source", "sub_10_usd_fill", "sub_5_usd_fill", "orderbook_classification", "orderbook_imbalance_ratio", "orderbook_pressure_score"]
+        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "fill_liquidity", "is_maker_fill", "is_taker_fill", "dust_fill", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason", "order_source", "sub_10_usd_fill", "sub_5_usd_fill", "orderbook_classification", "orderbook_imbalance_ratio", "orderbook_pressure_score", "prediction_bias"]
         write_header = not self.trade_ledger_csv.exists()
         with self.trade_ledger_csv.open("a", encoding="utf-8") as f:
             if write_header:
@@ -812,21 +813,21 @@ class LiveExecutionEngine:
         limit_price = mark_price * 1.002 if side == "buy" else mark_price * 0.998
         return self._submit_live_limit(symbol, side, abs(self.state.position_size), limit_price, reduce_only=True)
 
-    def on_candle(self, candle: dict, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", strategy_status: str = "running", orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None) -> list[dict]:
+    def on_candle(self, candle: dict, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", strategy_status: str = "running", orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None, prediction_bias: str = "") -> list[dict]:
         symbol = str(candle.get("symbol") or "")
         if not symbol and self.open_orders:
             symbol = str(self.open_orders[0].get("symbol", ""))
         # No candle-touch fill simulation in live mode. This only polls exchange fills.
-        return self.sync_user_fills(symbol or None, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason, orderbook_classification=orderbook_classification, orderbook_imbalance_ratio=orderbook_imbalance_ratio, orderbook_pressure_score=orderbook_pressure_score)
+        return self.sync_user_fills(symbol or None, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason, orderbook_classification=orderbook_classification, orderbook_imbalance_ratio=orderbook_imbalance_ratio, orderbook_pressure_score=orderbook_pressure_score, prediction_bias=prediction_bias)
 
-    def sync_user_fills(self, symbol: str | None = None, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None) -> list[dict]:
+    def sync_user_fills(self, symbol: str | None = None, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None, prediction_bias: str = "") -> list[dict]:
         fills = self.client.get_user_fills(symbol)
         new_entries: list[dict] = []
         for raw in fills:
             fill_id = self._fill_id(raw)
             if fill_id in self._seen_fill_ids:
                 continue
-            entry = self._ledger_entry_from_exchange_fill(raw, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason, orderbook_classification=orderbook_classification, orderbook_imbalance_ratio=orderbook_imbalance_ratio, orderbook_pressure_score=orderbook_pressure_score)
+            entry = self._ledger_entry_from_exchange_fill(raw, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason, orderbook_classification=orderbook_classification, orderbook_imbalance_ratio=orderbook_imbalance_ratio, orderbook_pressure_score=orderbook_pressure_score, prediction_bias=prediction_bias)
             self._seen_fill_ids.add(fill_id)
             self.state.realized_pnl += float(entry.get("realized_pnl_delta", 0.0) or 0.0)
             self.state.fees_paid += float(entry.get("fee", 0.0) or 0.0)
@@ -849,7 +850,7 @@ class LiveExecutionEngine:
 
     def _append_trade_ledger(self, entry: dict) -> None:
         self.trade_ledger_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "fill_liquidity", "is_maker_fill", "is_taker_fill", "dust_fill", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason", "order_source", "sub_10_usd_fill", "sub_5_usd_fill", "orderbook_classification", "orderbook_imbalance_ratio", "orderbook_pressure_score"]
+        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "fill_liquidity", "is_maker_fill", "is_taker_fill", "dust_fill", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason", "order_source", "sub_10_usd_fill", "sub_5_usd_fill", "orderbook_classification", "orderbook_imbalance_ratio", "orderbook_pressure_score", "prediction_bias"]
         write_header = not self.trade_ledger_csv.exists()
         with self.trade_ledger_csv.open("a", encoding="utf-8") as f:
             if write_header:
@@ -950,7 +951,7 @@ class LiveExecutionEngine:
                 return f"{key}:{raw.get(key)}:{raw.get('time', '')}"
         return json.dumps(raw, sort_keys=True)
 
-    def _ledger_entry_from_exchange_fill(self, raw: dict, *, regime: str, mode: str, risk_state: str, pause_reason: str, orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None) -> dict:
+    def _ledger_entry_from_exchange_fill(self, raw: dict, *, regime: str, mode: str, risk_state: str, pause_reason: str, orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None, prediction_bias: str = "") -> dict:
         price = float(raw.get("px", raw.get("price", 0.0)) or 0.0)
         size = float(raw.get("sz", raw.get("size", 0.0)) or 0.0)
         side_raw = str(raw.get("side", "")).lower()
@@ -1006,6 +1007,7 @@ class LiveExecutionEngine:
             "orderbook_classification": orderbook_classification,
             "orderbook_imbalance_ratio": orderbook_imbalance_ratio,
             "orderbook_pressure_score": orderbook_pressure_score,
+            "prediction_bias": prediction_bias,
         }
 
 
