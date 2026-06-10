@@ -45,6 +45,8 @@ class StrategyOrchestrator:
             smoothing_window=getattr(config, "orderbook_smoothing_window", 5),
             min_samples=getattr(config, "orderbook_min_samples", 5),
             max_age_seconds=getattr(config, "orderbook_max_age_seconds", 5.0),
+            ema_alpha=getattr(config, "orderbook_imbalance_ema_alpha", 0.35),
+            min_confidence=getattr(config, "orderbook_min_confidence", 0.55),
         )
         self.orderbook_bullish_entries = 0
         self.orderbook_bearish_entries = 0
@@ -122,7 +124,7 @@ class StrategyOrchestrator:
         )
         prediction_context = prediction.to_dict()
         logger.info(
-            "prediction_layer available=%s directional_score=%.6f bullish_probability=%.4f bearish_probability=%.4f neutral_probability=%.4f confidence_score=%.4f prediction_bias=%s contributing_signals=%s fallback_reason=%s",
+            "prediction_layer available=%s directional_score=%.6f bullish_probability=%.4f bearish_probability=%.4f neutral_probability=%.4f confidence_score=%.4f prediction_bias=%s signal_weights_used=%s contributing_signals=%s fallback_reason=%s",
             prediction.available,
             prediction.directional_score,
             prediction.bullish_probability,
@@ -130,6 +132,7 @@ class StrategyOrchestrator:
             prediction.neutral_probability,
             prediction.confidence_score,
             prediction.prediction_bias,
+            prediction.signal_weights_used,
             prediction.contributing_signals,
             prediction.fallback_reason,
         )
@@ -1338,49 +1341,99 @@ class StrategyOrchestrator:
             "prediction_short_levels_before": len(plan.short_levels),
             "prediction_long_levels_after": len(plan.long_levels),
             "prediction_short_levels_after": len(plan.short_levels),
+            "long_level_multiplier": 1.0,
+            "short_level_multiplier": 1.0,
+            "long_size_multiplier": 1.0,
+            "short_size_multiplier": 1.0,
         }
-        if not prediction.available or plan.regime != MarketRegime.RANGE or position_side != "FLAT":
-            if not prediction.available:
-                context["prediction_grid_action"] = "fallback_existing_strategy"
+        if not prediction.available:
+            context["prediction_grid_action"] = "fallback_existing_strategy"
+            return context
+        if plan.regime != MarketRegime.RANGE or position_side != "FLAT":
             return context
         if prediction.prediction_bias not in {"LONG", "STRONG_LONG", "SHORT", "STRONG_SHORT"}:
             return context
 
-        max_bias_pct = min(max(float(getattr(self.config, "prediction_max_level_bias_pct", 0.5)), 0.0), 1.0)
-        confidence = min(max(prediction.confidence_score, 0.0), 1.0)
-        level_reduction_pct = min(max_bias_pct * confidence, max_bias_pct)
-        max_size_multiplier = max(float(getattr(self.config, "prediction_max_size_multiplier", 1.25)), 1.0)
-        min_size_multiplier = min(max(float(getattr(self.config, "prediction_min_size_multiplier", 0.75)), 0.0), 1.0)
-        favored_multiplier = min(1.0 + (max_size_multiplier - 1.0) * confidence, max_size_multiplier)
-        reduced_multiplier = max(1.0 - (1.0 - min_size_multiplier) * confidence, min_size_multiplier)
+        configured_max_bias = min(max(float(getattr(self.config, "prediction_max_level_bias_pct", 0.35)), 0.0), 1.0)
+        requested_level_bias = 0.35 if prediction.prediction_bias in {"STRONG_LONG", "STRONG_SHORT"} else 0.25
+        level_bias_pct = min(requested_level_bias, configured_max_bias)
+        confidence_threshold = max(float(getattr(self.config, "prediction_confidence_threshold", 0.55)), 0.0)
+        high_confidence = prediction.confidence_score >= confidence_threshold
+        max_size_multiplier = max(float(getattr(self.config, "prediction_max_size_multiplier", 1.20)), 1.0)
+        min_size_multiplier = min(max(float(getattr(self.config, "prediction_min_size_multiplier", 0.80)), 0.0), 1.0)
+
+        if high_confidence:
+            if prediction.prediction_bias == "STRONG_LONG":
+                long_mult, short_mult = 1.20, 0.80
+            elif prediction.prediction_bias == "LONG":
+                long_mult, short_mult = 1.10, 0.90
+            elif prediction.prediction_bias == "SHORT":
+                long_mult, short_mult = 0.90, 1.10
+            else:
+                long_mult, short_mult = 0.80, 1.20
+            long_mult = min(max(long_mult, min_size_multiplier), max_size_multiplier)
+            short_mult = min(max(short_mult, min_size_multiplier), max_size_multiplier)
+        else:
+            # Fee-aware fallback: low-confidence predictions may tilt level count,
+            # but they must not tighten economics by increasing order size.
+            long_mult = short_mult = 1.0
 
         bullish = prediction.prediction_bias in {"LONG", "STRONG_LONG"}
         favored_levels = plan.long_levels if bullish else plan.short_levels
         reduced_levels = plan.short_levels if bullish else plan.long_levels
-        if reduced_levels and level_reduction_pct > 0:
-            keep = max(1, int(round(len(reduced_levels) * (1.0 - level_reduction_pct))))
-            del reduced_levels[keep:]
+        favored_before = len(favored_levels)
+        reduced_before = len(reduced_levels)
 
-        favored_notional = sum(level.price * level.size for level in favored_levels)
-        if favored_notional > 0:
-            favored_multiplier = min(favored_multiplier, max_one_side_notional / max(favored_notional, 1e-9))
-        favored_multiplier = max(1.0, favored_multiplier)
+        def side_notional(levels: list) -> float:
+            return sum(level.price * level.size for level in levels)
+
+        def append_level(levels: list, side: str, multiplier: float) -> bool:
+            if not levels:
+                return False
+            next_index = len(levels) + 1
+            base_size = levels[0].size
+            next_price = price * (1.0 - plan.spacing_pct * next_index) if side == "buy" else price * (1.0 + plan.spacing_pct * next_index)
+            max_size_by_trade = self.config.max_notional_per_trade_usd / max(next_price, 1e-9)
+            max_size = max(0.0, min(float(self.config.max_order_size), max_size_by_trade))
+            size = min(max(base_size, 0.0), max_size)
+            if (side_notional(levels) + next_price * size) > max_one_side_notional + 1e-9:
+                return False
+            from .types import GridLevel
+            levels.append(GridLevel(price=next_price, side=side, size=size))
+            return True
+
+        favored_target = max(favored_before, int(round(favored_before * (1.0 + level_bias_pct))))
+        if level_bias_pct > 0 and favored_before > 0 and favored_target == favored_before:
+            favored_target += 1
+        reduced_target = max(1, int(round(reduced_before * (1.0 - level_bias_pct)))) if reduced_before > 0 else 0
+        if reduced_before > 0:
+            del reduced_levels[reduced_target:]
+        while len(favored_levels) < favored_target:
+            if not append_level(favored_levels, "buy" if bullish else "sell", long_mult if bullish else short_mult):
+                break
+
         max_size_by_notional = self.config.max_notional_per_trade_usd / max(price, 1e-9)
         max_size = max(0.0, min(float(self.config.max_order_size), max_size_by_notional))
-        for level in favored_levels:
-            level.size = min(max(level.size * favored_multiplier, 0.0), max_size)
-        for level in reduced_levels:
-            level.size = min(max(level.size * reduced_multiplier, 0.0), max_size)
+        for level in plan.long_levels:
+            level.size = min(max(level.size * long_mult, 0.0), max_size)
+        for level in plan.short_levels:
+            level.size = min(max(level.size * short_mult, 0.0), max_size)
 
+        long_after = len(plan.long_levels)
+        short_after = len(plan.short_levels)
         context.update({
             "prediction_grid_action": "range_long_bias" if bullish else "range_short_bias",
-            "prediction_long_size_multiplier": favored_multiplier if bullish else reduced_multiplier,
-            "prediction_short_size_multiplier": reduced_multiplier if bullish else favored_multiplier,
-            "prediction_long_levels_after": len(plan.long_levels),
-            "prediction_short_levels_after": len(plan.short_levels),
+            "prediction_long_size_multiplier": long_mult,
+            "prediction_short_size_multiplier": short_mult,
+            "prediction_long_levels_after": long_after,
+            "prediction_short_levels_after": short_after,
+            "long_level_multiplier": long_after / max(context["prediction_long_levels_before"], 1),
+            "short_level_multiplier": short_after / max(context["prediction_short_levels_before"], 1),
+            "long_size_multiplier": long_mult,
+            "short_size_multiplier": short_mult,
         })
         logger.info(
-            "prediction_grid_bias action=%s bias=%s confidence=%.4f long_levels_before=%s short_levels_before=%s long_levels_after=%s short_levels_after=%s long_size_multiplier=%.3f short_size_multiplier=%.3f",
+            "prediction_grid_bias action=%s bias=%s confidence=%.4f long_levels_before=%s short_levels_before=%s long_levels_after=%s short_levels_after=%s long_size_multiplier=%.3f short_size_multiplier=%.3f long_level_multiplier=%.3f short_level_multiplier=%.3f",
             context["prediction_grid_action"],
             prediction.prediction_bias,
             prediction.confidence_score,
@@ -1390,6 +1443,8 @@ class StrategyOrchestrator:
             context["prediction_short_levels_after"],
             context["prediction_long_size_multiplier"],
             context["prediction_short_size_multiplier"],
+            context["long_level_multiplier"],
+            context["short_level_multiplier"],
         )
         return context
 
