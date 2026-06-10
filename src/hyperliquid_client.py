@@ -350,6 +350,7 @@ class HyperliquidClient:
         price: float,
         *,
         reduce_only: bool = False,
+        post_only: bool = False,
     ) -> Any:
         self.require_live_execution_support()
         assert self.exchange is not None
@@ -361,8 +362,12 @@ class HyperliquidClient:
             raise ValueError(
                 f"invalid_normalized_order: symbol={symbol} side={side} raw_size={size} raw_price={price} normalized_size={normalized_size} normalized_price={normalized_price}"
             )
+        # Alo (post-only) guarantees the order rests as maker; the exchange
+        # rejects it instead of crossing the book, so it must never be used on
+        # orders that need immediate execution (e.g. aggressive reduce-only closes).
+        tif = "Alo" if post_only else "Gtc"
         logger.debug(
-            "place_limit_order_normalized symbol=%s side=%s raw_size=%s raw_price=%s normalized_size=%s normalized_price=%s reduce_only=%s",
+            "place_limit_order_normalized symbol=%s side=%s raw_size=%s raw_price=%s normalized_size=%s normalized_price=%s reduce_only=%s tif=%s",
             symbol,
             side,
             size,
@@ -370,13 +375,14 @@ class HyperliquidClient:
             normalized_size,
             normalized_price,
             reduce_only,
+            tif,
         )
         return self.exchange.order(
             symbol,
             side.lower() == "buy",
             normalized_size,
             normalized_price,
-            {"limit": {"tif": "Gtc"}},
+            {"limit": {"tif": tif}},
             reduce_only=reduce_only,
         )
 

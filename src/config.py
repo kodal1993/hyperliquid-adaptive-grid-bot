@@ -39,6 +39,9 @@ class BotConfig:
     regime_confirmation_bars: int
     regime_min_confidence: float
     trend_flip_cooldown_ticks: int
+    maker_fee_rate: float
+    taker_fee_rate: float
+    use_alo_orders: bool
     order_notional_usd: float
     max_active_exposure_usd: float
     regrid_threshold_pct: float
@@ -197,6 +200,9 @@ class BotConfig:
             regime_confirmation_bars=int(os.getenv("REGIME_CONFIRMATION_BARS", "1")),
             regime_min_confidence=float(os.getenv("REGIME_MIN_CONFIDENCE", os.getenv("REGIME_CONFIDENCE_MIN", "0.0"))),
             trend_flip_cooldown_ticks=int(os.getenv("TREND_FLIP_COOLDOWN_TICKS", os.getenv("FLIP_COOLDOWN_TICKS", "6"))),
+            maker_fee_rate=float(os.getenv("MAKER_FEE_RATE", "0.00015")),
+            taker_fee_rate=float(os.getenv("TAKER_FEE_RATE", "0.00045")),
+            use_alo_orders=os.getenv("USE_ALO_ORDERS", "true").lower() == "true",
             order_notional_usd=float(os.getenv("ORDER_NOTIONAL_USD", os.getenv("MAX_NOTIONAL_PER_TRADE_USD", "10"))),
             max_active_exposure_usd=float(os.getenv("MAX_ACTIVE_EXPOSURE_USD", "50")),
             regrid_threshold_pct=float(os.getenv("REGRID_THRESHOLD_PCT", "0.003")),
@@ -322,5 +328,9 @@ class BotConfig:
             errors.append(f"grid_spacing_pct must be > 0, got {self.grid_spacing_pct}")
         if self.tick_seconds < 1:
             errors.append(f"tick_seconds must be >= 1, got {self.tick_seconds}")
+        if self.maker_fee_rate < 0 or self.maker_fee_rate > 0.01:
+            errors.append(f"maker_fee_rate must be in [0, 0.01], got {self.maker_fee_rate}")
+        if self.taker_fee_rate < 0 or self.taker_fee_rate > 0.01:
+            errors.append(f"taker_fee_rate must be in [0, 0.01], got {self.taker_fee_rate}")
         if errors:
             raise ValueError("BotConfig validation failed:\n" + "\n".join(f"  - {e}" for e in errors))

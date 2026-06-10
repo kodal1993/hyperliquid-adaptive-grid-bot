@@ -74,6 +74,72 @@ def _is_dust_notional(notional: float, threshold_usd: float = 1.0) -> bool:
     return 0.0 < abs(notional) < threshold_usd
 
 
+def _diff_grid_orders(
+    active_orders: list[dict],
+    desired_levels: list[dict],
+    price_tolerance_pct: float,
+    size_tolerance_pct: float = 0.05,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Match desired grid levels against active orders to minimize churn.
+
+    Returns (keep, cancel, place): active orders close enough to a desired
+    level are kept, unmatched active orders are canceled, and unmatched
+    desired levels are placed. Greedy nearest-price matching per side.
+    """
+    unmatched_active = list(active_orders)
+    keep: list[dict] = []
+    place: list[dict] = []
+    for level in desired_levels:
+        target_price = float(level.get("price", 0.0) or 0.0)
+        target_size = float(level.get("size", 0.0) or 0.0)
+        best = None
+        best_delta = None
+        for order in unmatched_active:
+            if str(order.get("side", "")).lower() != str(level.get("side", "")).lower():
+                continue
+            order_price = float(order.get("price", 0.0) or 0.0)
+            order_size = float(order.get("size", 0.0) or 0.0)
+            price_delta = abs(order_price - target_price) / max(target_price, 1e-9)
+            if price_delta > price_tolerance_pct:
+                continue
+            if abs(order_size - target_size) / max(target_size, 1e-9) > size_tolerance_pct:
+                continue
+            if best is None or price_delta < best_delta:
+                best, best_delta = order, price_delta
+        if best is not None:
+            unmatched_active.remove(best)
+            keep.append(best)
+        else:
+            place.append(level)
+    return keep, unmatched_active, place
+
+
+def _order_submit_error(response: object) -> str:
+    """Extract an error message from a Hyperliquid order response, if any.
+
+    Returns "" when the response indicates success or carries no status info
+    (e.g. test doubles returning None).
+    """
+    if not isinstance(response, dict):
+        return ""
+    if str(response.get("status", "ok")).lower() != "ok":
+        return str(response.get("response") or response.get("status"))
+    inner = response.get("response")
+    if isinstance(inner, dict):
+        data = inner.get("data")
+        statuses = data.get("statuses") if isinstance(data, dict) else None
+        if isinstance(statuses, list):
+            for status in statuses:
+                if isinstance(status, dict) and status.get("error"):
+                    return str(status["error"])
+    return ""
+
+
+def _is_post_only_reject(error: str) -> bool:
+    lowered = error.lower()
+    return "post only" in lowered or "alo" in lowered or "immediately match" in lowered
+
+
 def classify_exposure_action(position_size: float, side: str, qty: float) -> str:
     side = side.lower()
     qty = abs(qty)
@@ -106,11 +172,13 @@ def trade_category_for_action(exposure_action: str) -> str:
     }.get(exposure_action, exposure_action or "unknown")
 
 class PaperExecutionEngine:
-    def __init__(self, client: HyperliquidClient, state_file: str, paper_mode: bool = True, enable_live_trading: bool = False, fee_rate: float = 0.0004, start_balance: float = 500.0, fill_model: str = "optimistic", max_position_notional_usd: float = 500.0, soft_exposure_cap_pct: float = 0.6, hard_exposure_cap_pct: float = 0.8, absolute_exposure_cap_pct: float = 1.0, allow_position_flip: bool = False, min_order_notional_usd: float | None = None, dust_position_notional_usd: float = 2.0, trade_ledger_csv: str | None = None, trade_ledger_jsonl: str | None = None, risk_decisions_csv: str | None = None, min_order_lifetime_seconds: int = 90, min_reprice_distance_pct: float = 0.0015) -> None:
+    def __init__(self, client: HyperliquidClient, state_file: str, paper_mode: bool = True, enable_live_trading: bool = False, fee_rate: float = 0.0004, start_balance: float = 500.0, fill_model: str = "optimistic", max_position_notional_usd: float = 500.0, soft_exposure_cap_pct: float = 0.6, hard_exposure_cap_pct: float = 0.8, absolute_exposure_cap_pct: float = 1.0, allow_position_flip: bool = False, min_order_notional_usd: float | None = None, dust_position_notional_usd: float = 2.0, trade_ledger_csv: str | None = None, trade_ledger_jsonl: str | None = None, risk_decisions_csv: str | None = None, min_order_lifetime_seconds: int = 90, min_reprice_distance_pct: float = 0.0015, maker_fee_rate: float | None = None, taker_fee_rate: float | None = None) -> None:
         self.client = client
         self.paper_mode = paper_mode
         self.enable_live_trading = enable_live_trading
         self.fee_rate = fee_rate
+        self.maker_fee_rate = float(maker_fee_rate if maker_fee_rate is not None else fee_rate)
+        self.taker_fee_rate = float(taker_fee_rate if taker_fee_rate is not None else fee_rate)
         self.state_file = Path(state_file)
         self.open_orders: list[dict] = []
         self.fill_model = fill_model
@@ -227,15 +295,9 @@ class PaperExecutionEngine:
             logger.info("reprice_decision decision=skip reprice_reason=%s min_order_lifetime_seconds=%s min_reprice_distance_pct=%s", reprice_reason, self.min_order_lifetime_seconds, self.min_reprice_distance_pct)
             return {"canceled": 0, "placed": 0, "symbol": symbol, "reprice_decision": "skip", "reprice_reason": reprice_reason}
         now_ts = time.time()
-        canceled = 0
         retained = [o for o in self.open_orders if str(o.get("symbol", symbol)).upper() != symbol.upper() or bool(o.get("reduce_only", False))]
-        for old in self.open_orders:
-            if str(old.get("symbol", symbol)).upper() == symbol.upper() and not bool(old.get("reduce_only", False)):
-                canceled += 1
-                created = old.get("created_ts")
-                lifetime = (now_ts - float(created)) if created else None
-                self._record_order_event("cancelled", symbol=symbol, side=str(old.get("side", "")), price=float(old.get("price", 0.0) or 0.0), size=float(old.get("size", 0.0) or 0.0), lifetime_seconds=lifetime)
-        orders = []
+        active = [o for o in self.open_orders if str(o.get("symbol", symbol)).upper() == symbol.upper() and not bool(o.get("reduce_only", False))]
+        desired: list[dict] = []
         for o in (plan.long_levels + plan.short_levels):
             notional = abs(o.price * o.size)
             if self.min_order_notional_usd > 0 and notional + 1e-9 < self.min_order_notional_usd:
@@ -249,12 +311,22 @@ class PaperExecutionEngine:
                     self.min_order_notional_usd,
                 )
                 continue
-            order = {"symbol": symbol, "side": o.side, "price": o.price, "size": o.size, "created_ts": now_ts, "order_source": "normal_entry"}
+            desired.append({"side": o.side, "price": o.price, "size": o.size})
+        kept, to_cancel, to_place = _diff_grid_orders(active, desired, self.min_reprice_distance_pct)
+        canceled = 0
+        for old in to_cancel:
+            canceled += 1
+            created = old.get("created_ts")
+            lifetime = (now_ts - float(created)) if created else None
+            self._record_order_event("cancelled", symbol=symbol, side=str(old.get("side", "")), price=float(old.get("price", 0.0) or 0.0), size=float(old.get("size", 0.0) or 0.0), lifetime_seconds=lifetime)
+        orders = []
+        for level in to_place:
+            order = {"symbol": symbol, "side": level["side"], "price": level["price"], "size": level["size"], "created_ts": now_ts, "order_source": "normal_entry"}
             orders.append(order)
-            self._record_order_event("submitted", symbol=symbol, side=o.side, price=o.price, size=o.size)
-        self.open_orders = retained + orders
-        logger.info("reprice_decision decision=replace reprice_reason=%s canceled=%s placed=%s", reprice_reason, canceled, len(orders))
-        return {"canceled": canceled, "placed": len(orders), "symbol": symbol, "reprice_decision": "replace", "reprice_reason": reprice_reason}
+            self._record_order_event("submitted", symbol=symbol, side=level["side"], price=level["price"], size=level["size"])
+        self.open_orders = retained + kept + orders
+        logger.info("reprice_decision decision=replace reprice_reason=%s canceled=%s placed=%s kept=%s", reprice_reason, canceled, len(orders), len(kept))
+        return {"canceled": canceled, "placed": len(orders), "kept": len(kept), "symbol": symbol, "reprice_decision": "replace", "reprice_reason": reprice_reason}
 
     def cancel_all_orders(self, symbol: str) -> int:
         self._require_paper_execution("cancel_all_orders")
@@ -471,8 +543,8 @@ class PaperExecutionEngine:
         is_flip_trade = exposure_action == "flipping"
         signed = size if fill["side"] == "buy" else -size
         notional = abs(price * size)
-        fee = notional * self.fee_rate
         fill_liquidity = _classify_fill_liquidity(fill, default="maker")
+        fee = notional * (self.maker_fee_rate if fill_liquidity == "maker" else self.taker_fee_rate)
         is_dust_fill = _is_dust_notional(notional, self.dust_position_notional_usd)
         self.paper.fees_paid += fee
         self.paper.cash -= fee
@@ -655,6 +727,9 @@ class LiveExecutionEngine:
         dust_position_notional_usd: float = 2.0,
         leverage: int = 1,
         fee_rate: float = 0.0004,
+        maker_fee_rate: float | None = None,
+        taker_fee_rate: float | None = None,
+        use_alo_orders: bool = True,
         **kwargs,
     ) -> None:
         self.client = client
@@ -680,6 +755,10 @@ class LiveExecutionEngine:
         self.min_notional_blocked_count = 0
         self.leverage = leverage
         self.fee_rate = fee_rate
+        self.maker_fee_rate = float(maker_fee_rate if maker_fee_rate is not None else fee_rate)
+        self.taker_fee_rate = float(taker_fee_rate if taker_fee_rate is not None else fee_rate)
+        self.use_alo_orders = bool(use_alo_orders)
+        self.alo_rejected_count = 0
         self._seen_fill_ids: set[str] = set()
         self._load_live_seen_fills()
         self.min_order_lifetime_seconds = max(int(kwargs.pop("min_order_lifetime_seconds", 90)), 0)
@@ -845,24 +924,46 @@ class LiveExecutionEngine:
         if not can_replace:
             logger.info("reprice_decision decision=skip reprice_reason=%s min_order_lifetime_seconds=%s min_reprice_distance_pct=%s", reprice_reason, self.min_order_lifetime_seconds, self.min_reprice_distance_pct)
             return {"canceled": 0, "placed": 0, "symbol": symbol, "reprice_decision": "skip", "reprice_reason": reprice_reason}
-        existing = [o for o in self.open_orders if str(o.get("symbol", symbol)).upper() == symbol.upper()]
-        canceled = self.cancel_all_orders(symbol)
+        active = [o for o in self.open_orders if str(o.get("symbol", symbol)).upper() == symbol.upper() and not bool(o.get("reduce_only", False))]
+        desired = [{"side": o.side, "price": o.price, "size": o.size} for o in plan.long_levels + plan.short_levels]
+        kept, to_cancel, to_place = _diff_grid_orders(active, desired, self.min_reprice_distance_pct)
         now_ts = time.time()
-        for old in existing:
+        canceled = 0
+        cancel_oids: set[int] = set()
+        for old in to_cancel:
+            oid = old.get("oid")
+            if oid is None:
+                continue
+            try:
+                self.client.cancel_order(symbol, int(oid))
+            except Exception as exc:
+                # The order may have just filled or been canceled; the post-cancel
+                # sync below decides whether state is safe to keep building on.
+                logger.warning("live_cancel_failed oid=%s side=%s price=%s error=%s", oid, old.get("side"), old.get("price"), exc)
+                continue
+            canceled += 1
+            cancel_oids.add(int(oid))
             created = old.get("created_ts")
             lifetime = (now_ts - float(created)) if created else None
             self._record_order_event("cancelled", symbol=symbol, side=str(old.get("side", "")), price=float(old.get("price", 0.0) or 0.0), size=float(old.get("size", 0.0) or 0.0), lifetime_seconds=lifetime)
-        remaining_after_cancel = self.sync_open_orders(symbol)
-        if remaining_after_cancel:
-            logger.warning("live_grid_rebuild_skipped reason=cancel_confirmation_pending remaining_open_orders=%s", len(remaining_after_cancel))
-            return {"canceled": canceled, "placed": 0, "symbol": symbol, "error": "cancel_confirmation_pending", "reprice_decision": "replace", "reprice_reason": reprice_reason}
+        if to_cancel:
+            remaining_after_cancel = self.sync_open_orders(symbol)
+            still_present = [o for o in remaining_after_cancel if o.get("oid") is not None and int(o["oid"]) in cancel_oids]
+            if still_present or canceled < len(to_cancel):
+                logger.warning(
+                    "live_grid_rebuild_skipped reason=cancel_confirmation_pending remaining_canceled_orders=%s cancel_failures=%s kept=%s",
+                    len(still_present),
+                    len(to_cancel) - canceled,
+                    len(kept),
+                )
+                return {"canceled": canceled, "placed": 0, "kept": len(kept), "symbol": symbol, "error": "cancel_confirmation_pending", "reprice_decision": "replace", "reprice_reason": reprice_reason}
         placed = 0
-        for order in plan.long_levels + plan.short_levels:
-            if self._submit_live_limit(symbol, order.side, order.size, order.price, reduce_only=False):
+        for level in to_place:
+            if self._submit_live_limit(symbol, level["side"], level["size"], level["price"], reduce_only=False):
                 placed += 1
         self.sync_open_orders(symbol)
-        logger.info("reprice_decision decision=replace reprice_reason=%s canceled=%s placed=%s", reprice_reason, canceled, placed)
-        return {"canceled": canceled, "placed": placed, "symbol": symbol, "reprice_decision": "replace", "reprice_reason": reprice_reason}
+        logger.info("reprice_decision decision=replace reprice_reason=%s canceled=%s placed=%s kept=%s", reprice_reason, canceled, placed, len(kept))
+        return {"canceled": canceled, "placed": placed, "kept": len(kept), "symbol": symbol, "reprice_decision": "replace", "reprice_reason": reprice_reason}
 
     def cancel_all_orders(self, symbol: str) -> int:
         canceled = self.client.cancel_all_orders(symbol)
@@ -1074,11 +1175,24 @@ class LiveExecutionEngine:
         if not reduce_only and abs((self.state.position_size + _signed_order_size(side, normalized_size)) * normalized_price) > self.max_position_notional_usd + 1e-9:
             logger.warning("live_order_blocked reason=max_position_notional side=%s price=%s size=%s", side, normalized_price, normalized_size)
             return False
-        logger.info("order_submitted mode=live side=%s price=%s qty=%s notional=%s reduce_only=%s", side, normalized_price, normalized_size, notional, reduce_only)
+        # Grid entries are post-only (Alo) so they always rest as maker; reduce-only
+        # closes keep Gtc because they may need to cross the book immediately.
+        post_only = self.use_alo_orders and not reduce_only
+        logger.info("order_submitted mode=live side=%s price=%s qty=%s notional=%s reduce_only=%s post_only=%s", side, normalized_price, normalized_size, notional, reduce_only, post_only)
         try:
-            self.client.place_limit_order(symbol, side, normalized_size, normalized_price, reduce_only=reduce_only)
+            response = self.client.place_limit_order(symbol, side, normalized_size, normalized_price, reduce_only=reduce_only, post_only=post_only)
         except ValueError as exc:
             logger.warning("live_order_skipped reason=sdk_wire_rounding_error side=%s price=%s size=%s error=%s", side, normalized_price, normalized_size, exc)
+            return False
+        error = _order_submit_error(response)
+        if error:
+            if post_only and _is_post_only_reject(error):
+                # The level would have crossed the spread (taker fill); skipping it
+                # is the intended fee protection, the next tick re-plans the grid.
+                self.alo_rejected_count += 1
+                logger.warning("live_order_alo_rejected side=%s price=%s size=%s alo_rejected_count=%s error=%s", side, normalized_price, normalized_size, self.alo_rejected_count, error)
+            else:
+                logger.warning("live_order_rejected side=%s price=%s size=%s reduce_only=%s error=%s", side, normalized_price, normalized_size, reduce_only, error)
             return False
         if not reduce_only:
             self._record_order_event("submitted", symbol=symbol, side=side, price=normalized_price, size=normalized_size)

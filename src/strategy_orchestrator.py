@@ -471,7 +471,7 @@ class StrategyOrchestrator:
             regime=regime,
             regime_signal=regime_signal,
             spacing_pct=final_spacing_pct,
-            fee_rate=max(float(getattr(self.execution_engine, "fee_rate", 0.0)), 0.0),
+            fee_rate=self._planning_fee_rate(),
             force_reduce_only=force_reduce_only,
         )
         allow_buys = entry_filter_context.pop("allow_buys")
@@ -484,7 +484,7 @@ class StrategyOrchestrator:
             regime=regime,
             orderbook=orderbook_context,
             spacing_pct=final_spacing_pct,
-            fee_rate=max(float(getattr(self.execution_engine, "fee_rate", 0.0)), 0.0),
+            fee_rate=self._planning_fee_rate(),
             force_reduce_only=force_reduce_only,
         )
         allow_buys = orderbook_filter_context.pop("allow_buys")
@@ -1517,6 +1517,18 @@ class StrategyOrchestrator:
         )
         return context
 
+    def _planning_fee_rate(self) -> float:
+        """Per-side fee rate used for edge/spacing planning.
+
+        Grid orders are submitted post-only (Alo), so both the entry and the
+        paired exit rest as maker; planning with the taker rate would block
+        profitable levels and force wider spacing than necessary.
+        """
+        maker = getattr(self.execution_engine, "maker_fee_rate", None)
+        if maker is None:
+            maker = getattr(self.execution_engine, "fee_rate", 0.0)
+        return max(float(maker or 0.0), 0.0)
+
     def _entry_edge_score(self, spacing_pct: float, fee_rate: float) -> float:
         roundtrip_fee_pct = max(fee_rate * 2.0, 1e-9)
         return max(spacing_pct, 0.0) / roundtrip_fee_pct
@@ -1798,7 +1810,7 @@ class StrategyOrchestrator:
         kept_short = []
         skipped = 0
         skipped_by_reason: dict[str, int] = {}
-        fee_rate = max(float(getattr(self.execution_engine, "fee_rate", 0.0)), 0.0)
+        fee_rate = self._planning_fee_rate()
         min_edge_usd = max(float(self.config.min_expected_net_edge_usd), 0.0)
         min_edge_pct = max(float(self.config.min_expected_net_edge_pct), 0.0)
         min_rr = max(float(self.config.min_rr_ratio), 0.0)
@@ -2164,7 +2176,7 @@ class StrategyOrchestrator:
         atr_component = atr_pct * self.config.grid_spacing_vol_multiplier
         vol_component = return_vol_pct * self.config.grid_spacing_vol_multiplier
         raw_spacing = max(self.config.grid_spacing_pct, atr_component, vol_component) * spacing_multiplier
-        fee_rate = max(float(getattr(self.execution_engine, "fee_rate", 0.0)), 0.0)
+        fee_rate = self._planning_fee_rate()
         fee_floor_pct = fee_rate * 2.0 * max(float(getattr(self.config, "min_net_profit_fee_multiplier", 3.0)), 1.0)
         global_min = max(float(getattr(self.config, "grid_spacing_pct_min", 0.004)), fee_floor_pct)
         global_max = max(float(getattr(self.config, "grid_spacing_pct_max", 0.0075)), global_min)
