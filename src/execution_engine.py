@@ -106,7 +106,7 @@ def trade_category_for_action(exposure_action: str) -> str:
     }.get(exposure_action, exposure_action or "unknown")
 
 class PaperExecutionEngine:
-    def __init__(self, client: HyperliquidClient, state_file: str, paper_mode: bool = True, enable_live_trading: bool = False, fee_rate: float = 0.0004, start_balance: float = 500.0, fill_model: str = "optimistic", max_position_notional_usd: float = 500.0, soft_exposure_cap_pct: float = 0.6, hard_exposure_cap_pct: float = 0.8, absolute_exposure_cap_pct: float = 1.0, allow_position_flip: bool = False, min_order_notional_usd: float | None = None, dust_position_notional_usd: float = 2.0, trade_ledger_csv: str | None = None, trade_ledger_jsonl: str | None = None, risk_decisions_csv: str | None = None) -> None:
+    def __init__(self, client: HyperliquidClient, state_file: str, paper_mode: bool = True, enable_live_trading: bool = False, fee_rate: float = 0.0004, start_balance: float = 500.0, fill_model: str = "optimistic", max_position_notional_usd: float = 500.0, soft_exposure_cap_pct: float = 0.6, hard_exposure_cap_pct: float = 0.8, absolute_exposure_cap_pct: float = 1.0, allow_position_flip: bool = False, min_order_notional_usd: float | None = None, dust_position_notional_usd: float = 2.0, trade_ledger_csv: str | None = None, trade_ledger_jsonl: str | None = None, risk_decisions_csv: str | None = None, min_order_lifetime_seconds: int = 90, min_reprice_distance_pct: float = 0.0015) -> None:
         self.client = client
         self.paper_mode = paper_mode
         self.enable_live_trading = enable_live_trading
@@ -133,6 +133,58 @@ class PaperExecutionEngine:
         self.last_real_trade_ts: datetime | None = None
         self.flip_trade_count = 0
         self.last_flip_trade_ts: datetime | None = None
+        self.min_order_lifetime_seconds = max(int(min_order_lifetime_seconds), 0)
+        self.min_reprice_distance_pct = max(float(min_reprice_distance_pct), 0.0)
+        self.order_events: list[dict] = []
+
+    def _record_order_event(self, event_type: str, *, symbol: str = "", side: str = "", price: float | None = None, size: float | None = None, lifetime_seconds: float | None = None) -> None:
+        self.order_events.append({"ts": time.time(), "event": event_type, "symbol": symbol, "side": side, "price": price, "size": size, "lifetime_seconds": lifetime_seconds})
+        cutoff = time.time() - 24 * 3600
+        self.order_events = [e for e in self.order_events if float(e.get("ts", 0.0) or 0.0) >= cutoff]
+
+    def fill_rate_metrics(self, mark_price: float, *, symbol: str = "") -> dict:
+        now = time.time()
+        out: dict[str, object] = {}
+        for label, seconds in (("1h", 3600), ("6h", 21600), ("24h", 86400)):
+            events = [e for e in self.order_events if now - float(e.get("ts", 0.0) or 0.0) <= seconds and (not symbol or str(e.get("symbol", "")).upper() == symbol.upper())]
+            submitted = sum(1 for e in events if e.get("event") == "submitted")
+            cancelled = sum(1 for e in events if e.get("event") == "cancelled")
+            filled = sum(1 for e in events if e.get("event") == "filled")
+            lifetimes = [float(e["lifetime_seconds"]) for e in events if e.get("event") in {"cancelled", "filled"} and e.get("lifetime_seconds") is not None]
+            out[label] = {"orders_submitted": submitted, "orders_cancelled": cancelled, "orders_filled": filled, "fill_rate": (filled / submitted) if submitted else 0.0, "cancel_to_fill_ratio": (cancelled / filled) if filled else float(cancelled), "average_order_lifetime_seconds": (sum(lifetimes) / len(lifetimes)) if lifetimes else 0.0}
+        relevant_orders = [o for o in self.open_orders if not symbol or str(o.get("symbol", "")).upper() == symbol.upper()]
+        distances = [abs(float(o.get("price", 0.0) or 0.0) - mark_price) / max(mark_price, 1e-9) for o in relevant_orders]
+        buys = [o for o in relevant_orders if str(o.get("side", "")).lower() == "buy"]
+        sells = [o for o in relevant_orders if str(o.get("side", "")).lower() == "sell"]
+        nearest_buy = max((float(o.get("price", 0.0) or 0.0) for o in buys), default=None)
+        nearest_sell = min((float(o.get("price", 0.0) or 0.0) for o in sells), default=None)
+        last_fill_age = None
+        if self.last_real_trade_ts is not None:
+            last_fill_age = (datetime.now(timezone.utc) - self.last_real_trade_ts).total_seconds() / 60.0
+        out.update({"average_distance_to_mid_pct": (sum(distances) / len(distances)) if distances else None, "nearest_buy_distance_pct": ((mark_price - nearest_buy) / mark_price) if nearest_buy else None, "nearest_sell_distance_pct": ((nearest_sell - mark_price) / mark_price) if nearest_sell else None, "time_since_last_fill_minutes": last_fill_age})
+        return out
+
+    def _can_replace_grid_now(self, symbol: str, plan: GridPlan) -> tuple[bool, str]:
+        active = [o for o in self.open_orders if str(o.get("symbol", symbol)).upper() == symbol.upper() and not bool(o.get("reduce_only", False))]
+        if not active:
+            return True, "no_existing_orders"
+        now = time.time()
+        ages = [now - float(o.get("created_ts") or now) for o in active]
+        min_age = min(ages) if ages else 0.0
+        if min_age < self.min_order_lifetime_seconds:
+            return False, "min_order_lifetime"
+        new_by_side = {"buy": sorted([x.price for x in plan.long_levels], reverse=True), "sell": sorted([x.price for x in plan.short_levels])}
+        old_by_side = {"buy": sorted([float(o.get("price", 0.0) or 0.0) for o in active if str(o.get("side", "")).lower() == "buy"], reverse=True), "sell": sorted([float(o.get("price", 0.0) or 0.0) for o in active if str(o.get("side", "")).lower() == "sell"])}
+        deltas: list[float] = []
+        for side in ("buy", "sell"):
+            for old_px, new_px in zip(old_by_side[side], new_by_side[side]):
+                deltas.append(abs(float(new_px) - old_px) / max(old_px, 1e-9))
+            if len(old_by_side[side]) != len(new_by_side[side]):
+                deltas.append(self.min_reprice_distance_pct)
+        max_delta = max(deltas) if deltas else self.min_reprice_distance_pct
+        if max_delta < self.min_reprice_distance_pct:
+            return False, "min_reprice_distance"
+        return True, "reprice_threshold_met"
 
     def _require_paper_execution(self, action: str) -> None:
         if not self.paper_mode:
@@ -168,8 +220,20 @@ class PaperExecutionEngine:
     def cancel_replace_grid(self, symbol: str, plan: GridPlan) -> dict[str, int | str]:
         self._require_paper_execution("cancel_replace_grid")
         if not plan.should_regrid:
-            return {"canceled": 0, "placed": 0, "symbol": symbol}
+            return {"canceled": 0, "placed": 0, "symbol": symbol, "reprice_decision": "skip", "reprice_reason": "regrid_not_required"}
+        can_replace, reprice_reason = self._can_replace_grid_now(symbol, plan)
+        if not can_replace:
+            logger.info("reprice_decision decision=skip reprice_reason=%s min_order_lifetime_seconds=%s min_reprice_distance_pct=%s", reprice_reason, self.min_order_lifetime_seconds, self.min_reprice_distance_pct)
+            return {"canceled": 0, "placed": 0, "symbol": symbol, "reprice_decision": "skip", "reprice_reason": reprice_reason}
         now_ts = time.time()
+        canceled = 0
+        retained = [o for o in self.open_orders if str(o.get("symbol", symbol)).upper() != symbol.upper() or bool(o.get("reduce_only", False))]
+        for old in self.open_orders:
+            if str(old.get("symbol", symbol)).upper() == symbol.upper() and not bool(old.get("reduce_only", False)):
+                canceled += 1
+                created = old.get("created_ts")
+                lifetime = (now_ts - float(created)) if created else None
+                self._record_order_event("cancelled", symbol=symbol, side=str(old.get("side", "")), price=float(old.get("price", 0.0) or 0.0), size=float(old.get("size", 0.0) or 0.0), lifetime_seconds=lifetime)
         orders = []
         for o in (plan.long_levels + plan.short_levels):
             notional = abs(o.price * o.size)
@@ -184,9 +248,12 @@ class PaperExecutionEngine:
                     self.min_order_notional_usd,
                 )
                 continue
-            orders.append({"symbol": symbol, "side": o.side, "price": o.price, "size": o.size, "created_ts": now_ts, "order_source": "normal_entry"})
-        self.open_orders = orders
-        return {"canceled": 0, "placed": len(self.open_orders), "symbol": symbol}
+            order = {"symbol": symbol, "side": o.side, "price": o.price, "size": o.size, "created_ts": now_ts, "order_source": "normal_entry"}
+            orders.append(order)
+            self._record_order_event("submitted", symbol=symbol, side=o.side, price=o.price, size=o.size)
+        self.open_orders = retained + orders
+        logger.info("reprice_decision decision=replace reprice_reason=%s canceled=%s placed=%s", reprice_reason, canceled, len(orders))
+        return {"canceled": canceled, "placed": len(orders), "symbol": symbol, "reprice_decision": "replace", "reprice_reason": reprice_reason}
 
     def cancel_all_orders(self, symbol: str) -> int:
         self._require_paper_execution("cancel_all_orders")
@@ -467,6 +534,9 @@ class PaperExecutionEngine:
             "orderbook_pressure_score": orderbook_pressure_score,
             "prediction_bias": prediction_bias,
         }
+        created = fill.get("created_ts")
+        lifetime = (time.time() - float(created)) if created else None
+        self._record_order_event("filled", symbol=str(fill.get("symbol", "")), side=str(fill.get("side", "")), price=price, size=size, lifetime_seconds=lifetime)
         self.trade_log.append(entry)
         self._append_trade_ledger(entry)
 
@@ -611,7 +681,57 @@ class LiveExecutionEngine:
         self.fee_rate = fee_rate
         self._seen_fill_ids: set[str] = set()
         self._load_live_seen_fills()
+        self.min_order_lifetime_seconds = max(int(kwargs.pop("min_order_lifetime_seconds", 90)), 0)
+        self.min_reprice_distance_pct = max(float(kwargs.pop("min_reprice_distance_pct", 0.0015)), 0.0)
+        self.order_events: list[dict] = []
         self.client.require_live_execution_support()
+
+    def _record_order_event(self, event_type: str, *, symbol: str = "", side: str = "", price: float | None = None, size: float | None = None, lifetime_seconds: float | None = None) -> None:
+        self.order_events.append({"ts": time.time(), "event": event_type, "symbol": symbol, "side": side, "price": price, "size": size, "lifetime_seconds": lifetime_seconds})
+        cutoff = time.time() - 24 * 3600
+        self.order_events = [e for e in self.order_events if float(e.get("ts", 0.0) or 0.0) >= cutoff]
+
+    def fill_rate_metrics(self, mark_price: float, *, symbol: str = "") -> dict:
+        now = time.time()
+        out: dict[str, object] = {}
+        for label, seconds in (("1h", 3600), ("6h", 21600), ("24h", 86400)):
+            events = [e for e in self.order_events if now - float(e.get("ts", 0.0) or 0.0) <= seconds and (not symbol or str(e.get("symbol", "")).upper() == symbol.upper())]
+            submitted = sum(1 for e in events if e.get("event") == "submitted")
+            cancelled = sum(1 for e in events if e.get("event") == "cancelled")
+            filled = sum(1 for e in events if e.get("event") == "filled")
+            lifetimes = [float(e["lifetime_seconds"]) for e in events if e.get("event") in {"cancelled", "filled"} and e.get("lifetime_seconds") is not None]
+            out[label] = {"orders_submitted": submitted, "orders_cancelled": cancelled, "orders_filled": filled, "fill_rate": (filled / submitted) if submitted else 0.0, "cancel_to_fill_ratio": (cancelled / filled) if filled else float(cancelled), "average_order_lifetime_seconds": (sum(lifetimes) / len(lifetimes)) if lifetimes else 0.0}
+        relevant_orders = [o for o in self.open_orders if not symbol or str(o.get("symbol", "")).upper() == symbol.upper()]
+        distances = [abs(float(o.get("price", 0.0) or 0.0) - mark_price) / max(mark_price, 1e-9) for o in relevant_orders]
+        buys = [o for o in relevant_orders if str(o.get("side", "")).lower() == "buy"]
+        sells = [o for o in relevant_orders if str(o.get("side", "")).lower() == "sell"]
+        nearest_buy = max((float(o.get("price", 0.0) or 0.0) for o in buys), default=None)
+        nearest_sell = min((float(o.get("price", 0.0) or 0.0) for o in sells), default=None)
+        last_fill_age = None
+        if self.last_real_trade_ts is not None:
+            last_fill_age = (datetime.now(timezone.utc) - self.last_real_trade_ts).total_seconds() / 60.0
+        out.update({"average_distance_to_mid_pct": (sum(distances) / len(distances)) if distances else None, "nearest_buy_distance_pct": ((mark_price - nearest_buy) / mark_price) if nearest_buy else None, "nearest_sell_distance_pct": ((nearest_sell - mark_price) / mark_price) if nearest_sell else None, "time_since_last_fill_minutes": last_fill_age})
+        return out
+
+    def _can_replace_grid_now(self, symbol: str, plan: GridPlan) -> tuple[bool, str]:
+        active = [o for o in self.open_orders if str(o.get("symbol", symbol)).upper() == symbol.upper() and not bool(o.get("reduce_only", False))]
+        if not active:
+            return True, "no_existing_orders"
+        now = time.time()
+        ages = [now - float(o.get("created_ts") or now) for o in active]
+        if ages and min(ages) < self.min_order_lifetime_seconds:
+            return False, "min_order_lifetime"
+        new_by_side = {"buy": sorted([x.price for x in plan.long_levels], reverse=True), "sell": sorted([x.price for x in plan.short_levels])}
+        old_by_side = {"buy": sorted([float(o.get("price", 0.0) or 0.0) for o in active if str(o.get("side", "")).lower() == "buy"], reverse=True), "sell": sorted([float(o.get("price", 0.0) or 0.0) for o in active if str(o.get("side", "")).lower() == "sell"])}
+        deltas: list[float] = []
+        for side in ("buy", "sell"):
+            for old_px, new_px in zip(old_by_side[side], new_by_side[side]):
+                deltas.append(abs(float(new_px) - old_px) / max(old_px, 1e-9))
+            if len(old_by_side[side]) != len(new_by_side[side]):
+                deltas.append(self.min_reprice_distance_pct)
+        if (max(deltas) if deltas else self.min_reprice_distance_pct) < self.min_reprice_distance_pct:
+            return False, "min_reprice_distance"
+        return True, "reprice_threshold_met"
 
     def _require_paper_execution(self, action: str) -> None:
         raise RuntimeError(f"live_execution_forbids_paper_simulation: {action} cannot run in LIVE mode")
@@ -716,20 +836,31 @@ class LiveExecutionEngine:
         return None
 
     def cancel_replace_grid(self, symbol: str, plan: GridPlan) -> dict[str, int | str]:
+        self.sync_open_orders(symbol)
         if not plan.should_regrid:
-            self.sync_open_orders(symbol)
-            return {"canceled": 0, "placed": 0, "symbol": symbol}
+            return {"canceled": 0, "placed": 0, "symbol": symbol, "reprice_decision": "skip", "reprice_reason": "regrid_not_required"}
+        can_replace, reprice_reason = self._can_replace_grid_now(symbol, plan)
+        if not can_replace:
+            logger.info("reprice_decision decision=skip reprice_reason=%s min_order_lifetime_seconds=%s min_reprice_distance_pct=%s", reprice_reason, self.min_order_lifetime_seconds, self.min_reprice_distance_pct)
+            return {"canceled": 0, "placed": 0, "symbol": symbol, "reprice_decision": "skip", "reprice_reason": reprice_reason}
+        existing = [o for o in self.open_orders if str(o.get("symbol", symbol)).upper() == symbol.upper()]
         canceled = self.cancel_all_orders(symbol)
+        now_ts = time.time()
+        for old in existing:
+            created = old.get("created_ts")
+            lifetime = (now_ts - float(created)) if created else None
+            self._record_order_event("cancelled", symbol=symbol, side=str(old.get("side", "")), price=float(old.get("price", 0.0) or 0.0), size=float(old.get("size", 0.0) or 0.0), lifetime_seconds=lifetime)
         remaining_after_cancel = self.sync_open_orders(symbol)
         if remaining_after_cancel:
             logger.warning("live_grid_rebuild_skipped reason=cancel_confirmation_pending remaining_open_orders=%s", len(remaining_after_cancel))
-            return {"canceled": canceled, "placed": 0, "symbol": symbol, "error": "cancel_confirmation_pending"}
+            return {"canceled": canceled, "placed": 0, "symbol": symbol, "error": "cancel_confirmation_pending", "reprice_decision": "replace", "reprice_reason": reprice_reason}
         placed = 0
         for order in plan.long_levels + plan.short_levels:
             if self._submit_live_limit(symbol, order.side, order.size, order.price, reduce_only=False):
                 placed += 1
         self.sync_open_orders(symbol)
-        return {"canceled": canceled, "placed": placed, "symbol": symbol}
+        logger.info("reprice_decision decision=replace reprice_reason=%s canceled=%s placed=%s", reprice_reason, canceled, placed)
+        return {"canceled": canceled, "placed": placed, "symbol": symbol, "reprice_decision": "replace", "reprice_reason": reprice_reason}
 
     def cancel_all_orders(self, symbol: str) -> int:
         canceled = self.client.cancel_all_orders(symbol)
@@ -837,14 +968,18 @@ class LiveExecutionEngine:
                 entry["flip_trade_count"] = self.flip_trade_count
             entry["realized_pnl_total"] = self.state.realized_pnl
             entry["fees_paid"] = self.state.fees_paid
+            self._record_order_event("filled", symbol=str(entry.get("symbol", symbol or "")), side=str(entry.get("side", "")), price=float(entry.get("price", 0.0) or 0.0), size=float(entry.get("qty", 0.0) or 0.0))
             self.trade_log.append(entry)
             self._append_trade_ledger(entry)
             new_entries.append(entry)
         if new_entries:
+            self.no_fill_cycles = 0
             self.last_real_trade_ts = datetime.now(timezone.utc)
             if symbol:
                 self.sync_account(symbol, None)
             self.save_state()
+        else:
+            self.no_fill_cycles += 1
         return new_entries
 
 
@@ -943,6 +1078,8 @@ class LiveExecutionEngine:
         except ValueError as exc:
             logger.warning("live_order_skipped reason=sdk_wire_rounding_error side=%s price=%s size=%s error=%s", side, normalized_price, normalized_size, exc)
             return False
+        if not reduce_only:
+            self._record_order_event("submitted", symbol=symbol, side=side, price=normalized_price, size=normalized_size)
         return True
 
     def _fill_id(self, raw: dict) -> str:
