@@ -76,6 +76,32 @@ def test_os_env_profile_precedence_over_dotenv(tmp_path, monkeypatch):
     assert cfg.env_profile == "paper"
     assert cfg.grid_levels == 11
 
+
+def test_fill_execution_defaults_are_loosened(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ENV_PROFILE", raising=False)
+    monkeypatch.delenv("MIN_EXPECTED_NET_PROFIT_FEE_MULTIPLE", raising=False)
+    monkeypatch.delenv("MIN_NET_PROFIT_FEE_MULTIPLIER", raising=False)
+    monkeypatch.delenv("GRID_SPACING_PCT_MIN", raising=False)
+    monkeypatch.delenv("GRID_SPACING_MIN_PCT", raising=False)
+
+    cfg = BotConfig.from_env()
+
+    assert cfg.grid_spacing_pct_min == pytest.approx(0.0025)
+    assert cfg.min_expected_net_profit_fee_multiple == pytest.approx(2.75)
+    assert cfg.min_net_profit_fee_multiplier == pytest.approx(2.75)
+
+
+def test_low_fill_rate_warning_logs_after_180_minutes(caplog):
+    from src.main import _log_low_fill_rate_warning
+
+    caplog.set_level(logging.WARNING, logger="src.main")
+
+    _log_low_fill_rate_warning(181.0)
+
+    assert "LOW_FILL_RATE_WARNING" in caplog.text
+    assert "time_since_last_fill_minutes=181.00" in caplog.text
+
 def test_grid_generation():
     gm = GridManager()
     plan = gm.build_grid(100, 3, 0.01, 0.0, MarketRegime.RANGE, 1, 0.0, 0.0, GridMode.NEUTRAL)
@@ -2519,7 +2545,7 @@ def test_volatility_adaptive_spacing_uses_configured_buckets(tmp_path):
     normal_spacing, normal_source = orch._calculate_spacing_pct(0.006, 0.001)
     high_spacing, high_source = orch._calculate_spacing_pct(0.02, 0.001)
 
-    assert low_spacing >= 0.0035
+    assert 0.0025 <= low_spacing <= 0.0030
     assert 0.0035 <= normal_spacing <= 0.0045
     assert 0.0055 <= high_spacing <= 0.0055
     assert "low_volatility" in low_source

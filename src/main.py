@@ -28,6 +28,26 @@ DEFAULT_LOCK_FILE = Path("/tmp/hyperliquid_adaptive_grid_bot.lock")
 TRADES_CSV = Path("logs/trades.csv")
 RISK_DECISIONS_CSV = Path("logs/risk_decisions.csv")
 LAST_100_REAL_TRADES_CSV = Path("logs/last_100_real_trades.csv")
+LOW_FILL_RATE_WARNING_MINUTES = 180.0
+
+
+def _time_since_last_fill_minutes(fill_rate_metrics: dict, engine: object, tick_seconds: int) -> float | None:
+    metric_age = fill_rate_metrics.get("time_since_last_fill_minutes") if isinstance(fill_rate_metrics, dict) else None
+    if metric_age is not None:
+        return float(metric_age)
+    no_fill_cycles = float(getattr(engine, "no_fill_cycles", 0) or 0)
+    if no_fill_cycles <= 0:
+        return None
+    return no_fill_cycles * max(float(tick_seconds), 0.0) / 60.0
+
+
+def _log_low_fill_rate_warning(time_since_last_fill_minutes: float | None) -> None:
+    if time_since_last_fill_minutes is not None and time_since_last_fill_minutes > LOW_FILL_RATE_WARNING_MINUTES:
+        logger.warning(
+            "LOW_FILL_RATE_WARNING time_since_last_fill_minutes=%.2f threshold_minutes=%.2f",
+            time_since_last_fill_minutes,
+            LOW_FILL_RATE_WARNING_MINUTES,
+        )
 
 
 def to_df(candles: list[dict]) -> pd.DataFrame:
@@ -1106,15 +1126,20 @@ def run() -> None:
         nearest_buy = float(buys[0]["price"]) if buys else None
         nearest_sell = float(sells[0]["price"]) if sells else None
         fill_rate_metrics = engine.fill_rate_metrics(mark_price, symbol=cfg.default_symbol) if hasattr(engine, "fill_rate_metrics") else {}
+        time_since_last_fill_minutes = _time_since_last_fill_minutes(fill_rate_metrics, engine, cfg.tick_seconds)
+        if isinstance(fill_rate_metrics, dict):
+            fill_rate_metrics["time_since_last_fill_minutes"] = time_since_last_fill_minutes
+        _log_low_fill_rate_warning(time_since_last_fill_minutes)
         one_hour_fill_rate = fill_rate_metrics.get("1h", {}) if isinstance(fill_rate_metrics.get("1h", {}), dict) else {}
         logger.info(
-            "fill_rate_state orders_submitted=%s orders_cancelled=%s orders_filled=%s cancel_to_fill_ratio=%s nearest_buy_distance_pct=%s nearest_sell_distance_pct=%s avg_order_lifetime_seconds=%s avg_order_distance_to_mid_pct=%s spacing_pct=%s reprice_decision=%s reprice_reason=%s no_fill_watchdog_active=%s",
+            "fill_rate_state orders_submitted=%s orders_cancelled=%s orders_filled=%s cancel_to_fill_ratio=%s nearest_buy_distance_pct=%s nearest_sell_distance_pct=%s time_since_last_fill_minutes=%s avg_order_lifetime_seconds=%s avg_order_distance_to_mid_pct=%s spacing_pct=%s reprice_decision=%s reprice_reason=%s no_fill_watchdog_active=%s",
             one_hour_fill_rate.get("orders_submitted", 0),
             one_hour_fill_rate.get("orders_cancelled", 0),
             one_hour_fill_rate.get("orders_filled", 0),
             one_hour_fill_rate.get("cancel_to_fill_ratio", 0.0),
             fill_rate_metrics.get("nearest_buy_distance_pct"),
             fill_rate_metrics.get("nearest_sell_distance_pct"),
+            time_since_last_fill_minutes,
             one_hour_fill_rate.get("average_order_lifetime_seconds", 0.0),
             fill_rate_metrics.get("average_distance_to_mid_pct"),
             status_payload.get("grid_spacing_pct"),
@@ -1135,7 +1160,7 @@ def run() -> None:
                 "average_distance_to_mid_pct": fill_rate_metrics.get("average_distance_to_mid_pct"),
                 "nearest_buy_distance_pct": fill_rate_metrics.get("nearest_buy_distance_pct"),
                 "nearest_sell_distance_pct": fill_rate_metrics.get("nearest_sell_distance_pct"),
-                "time_since_last_fill_minutes": fill_rate_metrics.get("time_since_last_fill_minutes"),
+                "time_since_last_fill_minutes": time_since_last_fill_minutes,
                 "active_buy_orders": len(buys),
                 "active_sell_orders": len(sells),
                 "one_sided_grid_due_to_dust": bool(is_dust_position and ((len(buys) == 0) ^ (len(sells) == 0)) and (len(buys) + len(sells) > 0)),
