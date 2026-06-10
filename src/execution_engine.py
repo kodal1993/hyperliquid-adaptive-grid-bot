@@ -151,7 +151,8 @@ class PaperExecutionEngine:
             cancelled = sum(1 for e in events if e.get("event") == "cancelled")
             filled = sum(1 for e in events if e.get("event") == "filled")
             lifetimes = [float(e["lifetime_seconds"]) for e in events if e.get("event") in {"cancelled", "filled"} and e.get("lifetime_seconds") is not None]
-            out[label] = {"orders_submitted": submitted, "orders_cancelled": cancelled, "orders_filled": filled, "fill_rate": (filled / submitted) if submitted else 0.0, "cancel_to_fill_ratio": (cancelled / filled) if filled else float(cancelled), "average_order_lifetime_seconds": (sum(lifetimes) / len(lifetimes)) if lifetimes else 0.0}
+            avg_lifetime = (sum(lifetimes) / len(lifetimes)) if lifetimes else 0.0
+            out[label] = {"orders_submitted": submitted, "orders_cancelled": cancelled, "orders_filled": filled, "fill_rate": (filled / submitted) if submitted else 0.0, "cancel_to_fill_ratio": (cancelled / filled) if filled else float(cancelled), "avg_order_lifetime_seconds": avg_lifetime, "average_order_lifetime_seconds": avg_lifetime}
         relevant_orders = [o for o in self.open_orders if not symbol or str(o.get("symbol", "")).upper() == symbol.upper()]
         distances = [abs(float(o.get("price", 0.0) or 0.0) - mark_price) / max(mark_price, 1e-9) for o in relevant_orders]
         buys = [o for o in relevant_orders if str(o.get("side", "")).lower() == "buy"]
@@ -700,7 +701,8 @@ class LiveExecutionEngine:
             cancelled = sum(1 for e in events if e.get("event") == "cancelled")
             filled = sum(1 for e in events if e.get("event") == "filled")
             lifetimes = [float(e["lifetime_seconds"]) for e in events if e.get("event") in {"cancelled", "filled"} and e.get("lifetime_seconds") is not None]
-            out[label] = {"orders_submitted": submitted, "orders_cancelled": cancelled, "orders_filled": filled, "fill_rate": (filled / submitted) if submitted else 0.0, "cancel_to_fill_ratio": (cancelled / filled) if filled else float(cancelled), "average_order_lifetime_seconds": (sum(lifetimes) / len(lifetimes)) if lifetimes else 0.0}
+            avg_lifetime = (sum(lifetimes) / len(lifetimes)) if lifetimes else 0.0
+            out[label] = {"orders_submitted": submitted, "orders_cancelled": cancelled, "orders_filled": filled, "fill_rate": (filled / submitted) if submitted else 0.0, "cancel_to_fill_ratio": (cancelled / filled) if filled else float(cancelled), "avg_order_lifetime_seconds": avg_lifetime, "average_order_lifetime_seconds": avg_lifetime}
         relevant_orders = [o for o in self.open_orders if not symbol or str(o.get("symbol", "")).upper() == symbol.upper()]
         distances = [abs(float(o.get("price", 0.0) or 0.0) - mark_price) / max(mark_price, 1e-9) for o in relevant_orders]
         buys = [o for o in relevant_orders if str(o.get("side", "")).lower() == "buy"]
