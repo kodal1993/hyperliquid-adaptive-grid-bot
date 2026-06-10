@@ -972,13 +972,22 @@ class StrategyOrchestrator:
         )
         if no_fill_watchdog_context["no_fill_watchdog_active"]:
             before_watchdog_spacing = final_spacing_pct
-            final_spacing_pct = max(final_spacing_pct * 0.80, float(self.config.min_grid_profit_over_fees_pct))
+            reduction_pct = min(max(float(getattr(self.config, "no_fill_spacing_reduction_pct", 0.20)), 0.0), 1.0)
+            min_watchdog_spacing = max(
+                float(getattr(self.config, "no_fill_min_spacing_pct", 0.0022)),
+                float(self.config.min_grid_profit_over_fees_pct),
+            )
+            final_spacing_pct = max(final_spacing_pct * (1.0 - reduction_pct), min_watchdog_spacing)
+            no_fill_watchdog_context["no_fill_spacing_before_pct"] = before_watchdog_spacing
+            no_fill_watchdog_context["no_fill_spacing_after_pct"] = final_spacing_pct
+            no_fill_watchdog_context["no_fill_spacing_reduction_pct"] = reduction_pct
+            no_fill_watchdog_context["no_fill_min_spacing_pct"] = min_watchdog_spacing
             spacing_source = f"{spacing_source}_no_fill_watchdog"
             force_recenter = True
             recenter_context["force_recenter"] = True
             recenter_context["forced_rebuild"] = True
             recenter_context["rebuild_reason"] = "no_fill_watchdog"
-            logger.info("maker_fill_proximity_mode enabled=true spacing_pct_before=%.6f spacing_pct_after=%.6f fee_safe_min_pct=%.6f", before_watchdog_spacing, final_spacing_pct, float(self.config.min_grid_profit_over_fees_pct))
+            logger.info("maker_fill_proximity_mode enabled=true spacing_pct_before=%.6f spacing_pct_after=%.6f reduction_pct=%.3f min_spacing_pct=%.6f", before_watchdog_spacing, final_spacing_pct, reduction_pct, min_watchdog_spacing)
         recenter_context.update(no_fill_watchdog_context)
         plan: GridPlan = self.grid_manager.build_grid(price, max(effective_grid_levels, 1), final_spacing_pct, 0.0, regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=build_allow_buys, allow_sells=build_allow_sells, force_recenter=force_recenter, spacing_source=spacing_source, atr_pct=atr_pct, trend_bias=trend_bias, regime_confidence=regime_confidence)
         if effective_position_side == "FLAT" and orderbook_analysis.available and orderbook_analysis.ready:
@@ -1192,7 +1201,8 @@ class StrategyOrchestrator:
     def _no_fill_watchdog_context(self, *, symbol: str, price: float, risk_can_trade: bool, pause_reason: str, position_notional: float) -> dict:
         enabled = bool(getattr(self.config, "no_fill_watchdog_enabled", True))
         max_minutes = float(getattr(self.config, "no_fill_max_minutes", 60))
-        max_nearest = float(getattr(self.config, "no_fill_max_nearest_distance_pct", 0.004))
+        reduction_pct = min(max(float(getattr(self.config, "no_fill_spacing_reduction_pct", 0.20)), 0.0), 1.0)
+        min_spacing_pct = float(getattr(self.config, "no_fill_min_spacing_pct", 0.0022))
         buy_dist, sell_dist = self._nearest_order_distances(symbol, price)
         distances = [d for d in (buy_dist, sell_dist) if d is not None]
         nearest_distance = min(distances) if distances else None
@@ -1205,15 +1215,16 @@ class StrategyOrchestrator:
             effective_no_fill_minutes = max_minutes + 1.0
         open_orders_exist = any(str(o.get("symbol", symbol)).upper() == symbol.upper() for o in getattr(self.execution_engine, "open_orders", []))
         low_exposure = position_notional <= max(float(getattr(self.config, "max_position_notional_usd", 0.0)) * 0.25, float(getattr(self.config, "dust_position_notional_usd", 0.0)))
-        active = bool(enabled and risk_can_trade and pause_reason == "none" and low_exposure and open_orders_exist and effective_no_fill_minutes > max_minutes and nearest_distance is not None and nearest_distance > max_nearest)
+        active = bool(enabled and risk_can_trade and pause_reason == "none" and open_orders_exist and effective_no_fill_minutes >= max_minutes)
         if active:
-            logger.warning("no_fill_watchdog_triggered no_fill_minutes=%.2f max_minutes=%.2f nearest_distance_pct=%.6f max_nearest_distance_pct=%.6f open_orders_exist=%s low_exposure=%s", effective_no_fill_minutes, max_minutes, nearest_distance, max_nearest, open_orders_exist, low_exposure)
+            logger.warning("no_fill_watchdog_triggered no_fill_minutes=%.2f max_minutes=%.2f nearest_distance_pct=%s open_orders_exist=%s low_exposure=%s reduction_pct=%.3f min_spacing_pct=%.6f", effective_no_fill_minutes, max_minutes, nearest_distance, open_orders_exist, low_exposure, reduction_pct, min_spacing_pct)
         return {
             "no_fill_watchdog_active": active,
             "no_fill_watchdog_enabled": enabled,
             "no_fill_minutes": effective_no_fill_minutes,
             "no_fill_max_minutes": max_minutes,
-            "no_fill_max_nearest_distance_pct": max_nearest,
+            "no_fill_spacing_reduction_pct": reduction_pct,
+            "no_fill_min_spacing_pct": min_spacing_pct,
             "nearest_buy_distance_pct": buy_dist,
             "nearest_sell_distance_pct": sell_dist,
             "nearest_order_distance_pct": nearest_distance,

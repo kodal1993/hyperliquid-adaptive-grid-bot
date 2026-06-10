@@ -1080,7 +1080,8 @@ def run() -> None:
                 "no_fill_watchdog_enabled": bool(status.get("no_fill_watchdog_enabled", False)),
                 "no_fill_minutes": status.get("no_fill_minutes"),
                 "no_fill_max_minutes": status.get("no_fill_max_minutes"),
-                "no_fill_max_nearest_distance_pct": status.get("no_fill_max_nearest_distance_pct"),
+                "no_fill_spacing_reduction_pct": status.get("no_fill_spacing_reduction_pct"),
+                "no_fill_min_spacing_pct": status.get("no_fill_min_spacing_pct"),
             }
         )
         last_trade_ts = _resolve_last_real_trade_ts(cfg.default_symbol, fallback=(engine.last_real_trade_ts.isoformat() if engine.last_real_trade_ts else ""))
@@ -1140,7 +1141,7 @@ def run() -> None:
             fill_rate_metrics.get("nearest_buy_distance_pct"),
             fill_rate_metrics.get("nearest_sell_distance_pct"),
             time_since_last_fill_minutes,
-            one_hour_fill_rate.get("average_order_lifetime_seconds", 0.0),
+            one_hour_fill_rate.get("avg_order_lifetime_seconds", one_hour_fill_rate.get("average_order_lifetime_seconds", 0.0)),
             fill_rate_metrics.get("average_distance_to_mid_pct"),
             status_payload.get("grid_spacing_pct"),
             (status.get("orders", {}) or {}).get("reprice_decision") if isinstance(status.get("orders", {}), dict) else None,

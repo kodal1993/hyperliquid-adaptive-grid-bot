@@ -90,6 +90,12 @@ def test_fill_execution_defaults_are_loosened(monkeypatch, tmp_path):
     assert cfg.grid_spacing_pct_min == pytest.approx(0.0025)
     assert cfg.min_expected_net_profit_fee_multiple == pytest.approx(2.75)
     assert cfg.min_net_profit_fee_multiplier == pytest.approx(2.75)
+    assert cfg.no_fill_watchdog_enabled is True
+    assert cfg.no_fill_max_minutes == 60
+    assert cfg.no_fill_spacing_reduction_pct == pytest.approx(0.20)
+    assert cfg.no_fill_min_spacing_pct == pytest.approx(0.0022)
+    assert cfg.min_order_lifetime_seconds == 90
+    assert cfg.min_reprice_distance_pct == pytest.approx(0.0015)
 
 
 def test_low_fill_rate_warning_logs_after_180_minutes(caplog):
@@ -3341,7 +3347,8 @@ def test_no_fill_watchdog_narrows_spacing_after_timeout(tmp_path):
     cfg = BotConfig.from_env()
     cfg.no_fill_watchdog_enabled = True
     cfg.no_fill_max_minutes = 60
-    cfg.no_fill_max_nearest_distance_pct = 0.004
+    cfg.no_fill_spacing_reduction_pct = 0.20
+    cfg.no_fill_min_spacing_pct = 0.0022
     cfg.tick_seconds = 60
     cfg.min_order_notional_usd = 1
     cfg.min_notional_usd = 1
@@ -3367,7 +3374,8 @@ def test_no_fill_watchdog_narrows_spacing_after_timeout(tmp_path):
     status = orch.on_tick(_candles_for_watchdog(100.0), equity=500, daily_pnl_pct=0, symbol="BTC")
 
     assert status["no_fill_watchdog_active"] is True
-    assert status["grid_spacing_pct"] < 0.012
+    assert status["grid_spacing_pct"] == pytest.approx(status["no_fill_spacing_before_pct"] * 0.80)
+    assert status["grid_spacing_pct"] >= cfg.no_fill_min_spacing_pct
     assert len(eng.open_orders) > 0
     assert all(float(o["price"]) * float(o["size"]) >= cfg.min_order_notional_usd for o in eng.open_orders)
 
@@ -3414,7 +3422,8 @@ def test_no_fill_watchdog_never_creates_below_min_notional_order(tmp_path):
     cfg = BotConfig.from_env()
     cfg.no_fill_watchdog_enabled = True
     cfg.no_fill_max_minutes = 60
-    cfg.no_fill_max_nearest_distance_pct = 0.004
+    cfg.no_fill_spacing_reduction_pct = 0.20
+    cfg.no_fill_min_spacing_pct = 0.0022
     cfg.tick_seconds = 60
     cfg.min_order_notional_usd = 50
     cfg.min_notional_usd = 50
@@ -3443,7 +3452,8 @@ def test_no_fill_watchdog_never_creates_zero_order_flat_state(tmp_path):
     cfg = BotConfig.from_env()
     cfg.no_fill_watchdog_enabled = True
     cfg.no_fill_max_minutes = 60
-    cfg.no_fill_max_nearest_distance_pct = 0.004
+    cfg.no_fill_spacing_reduction_pct = 0.20
+    cfg.no_fill_min_spacing_pct = 0.0022
     cfg.tick_seconds = 60
     cfg.min_order_notional_usd = 1
     cfg.min_notional_usd = 1
