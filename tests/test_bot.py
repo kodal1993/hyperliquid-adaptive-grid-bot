@@ -1161,7 +1161,7 @@ def test_live_submit_skips_btc_order_below_min_notional_after_normalization(tmp_
         def get_user_fills(self, symbol=None):
             return []
 
-        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False):
+        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False, post_only=False):
             self.placed.append((symbol, side, size, price, reduce_only))
 
     client = FakeLiveClient()
@@ -1204,7 +1204,7 @@ def test_live_submit_allows_reduce_only_btc_order_below_min_notional_after_norma
         def get_user_fills(self, symbol=None):
             return []
 
-        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False):
+        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False, post_only=False):
             self.placed.append((symbol, side, size, price, reduce_only))
 
     client = FakeLiveClient()
@@ -1245,7 +1245,7 @@ def test_live_flatten_position_uses_aggressive_reduce_only_limit_for_dust_long(t
         def get_user_fills(self, symbol=None):
             return []
 
-        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False):
+        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False, post_only=False):
             self.placed.append((symbol, side, size, price, reduce_only))
 
     client = FakeLiveClient()
@@ -1374,7 +1374,7 @@ def test_live_submit_sends_normalized_btc_wire_values_and_not_raw_floats(tmp_pat
         def get_user_fills(self, symbol=None):
             return []
 
-        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False):
+        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False, post_only=False):
             float_to_wire(price)
             float_to_wire(size)
             self.placed.append((symbol, side, size, price, reduce_only))
@@ -1414,7 +1414,7 @@ def test_live_submit_catches_sdk_wire_rounding_error_and_continues(tmp_path, cap
         def get_user_fills(self, symbol=None):
             return []
 
-        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False):
+        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False, post_only=False):
             raise ValueError("float_to_wire causes rounding", price)
 
     eng = LiveExecutionEngine(
@@ -2133,7 +2133,7 @@ class DummyLiveClient:
     def cancel_all_orders(self, symbol):
         return 0
 
-    def place_limit_order(self, symbol, side, size, price, reduce_only=False):
+    def place_limit_order(self, symbol, side, size, price, reduce_only=False, post_only=False):
         return {"status": "ok"}
 
 
@@ -3678,3 +3678,184 @@ def test_bot_config_validate_accepts_defaults(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     cfg = BotConfig.from_env()
     cfg.validate()
+
+
+class _StatefulLiveClient:
+    """Live client double with mutable open-order book for diff-regrid tests."""
+
+    def __init__(self, orders=None):
+        self.orders = list(orders or [])
+        self.canceled_oids = []
+        self.placed = []
+        self.place_response = {"status": "ok"}
+
+    def require_live_execution_support(self):
+        return None
+
+    def get_balance(self):
+        return {"equity": 1000.0}
+
+    def get_position(self, symbol):
+        return {"coin": symbol, "szi": "0", "entryPx": "0"}
+
+    def get_open_orders(self, symbol):
+        return list(self.orders)
+
+    def get_user_fills(self, symbol=None):
+        return []
+
+    def cancel_order(self, symbol, oid):
+        self.canceled_oids.append(int(oid))
+        self.orders = [o for o in self.orders if int(o["oid"]) != int(oid)]
+        return {"status": "ok"}
+
+    def cancel_all_orders(self, symbol):
+        count = len(self.orders)
+        self.orders = []
+        return count
+
+    def place_limit_order(self, symbol, side, size, price, *, reduce_only=False, post_only=False):
+        self.placed.append({"side": side, "size": size, "price": price, "reduce_only": reduce_only, "post_only": post_only})
+        oid = 1000 + len(self.placed)
+        self.orders.append({"coin": symbol, "side": "B" if side == "buy" else "A", "limitPx": str(price), "sz": str(size), "oid": oid})
+        return self.place_response
+
+
+def _live_engine(tmp_path, client, **kwargs):
+    defaults = dict(
+        start_balance=1000,
+        min_notional_usd=1,
+        max_notional_per_trade_usd=200,
+        max_position_notional_usd=500,
+        min_order_lifetime_seconds=0,
+        min_reprice_distance_pct=0.0015,
+        trade_ledger_csv=str(tmp_path / "trades.csv"),
+        trade_ledger_jsonl=str(tmp_path / "trades.jsonl"),
+        risk_decisions_csv=str(tmp_path / "risk.csv"),
+    )
+    defaults.update(kwargs)
+    return LiveExecutionEngine(client, str(tmp_path / "live_state.json"), **defaults)
+
+
+def test_live_grid_entries_are_post_only_and_reduce_only_closes_are_not(tmp_path):
+    client = _StatefulLiveClient()
+    eng = _live_engine(tmp_path, client)
+
+    assert eng._submit_live_limit("BTC", "buy", 1.0, 99.0, reduce_only=False)
+    assert eng._submit_live_limit("BTC", "sell", 1.0, 101.0, reduce_only=True)
+
+    assert client.placed[0]["post_only"] is True
+    assert client.placed[1]["post_only"] is False
+
+
+def test_live_post_only_can_be_disabled_via_config_flag(tmp_path):
+    client = _StatefulLiveClient()
+    eng = _live_engine(tmp_path, client, use_alo_orders=False)
+
+    assert eng._submit_live_limit("BTC", "buy", 1.0, 99.0, reduce_only=False)
+
+    assert client.placed[0]["post_only"] is False
+
+
+def test_live_alo_rejection_returns_false_and_counts(tmp_path, caplog):
+    client = _StatefulLiveClient()
+    client.place_response = {
+        "status": "ok",
+        "response": {"type": "order", "data": {"statuses": [{"error": "Post only order would have immediately matched, bbo was 99.0"}]}},
+    }
+    eng = _live_engine(tmp_path, client)
+
+    assert not eng._submit_live_limit("BTC", "buy", 1.0, 99.0, reduce_only=False)
+    assert eng.alo_rejected_count == 1
+    assert "live_order_alo_rejected" in caplog.text
+    assert not any(e for e in eng.order_events if e.get("event") == "submitted")
+
+
+def test_live_order_error_status_returns_false(tmp_path, caplog):
+    client = _StatefulLiveClient()
+    client.place_response = {"status": "err", "response": "Insufficient margin"}
+    eng = _live_engine(tmp_path, client)
+
+    assert not eng._submit_live_limit("BTC", "buy", 1.0, 99.0, reduce_only=False)
+    assert eng.alo_rejected_count == 0
+    assert "live_order_rejected" in caplog.text
+
+
+def test_live_cancel_replace_grid_is_diff_based(tmp_path):
+    client = _StatefulLiveClient(orders=[
+        {"coin": "BTC", "side": "B", "limitPx": "99.0", "sz": "1.0", "oid": 1},
+        {"coin": "BTC", "side": "A", "limitPx": "102.0", "sz": "1.0", "oid": 2},
+    ])
+    eng = _live_engine(tmp_path, client)
+    plan = GridManager().build_grid(100, 1, 0.01, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    result = eng.cancel_replace_grid("BTC", plan)
+
+    assert result["reprice_decision"] == "replace"
+    assert result["kept"] == 1
+    assert result["canceled"] == 1
+    assert result["placed"] == 1
+    assert client.canceled_oids == [2]
+    assert len(client.placed) == 1
+    assert client.placed[0]["side"] == "sell"
+    assert client.placed[0]["price"] == pytest.approx(101.0)
+    assert client.placed[0]["post_only"] is True
+    remaining_oids = sorted(int(o["oid"]) for o in client.orders)
+    assert 1 in remaining_oids
+
+
+def test_paper_cancel_replace_grid_keeps_unmoved_orders(tmp_path):
+    eng = make_test_engine(tmp_path, "diff_paper.json", min_order_lifetime_seconds=0, min_reprice_distance_pct=0.0015)
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 1.0, "created_ts": time.time() - 600}]
+    plan = GridManager().build_grid(100, 1, 0.01, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    result = eng.cancel_replace_grid("BTC", plan)
+
+    assert result["reprice_decision"] == "replace"
+    assert result["kept"] == 1
+    assert result["canceled"] == 0
+    assert result["placed"] == 1
+    buys = [o for o in eng.open_orders if o["side"] == "buy"]
+    sells = [o for o in eng.open_orders if o["side"] == "sell"]
+    assert len(buys) == 1 and buys[0]["price"] == pytest.approx(99.0)
+    assert len(sells) == 1 and sells[0]["price"] == pytest.approx(101.0)
+
+
+def test_planning_fee_rate_prefers_maker_fee(tmp_path):
+    cfg = BotConfig.from_env()
+    eng = make_test_engine(tmp_path, "maker_fee.json", fee_rate=0.0004, maker_fee_rate=0.00015, taker_fee_rate=0.00045)
+    orch = StrategyOrchestrator(cfg, eng)
+
+    assert orch._planning_fee_rate() == pytest.approx(0.00015)
+
+
+def test_planning_fee_rate_falls_back_to_flat_fee_rate(tmp_path):
+    cfg = BotConfig.from_env()
+    eng = make_test_engine(tmp_path, "flat_fee.json", fee_rate=0.0004)
+    orch = StrategyOrchestrator(cfg, eng)
+
+    assert orch._planning_fee_rate() == pytest.approx(0.0004)
+
+
+def test_paper_fill_fee_uses_liquidity_specific_rate(tmp_path):
+    eng = make_test_engine(tmp_path, "fee_split.json", maker_fee_rate=0.0001, taker_fee_rate=0.0005)
+
+    eng._apply_fill({"symbol": "BTC", "side": "buy", "price": 100.0, "size": 1.0})
+    maker_fee = eng.paper.fees_paid
+    eng._apply_fill({"symbol": "BTC", "side": "buy", "price": 100.0, "size": 1.0, "liquidity": "taker"})
+    taker_fee = eng.paper.fees_paid - maker_fee
+
+    assert maker_fee == pytest.approx(100.0 * 0.0001)
+    assert taker_fee == pytest.approx(100.0 * 0.0005)
+
+
+def test_bot_config_fee_fields_from_env(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MAKER_FEE_RATE", "0.0002")
+    monkeypatch.setenv("TAKER_FEE_RATE", "0.0006")
+    monkeypatch.setenv("USE_ALO_ORDERS", "false")
+    cfg = BotConfig.from_env()
+
+    assert cfg.maker_fee_rate == pytest.approx(0.0002)
+    assert cfg.taker_fee_rate == pytest.approx(0.0006)
+    assert cfg.use_alo_orders is False

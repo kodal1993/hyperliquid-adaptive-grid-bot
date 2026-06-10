@@ -26,6 +26,7 @@ cp .env.example .env
 ## Key Configuration
 - Network/auth: `HL_NETWORK`, `HL_PRIVATE_KEY`, `HL_ACCOUNT_ADDRESS`
 - Grid: `GRID_LEVELS`, `GRID_SPACING_PCT`, `REGRID_THRESHOLD_PCT`
+- Fees/execution: `MAKER_FEE_RATE`, `TAKER_FEE_RATE`, `USE_ALO_ORDERS` (grid entries are post-only/Alo by default; edge filters plan with the maker rate)
 - Per-trade sizing: `MIN_NOTIONAL_USD`, `MAX_NOTIONAL_PER_TRADE_USD`, `MIN_ORDER_SIZE`, `MAX_ORDER_SIZE`
 - Exposure/risk: `MAX_POSITION_NOTIONAL_USD`, `MAX_ONE_DIRECTION_EXPOSURE_PCT`, `MAX_DRAWDOWN_PCT`, `DAILY_LOSS_LIMIT_PCT`
 - Runtime guard: `PAPER_MODE=false`, `ENABLE_LIVE_TRADING=true`, `LIVE_EXECUTION_ENABLED=true`
