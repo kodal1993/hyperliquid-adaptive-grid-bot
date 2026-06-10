@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from collections.abc import Callable
@@ -81,7 +82,14 @@ def _wire_float(value: Decimal) -> float:
 
 class HyperliquidClient:
     def __init__(
-        self, private_key: str, account_address: str, network: str = "testnet"
+        self,
+        private_key: str,
+        account_address: str,
+        network: str = "testnet",
+        *,
+        use_websocket: bool = False,
+        ws_symbol: str = "",
+        ws_candle_interval: str = "1m",
     ) -> None:
         self.private_key = private_key
         self.account_address = account_address
@@ -95,14 +103,43 @@ class HyperliquidClient:
         )
         self.retry_delays_seconds = _DEFAULT_RETRY_DELAYS_SECONDS
         self.consecutive_api_errors: int = 0
+        self.use_websocket = bool(use_websocket)
+        self.ws_symbol = str(ws_symbol or "").upper()
+        self.ws_candle_interval = ws_candle_interval
+        self.ws_active = False
+        self.ws_orderbook_max_age_seconds = 10.0
+        self.ws_candle_reseed_seconds = 1800.0
+        self.ws_fills_reconcile_every = 30
+        self._ws_lock = threading.Lock()
+        self._ws_book: dict[str, Any] | None = None
+        self._ws_book_ts = 0.0
+        self._ws_candles: dict[int, dict[str, Any]] = {}
+        self._ws_candle_ts = 0.0
+        self._ws_candles_seed_ts = 0.0
+        self._ws_fills: list[dict[str, Any]] = []
+        self._ws_fill_ids: set[str] = set()
+        self._ws_fills_snapshot = False
+        self._ws_fill_calls = 0
 
     def connect(self) -> None:
         try:
-            self.info = Info(self.base_url, skip_ws=True)
-            logger.info("Hyperliquid SDK Info connected network=%s", self.network)
+            self.info = Info(self.base_url, skip_ws=not self.use_websocket)
+            logger.info(
+                "Hyperliquid SDK Info connected network=%s websocket=%s",
+                self.network,
+                self.use_websocket,
+            )
         except Exception as exc:
             self.info = None
-            logger.warning("SDK info init failed, using HTTP fallback: %s", exc)
+            logger.warning("SDK info init failed (websocket=%s): %s", self.use_websocket, exc)
+            if self.use_websocket:
+                try:
+                    self.info = Info(self.base_url, skip_ws=True)
+                    logger.warning("SDK info reconnected without websocket, falling back to REST polling")
+                except Exception as rest_exc:
+                    self.info = None
+                    logger.warning("SDK info REST fallback init failed, using HTTP fallback: %s", rest_exc)
+        self._start_ws_subscriptions()
         if self.private_key:
             try:
                 wallet = Account.from_key(self.private_key)
@@ -119,6 +156,106 @@ class HyperliquidClient:
             except Exception as exc:
                 self.exchange = None
                 logger.error("Hyperliquid SDK Exchange init failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # WebSocket market-data layer. Every getter keeps a REST fallback, so a
+    # dead or stale websocket degrades to the previous polling behavior
+    # instead of stopping the bot.
+    # ------------------------------------------------------------------
+
+    def _start_ws_subscriptions(self) -> None:
+        if not (self.use_websocket and self.info is not None and self.ws_symbol):
+            return
+        try:
+            self.info.subscribe({"type": "l2Book", "coin": self.ws_symbol}, self._on_ws_l2_book)
+            self.info.subscribe(
+                {"type": "candle", "coin": self.ws_symbol, "interval": self.ws_candle_interval},
+                self._on_ws_candle,
+            )
+            if self.account_address:
+                self.info.subscribe(
+                    {"type": "userFills", "user": self.account_address},
+                    self._on_ws_user_fills,
+                )
+            self.ws_active = True
+            logger.info(
+                "websocket_subscriptions_active symbol=%s candle_interval=%s user_fills=%s",
+                self.ws_symbol,
+                self.ws_candle_interval,
+                bool(self.account_address),
+            )
+        except Exception as exc:
+            self.ws_active = False
+            logger.warning("websocket_subscribe_failed fallback=rest_polling error=%s", exc)
+
+    @staticmethod
+    def _ws_payload(message: object) -> object:
+        if isinstance(message, dict) and "data" in message:
+            return message["data"]
+        return message
+
+    def _on_ws_l2_book(self, message: object) -> None:
+        data = self._ws_payload(message)
+        if not isinstance(data, dict) or "levels" not in data:
+            return
+        with self._ws_lock:
+            self._ws_book = data
+            self._ws_book_ts = time.time()
+
+    def _on_ws_candle(self, message: object) -> None:
+        data = self._ws_payload(message)
+        candles = data if isinstance(data, list) else [data]
+        now = time.time()
+        with self._ws_lock:
+            for candle in candles:
+                if not isinstance(candle, dict) or candle.get("t") is None:
+                    continue
+                self._ws_candles[int(candle["t"])] = candle
+                self._ws_candle_ts = now
+            if len(self._ws_candles) > 800:
+                for key in sorted(self._ws_candles)[:-600]:
+                    del self._ws_candles[key]
+
+    def _on_ws_user_fills(self, message: object) -> None:
+        data = self._ws_payload(message)
+        if not isinstance(data, dict):
+            return
+        fills = data.get("fills") or []
+        with self._ws_lock:
+            if data.get("isSnapshot"):
+                self._ws_fills_snapshot = True
+            for fill in fills:
+                if isinstance(fill, dict):
+                    self._add_ws_fill_locked(fill)
+
+    @staticmethod
+    def _ws_fill_key(fill: dict) -> str:
+        return f"{fill.get('tid', fill.get('hash', ''))}:{fill.get('time', '')}"
+
+    def _add_ws_fill_locked(self, fill: dict) -> None:
+        key = self._ws_fill_key(fill)
+        if key in self._ws_fill_ids:
+            return
+        self._ws_fill_ids.add(key)
+        self._ws_fills.append(fill)
+        if len(self._ws_fills) > 2000:
+            self._ws_fills = self._ws_fills[-1500:]
+            self._ws_fill_ids = {self._ws_fill_key(f) for f in self._ws_fills}
+
+    def _ws_candles_usable(self, symbol: str, interval: str, lookback: int) -> bool:
+        if not (self.ws_active and symbol.upper() == self.ws_symbol and interval == self.ws_candle_interval):
+            return False
+        now = time.time()
+        with self._ws_lock:
+            count = len(self._ws_candles)
+            last_update = self._ws_candle_ts
+            seed_ts = self._ws_candles_seed_ts
+        if count < min(lookback, 30):
+            return False
+        if seed_ts and (now - seed_ts) > self.ws_candle_reseed_seconds:
+            return False
+        interval_seconds = self._interval_minutes(interval) * 60
+        return (now - last_update) <= max(3 * interval_seconds, 90)
 
     def _is_retryable_exception(self, exc: BaseException) -> bool:
         if isinstance(exc, requests.exceptions.HTTPError):
@@ -218,6 +355,29 @@ class HyperliquidClient:
     def get_candles(
         self, symbol: str, interval: str = "1m", lookback: int = 200
     ) -> list[dict[str, Any]]:
+        if self._ws_candles_usable(symbol, interval, lookback):
+            with self._ws_lock:
+                merged = [self._ws_candles[key] for key in sorted(self._ws_candles)]
+            return merged[-lookback:]
+        candles = self._get_candles_rest(symbol, interval, lookback)
+        if (
+            self.ws_active
+            and symbol.upper() == self.ws_symbol
+            and interval == self.ws_candle_interval
+            and isinstance(candles, list)
+        ):
+            with self._ws_lock:
+                for candle in candles:
+                    if isinstance(candle, dict) and candle.get("t") is not None:
+                        # setdefault: a fresher websocket update of the live candle
+                        # must not be clobbered by the REST snapshot.
+                        self._ws_candles.setdefault(int(candle["t"]), candle)
+                self._ws_candles_seed_ts = time.time()
+        return candles
+
+    def _get_candles_rest(
+        self, symbol: str, interval: str = "1m", lookback: int = 200
+    ) -> list[dict[str, Any]]:
         interval_minutes = self._interval_minutes(interval)
         end_ms = int(time.time() * 1000)
         start_ms = end_ms - lookback * interval_minutes * 60 * 1000
@@ -245,6 +405,11 @@ class HyperliquidClient:
 
 
     def get_l2_book(self, symbol: str) -> dict[str, Any]:
+        if self.ws_active and symbol.upper() == self.ws_symbol:
+            with self._ws_lock:
+                book, book_ts = self._ws_book, self._ws_book_ts
+            if book is not None and (time.time() - book_ts) <= self.ws_orderbook_max_age_seconds:
+                return {**book, "received_ts": book_ts}
         if self.info is not None:
             try:
                 return self._retry_hyperliquid_api(
@@ -331,11 +496,26 @@ class HyperliquidClient:
         return []
 
     def get_user_fills(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        if self.ws_active and self._ws_fills_snapshot:
+            self._ws_fill_calls += 1
+            # Serve fills from the websocket stream; every Nth call still does a
+            # REST reconcile pass in case the stream dropped messages.
+            if self.ws_fills_reconcile_every <= 0 or self._ws_fill_calls % self.ws_fills_reconcile_every != 0:
+                with self._ws_lock:
+                    fills = list(self._ws_fills)
+                if symbol:
+                    return [f for f in fills if str(f.get("coin", "")).upper() == symbol.upper()]
+                return fills
         if self.info is None or not self.account_address:
             return []
         fills = self._retry_hyperliquid_api(
             "Info.user_fills", lambda: self.info.user_fills(self.account_address)
         )
+        if self.ws_active and isinstance(fills, list):
+            with self._ws_lock:
+                for fill in fills:
+                    if isinstance(fill, dict):
+                        self._add_ws_fill_locked(fill)
         if symbol:
             return [
                 f for f in fills if str(f.get("coin", "")).upper() == symbol.upper()

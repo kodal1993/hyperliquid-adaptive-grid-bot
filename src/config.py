@@ -44,6 +44,7 @@ class BotConfig:
     use_alo_orders: bool
     paired_take_profit_enabled: bool
     paired_tp_spacing_multiplier: float
+    use_websocket: bool
     order_notional_usd: float
     max_active_exposure_usd: float
     regrid_threshold_pct: float
@@ -207,6 +208,7 @@ class BotConfig:
             use_alo_orders=os.getenv("USE_ALO_ORDERS", "true").lower() == "true",
             paired_take_profit_enabled=os.getenv("PAIRED_TAKE_PROFIT_ENABLED", "true").lower() == "true",
             paired_tp_spacing_multiplier=float(os.getenv("PAIRED_TP_SPACING_MULTIPLIER", "1.0")),
+            use_websocket=os.getenv("USE_WEBSOCKET", "true").lower() == "true",
             order_notional_usd=float(os.getenv("ORDER_NOTIONAL_USD", os.getenv("MAX_NOTIONAL_PER_TRADE_USD", "10"))),
             max_active_exposure_usd=float(os.getenv("MAX_ACTIVE_EXPOSURE_USD", "50")),
             regrid_threshold_pct=float(os.getenv("REGRID_THRESHOLD_PCT", "0.003")),
