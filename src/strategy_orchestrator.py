@@ -720,6 +720,22 @@ class StrategyOrchestrator:
         cleanup_requested = orphan_order_detected or stale_order_detected
         cleanup_canceled = 0
         state_uncertain_skip_cycle = False
+        rate_limited_until = float(getattr(self.execution_engine, "rate_limited_until", 0.0) or 0.0)
+        orphan_cleanup_skipped_rate_limit = False
+        if cleanup_requested and time.time() < rate_limited_until:
+            # While the address is over its cumulative request budget, a one-sided
+            # grid is expected (placements get rejected). Canceling the surviving
+            # side here only burns the trickle budget on cancel/replace loops.
+            orphan_cleanup_skipped_rate_limit = True
+            cleanup_requested = False
+            orphan_order_detected = False
+            stale_order_detected = False
+            logger.warning(
+                "orphan_cleanup_skipped_rate_limit_cooldown symbol=%s seconds_remaining=%.0f open_orders=%s",
+                symbol,
+                rate_limited_until - time.time(),
+                len(open_orders),
+            )
         if cleanup_requested:
             cleanup_label = "stale_order_detected" if stale_order_detected else "orphan_order_detected"
             if stale_order_detected:
@@ -841,6 +857,7 @@ class StrategyOrchestrator:
             "stale_order_cleanup_count": self.stale_order_cleanup_count,
             "cleanup_canceled_orders": cleanup_canceled,
             "state_uncertain_skip_cycle": state_uncertain_skip_cycle,
+            "orphan_cleanup_skipped_rate_limit": orphan_cleanup_skipped_rate_limit,
             "pre_rebuild_open_orders": len(open_orders),
             "pre_rebuild_buy_orders": buy_order_count,
             "pre_rebuild_sell_orders": sell_order_count,

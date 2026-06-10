@@ -1,5 +1,10 @@
 # Changelog
 
+## Address rate-limit cooldown
+
+- When Hyperliquid rejects an order with the cumulative-request rate limit ("Too many cumulative requests sent ... Place taker orders to free up 1 request per USDC traded"), the live engine now enters a 120s cooldown during which new entry orders are skipped locally instead of being sent and rejected — every rejected attempt deepens the request deficit. Reduce-only closes stay allowed.
+- During the cooldown the orchestrator also skips orphan/stale order cleanup: a one-sided grid is expected while placements are being rejected, and canceling the surviving side only burned the trickle budget on cancel/replace loops (observed live).
+
 ## Size-multiplier floor at exchange minimum notional
 
 - Orderbook/prediction bias multipliers (e.g. 0.75x short-side reduction) could shrink a $12 grid order below Hyperliquid's $10 minimum notional, silently erasing the level instead of reducing it (observed live as repeated `min_notional_blocked` on the sell side). Multiplied sizes are now floored back to the configured minimum order notional while respecting the per-trade cap.

@@ -140,6 +140,11 @@ def _is_post_only_reject(error: str) -> bool:
     return "post only" in lowered or "alo" in lowered or "immediately match" in lowered
 
 
+def _is_cumulative_rate_limit_error(error: str) -> bool:
+    lowered = error.lower()
+    return "too many cumulative requests" in lowered or "cumulative volume traded" in lowered
+
+
 def classify_exposure_action(position_size: float, side: str, qty: float) -> str:
     side = side.lower()
     qty = abs(qty)
@@ -791,6 +796,10 @@ class LiveExecutionEngine:
         self.paired_tp_spacing_multiplier = max(float(paired_tp_spacing_multiplier), 0.0)
         self.paired_tp_placed_count = 0
         self.last_grid_spacing_pct = 0.003
+        self.rate_limit_cooldown_seconds = max(float(kwargs.pop("rate_limit_cooldown_seconds", 120.0)), 0.0)
+        self.rate_limited_until = 0.0
+        self.rate_limit_trigger_count = 0
+        self.rate_limited_skip_count = 0
         self._seen_fill_ids: set[str] = set()
         self._load_live_seen_fills()
         self.min_order_lifetime_seconds = max(int(kwargs.pop("min_order_lifetime_seconds", 90)), 0)
@@ -1154,6 +1163,19 @@ class LiveExecutionEngine:
         return out
 
     def _submit_live_limit(self, symbol: str, side: str, size: float, price: float, *, reduce_only: bool) -> bool:
+        # During an address rate-limit cooldown every extra request only deepens
+        # the deficit, so skip new exposure; reduce-only closes stay allowed.
+        if not reduce_only and time.time() < self.rate_limited_until:
+            self.rate_limited_skip_count += 1
+            logger.warning(
+                "live_order_skipped reason=rate_limit_cooldown seconds_remaining=%.0f side=%s price=%s size=%s rate_limited_skip_count=%s",
+                self.rate_limited_until - time.time(),
+                side,
+                price,
+                size,
+                self.rate_limited_skip_count,
+            )
+            return False
         normalized_price = normalize_price(symbol, price)
         normalized_size = normalize_size(symbol, size)
         notional_decimal = abs(Decimal(str(normalized_size)) * Decimal(str(normalized_price)))
@@ -1226,6 +1248,19 @@ class LiveExecutionEngine:
                 # is the intended fee protection, the next tick re-plans the grid.
                 self.alo_rejected_count += 1
                 logger.warning("live_order_alo_rejected side=%s price=%s size=%s alo_rejected_count=%s error=%s", side, normalized_price, normalized_size, self.alo_rejected_count, error)
+            elif _is_cumulative_rate_limit_error(error):
+                self.rate_limit_trigger_count += 1
+                if self.rate_limit_cooldown_seconds > 0:
+                    self.rate_limited_until = time.time() + self.rate_limit_cooldown_seconds
+                logger.warning(
+                    "live_order_rate_limited cooldown_seconds=%.0f rate_limit_trigger_count=%s side=%s price=%s size=%s error=%s",
+                    self.rate_limit_cooldown_seconds,
+                    self.rate_limit_trigger_count,
+                    side,
+                    normalized_price,
+                    normalized_size,
+                    error,
+                )
             else:
                 logger.warning("live_order_rejected side=%s price=%s size=%s reduce_only=%s error=%s", side, normalized_price, normalized_size, reduce_only, error)
             return False
