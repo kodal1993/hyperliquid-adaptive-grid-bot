@@ -1484,9 +1484,9 @@ class StrategyOrchestrator:
         max_size_by_notional = self.config.max_notional_per_trade_usd / max(price, 1e-9)
         max_size = max(0.0, min(float(self.config.max_order_size), max_size_by_notional))
         for level in plan.long_levels:
-            level.size = min(max(level.size * long_mult, 0.0), max_size)
+            level.size = self._floor_size_to_min_order_notional(level.price, min(max(level.size * long_mult, 0.0), max_size))
         for level in plan.short_levels:
-            level.size = min(max(level.size * short_mult, 0.0), max_size)
+            level.size = self._floor_size_to_min_order_notional(level.price, min(max(level.size * short_mult, 0.0), max_size))
 
         long_after = len(plan.long_levels)
         short_after = len(plan.short_levels)
@@ -1533,13 +1533,28 @@ class StrategyOrchestrator:
         roundtrip_fee_pct = max(fee_rate * 2.0, 1e-9)
         return max(spacing_pct, 0.0) / roundtrip_fee_pct
 
+    def _floor_size_to_min_order_notional(self, level_price: float, size: float) -> float:
+        """Bias multipliers tilt order size, but must not shrink a level below
+        the exchange minimum notional — that silently erases the level instead
+        of reducing it (observed live: 0.75x on a $12 order -> $9 -> skipped)."""
+        min_notional = max(float(getattr(self.config, "min_order_notional_usd", self.config.min_notional_usd)), 0.0)
+        if min_notional <= 0 or size <= 0 or level_price <= 0:
+            return size
+        if size * level_price + 1e-9 >= min_notional:
+            return size
+        max_size_by_trade = self.config.max_notional_per_trade_usd / max(level_price, 1e-9)
+        max_size = max(0.0, min(float(self.config.max_order_size), max_size_by_trade))
+        if max_size <= 0:
+            return size
+        return min(min_notional / level_price, max_size)
+
     def _apply_orderbook_size_multipliers(self, plan: GridPlan, price: float, long_multiplier: float, short_multiplier: float) -> None:
         max_size_by_notional = self.config.max_notional_per_trade_usd / max(price, 1e-9)
         max_size = max(0.0, min(float(self.config.max_order_size), max_size_by_notional))
         for level in plan.long_levels:
-            level.size = min(max(level.size * long_multiplier, 0.0), max_size)
+            level.size = self._floor_size_to_min_order_notional(level.price, min(max(level.size * long_multiplier, 0.0), max_size))
         for level in plan.short_levels:
-            level.size = min(max(level.size * short_multiplier, 0.0), max_size)
+            level.size = self._floor_size_to_min_order_notional(level.price, min(max(level.size * short_multiplier, 0.0), max_size))
 
     def _apply_orderbook_entry_filter(
         self,
