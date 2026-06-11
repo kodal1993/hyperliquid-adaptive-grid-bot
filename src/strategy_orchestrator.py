@@ -68,6 +68,10 @@ class StrategyOrchestrator:
         self.wrong_way_exit_loss_pct = 0.0035
         self.adverse_move_exit_pct = max(float(getattr(config, "adverse_move_exit_pct", 0.0045)), 0.0)
         self.orphan_order_cleanup_count = 0
+        self._orphan_missing_side_streak = 0
+        self.orphan_cleanup_confirm_ticks = max(int(getattr(config, "orphan_cleanup_confirm_ticks", 3)), 1)
+        self._last_plan_buy_levels: int | None = None
+        self._last_plan_sell_levels: int | None = None
         self.stale_order_cleanup_count = 0
         self.min_notional_blocked_count = 0
         self.anti_chop_trigger_count = 0
@@ -1263,6 +1267,12 @@ class StrategyOrchestrator:
             **range_orderbook_long_context,
             **anti_chop_context,
         }
+        # Remember which sides the fully filtered plan actually generated; the
+        # flat-orphan detector must not demand resting orders on a side that
+        # the planning layers (stress, edge, orderbook filters) produced no
+        # levels for.
+        self._last_plan_buy_levels = len(plan.long_levels)
+        self._last_plan_sell_levels = len(plan.short_levels)
         try:
             result = self.execution_engine.cancel_replace_grid(symbol, plan)
         except Exception as exc:
@@ -2157,26 +2167,61 @@ class StrategyOrchestrator:
         buy_count = sum(1 for o in open_orders if str(o.get("side", "")).lower() == "buy")
         sell_count = sum(1 for o in open_orders if str(o.get("side", "")).lower() == "sell")
         expected_buy_orders, expected_sell_orders = self._expected_active_side_orders(mode, allowed_buys, allowed_sells)
+        # A side the last executed grid plan generated no levels for is not
+        # "missing": stress one-siding and edge/orderbook filters legitimately
+        # produce one-sided plans. Expecting it anyway nuked the healthy side
+        # in a cancel/replace loop (observed live: buy placed, canceled within
+        # seconds, re-placed at the same price, zero fills, request burn).
+        if self._last_plan_buy_levels is not None and self._last_plan_buy_levels == 0:
+            expected_buy_orders = 0
+        if self._last_plan_sell_levels is not None and self._last_plan_sell_levels == 0:
+            expected_sell_orders = 0
         context = {
             "expected_buy_orders": expected_buy_orders,
             "expected_sell_orders": expected_sell_orders,
             "actual_buy_orders": buy_count,
             "actual_sell_orders": sell_count,
+            "orphan_missing_side_streak": self._orphan_missing_side_streak,
         }
+
+        def _no_orphan(reason: str) -> tuple[bool, str, dict]:
+            self._orphan_missing_side_streak = 0
+            context["orphan_missing_side_streak"] = 0
+            return False, reason, context
+
         if position_side != "FLAT":
-            return False, "not_flat", context
+            return _no_orphan("not_flat")
         if not open_orders:
-            return False, "no_open_orders", context
+            return _no_orphan("no_open_orders")
         if expected_buy_orders == 0 and expected_sell_orders == 0:
-            return False, "no_active_sides_expected", context
+            return _no_orphan("no_active_sides_expected")
         missing_active_sides = []
         if expected_buy_orders > 0 and buy_count == 0:
             missing_active_sides.append("buy")
         if expected_sell_orders > 0 and sell_count == 0:
             missing_active_sides.append("sell")
-        if missing_active_sides:
-            return True, f"expected_active_side_missing:{','.join(missing_active_sides)}", context
-        return False, "active_allowed_sides_present", context
+        if not missing_active_sides:
+            return _no_orphan("active_allowed_sides_present")
+        # The op-budgeted regrid places a side per cycle; a freshly placed grid
+        # is not an orphan situation, give it the configured order lifetime.
+        min_lifetime = max(int(getattr(self.execution_engine, "min_order_lifetime_seconds", 90)), 0)
+        now_ts = time.time()
+        ages = []
+        for order in open_orders:
+            created = order.get("created_ts")
+            if created is None:
+                continue
+            try:
+                ages.append(now_ts - float(created))
+            except (TypeError, ValueError):
+                continue
+        if ages and min(ages) < min_lifetime:
+            return _no_orphan("young_orders_grace")
+        self._orphan_missing_side_streak += 1
+        context["orphan_missing_side_streak"] = self._orphan_missing_side_streak
+        if self._orphan_missing_side_streak < self.orphan_cleanup_confirm_ticks:
+            return False, f"missing_side_awaiting_confirmation:{self._orphan_missing_side_streak}/{self.orphan_cleanup_confirm_ticks}", context
+        return True, f"expected_active_side_missing:{','.join(missing_active_sides)}", context
 
     def _has_stale_flat_order(self, open_orders: list[dict], position_side: str) -> bool:
         if position_side != "FLAT" or self.config.stale_order_max_age_sec <= 0:

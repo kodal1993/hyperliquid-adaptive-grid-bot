@@ -117,6 +117,7 @@ class BotConfig:
     recenter_cooldown_seconds: int
     position_recenter_cooldown_seconds: int
     stale_order_max_age_sec: int
+    orphan_cleanup_confirm_ticks: int
     enable_market_stress_filter: bool
     high_vol_atr_pct: float
     extreme_vol_atr_pct: float
@@ -293,6 +294,7 @@ class BotConfig:
             recenter_cooldown_seconds=int(os.getenv("RECENTER_COOLDOWN_SECONDS", "600")),
             position_recenter_cooldown_seconds=int(os.getenv("POSITION_RECENTER_COOLDOWN_SECONDS", "900")),
             stale_order_max_age_sec=int(os.getenv("STALE_ORDER_MAX_AGE_SEC", "1800")),
+            orphan_cleanup_confirm_ticks=int(os.getenv("ORPHAN_CLEANUP_CONFIRM_TICKS", "3")),
             enable_market_stress_filter=os.getenv("ENABLE_MARKET_STRESS_FILTER", "true").lower() == "true",
             high_vol_atr_pct=float(os.getenv("HIGH_VOL_ATR_PCT", "0.006")),
             extreme_vol_atr_pct=float(os.getenv("EXTREME_VOL_ATR_PCT", "0.010")),
