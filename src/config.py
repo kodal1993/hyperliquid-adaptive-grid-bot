@@ -155,6 +155,7 @@ class BotConfig:
     rate_limit_deficit_cooldown_seconds_per_request: float
     rate_limit_max_cooldown_seconds: float
     rate_limit_orphan_grace_seconds: float
+    rate_limit_recovery_window_seconds: float
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -324,6 +325,7 @@ class BotConfig:
             rate_limit_deficit_cooldown_seconds_per_request=float(os.getenv("RATE_LIMIT_DEFICIT_COOLDOWN_SECONDS_PER_REQUEST", "0.05")),
             rate_limit_max_cooldown_seconds=float(os.getenv("RATE_LIMIT_MAX_COOLDOWN_SECONDS", "900")),
             rate_limit_orphan_grace_seconds=float(os.getenv("RATE_LIMIT_ORPHAN_GRACE_SECONDS", "600")),
+            rate_limit_recovery_window_seconds=float(os.getenv("RATE_LIMIT_RECOVERY_WINDOW_SECONDS", "1800")),
         )
         cfg.validate()
         return cfg

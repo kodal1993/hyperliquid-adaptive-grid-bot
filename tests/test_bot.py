@@ -4291,6 +4291,100 @@ def test_live_regrid_does_not_cancel_orders_during_rate_limit_cooldown(tmp_path)
     assert any(int(o["oid"]) == 1 for o in client.orders)
 
 
+def test_live_regrid_recovery_mode_places_before_cancels(tmp_path):
+    client = _StatefulLiveClient(orders=[
+        {"coin": "BTC", "side": "B", "limitPx": "90.0", "sz": "1.0", "oid": 1},
+    ])
+    eng = _live_engine(tmp_path, client, max_order_ops_per_cycle=2)
+    eng.last_rate_limit_ts = time.time() - 30
+    plan = GridManager().build_grid(100, 2, 0.02, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    result = eng.cancel_replace_grid("BTC", plan)
+
+    assert result["rate_limit_recovery_mode"] is True
+    assert result["placed"] == 1
+    assert result["canceled"] == 0
+    assert client.canceled_oids == []
+    assert any(int(o["oid"]) == 1 for o in client.orders)
+    # The single trickle slot goes to the placement closest to the grid center.
+    assert client.placed[0]["price"] == pytest.approx(98.0)
+
+
+def test_live_regrid_recovery_mode_cancels_only_when_nothing_to_place(tmp_path):
+    client = _StatefulLiveClient(orders=[
+        {"coin": "BTC", "side": "B", "limitPx": "98.0", "sz": "1.0", "oid": 1},
+        {"coin": "BTC", "side": "B", "limitPx": "96.0", "sz": "1.0", "oid": 2},
+        {"coin": "BTC", "side": "A", "limitPx": "102.0", "sz": "1.0", "oid": 3},
+        {"coin": "BTC", "side": "A", "limitPx": "104.0", "sz": "1.0", "oid": 4},
+        {"coin": "BTC", "side": "B", "limitPx": "90.0", "sz": "1.0", "oid": 5},
+    ])
+    eng = _live_engine(tmp_path, client, max_order_ops_per_cycle=2)
+    eng.last_rate_limit_ts = time.time() - 30
+    plan = GridManager().build_grid(100, 2, 0.02, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    result = eng.cancel_replace_grid("BTC", plan)
+
+    assert result["rate_limit_recovery_mode"] is True
+    assert result["placed"] == 0
+    assert result["canceled"] == 1
+    assert client.canceled_oids == [5]
+
+
+def test_live_regrid_recovery_mode_does_not_grow_book_past_desired_levels(tmp_path):
+    client = _StatefulLiveClient(orders=[
+        {"coin": "BTC", "side": "B", "limitPx": "97.5", "sz": "1.0", "oid": 1},
+        {"coin": "BTC", "side": "B", "limitPx": "95.5", "sz": "1.0", "oid": 2},
+        {"coin": "BTC", "side": "A", "limitPx": "102.5", "sz": "1.0", "oid": 3},
+        {"coin": "BTC", "side": "A", "limitPx": "104.5", "sz": "1.0", "oid": 4},
+    ])
+    eng = _live_engine(tmp_path, client, max_order_ops_per_cycle=2)
+    eng.last_rate_limit_ts = time.time() - 30
+    plan = GridManager().build_grid(100, 2, 0.02, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    result = eng.cancel_replace_grid("BTC", plan)
+
+    assert result["rate_limit_recovery_mode"] is True
+    assert result["placed"] == 0
+    assert result["canceled"] == 1
+
+
+def test_live_regrid_recovery_mode_expires_after_window(tmp_path):
+    client = _StatefulLiveClient()
+    eng = _live_engine(tmp_path, client, rate_limit_recovery_window_seconds=100)
+    eng.last_rate_limit_ts = time.time() - 200
+
+    assert eng._in_rate_limit_recovery() is False
+    eng.last_rate_limit_ts = time.time() - 50
+    assert eng._in_rate_limit_recovery() is True
+
+
+def test_live_regrid_reserves_place_budget_for_cancel_backlogs(tmp_path):
+    client = _StatefulLiveClient(orders=[
+        {"coin": "BTC", "side": "B", "limitPx": "90.0", "sz": "1.0", "oid": 1},
+        {"coin": "BTC", "side": "B", "limitPx": "89.0", "sz": "1.0", "oid": 2},
+        {"coin": "BTC", "side": "A", "limitPx": "111.0", "sz": "1.0", "oid": 3},
+    ])
+    eng = _live_engine(tmp_path, client, max_order_ops_per_cycle=2)
+    plan = GridManager().build_grid(100, 2, 0.02, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    result = eng.cancel_replace_grid("BTC", plan)
+
+    assert result["canceled"] == 1
+    assert result["placed"] == 1
+    assert client.placed[0]["price"] == pytest.approx(98.0)
+
+
+def test_live_state_persists_last_rate_limit_ts(tmp_path):
+    client = _StatefulLiveClient()
+    eng = _live_engine(tmp_path, client)
+    eng.last_rate_limit_ts = 1234567890.0
+    eng.save_state()
+
+    reloaded = _live_engine(tmp_path, _StatefulLiveClient())
+
+    assert reloaded.last_rate_limit_ts == pytest.approx(1234567890.0)
+
+
 def test_orphan_cleanup_skipped_within_rate_limit_grace_after_cooldown(tmp_path):
     cfg = BotConfig.from_env()
     cfg.min_order_notional_usd = 1

@@ -1,5 +1,12 @@
 # Changelog
 
+## Rate-limit recovery mode: placements before cancels
+
+- Fixed the trickle-budget deadlock that left the bot with no resting orders (and therefore no fills) while the address carries a Hyperliquid cumulative-request deficit. In that state the exchange accepts roughly one action per 10 seconds, but the regrid spent its op budget cancel-first: the accepted slot went to a cancel, the replacement placement was rejected, and the rejection re-armed a 120–900s freeze — every cycle removed an order and placed none, so the grid bled to zero and no volume was ever traded to repay the deficit.
+- For `RATE_LIMIT_RECOVERY_WINDOW_SECONDS` (default 1800s) after the last cumulative rate-limit rejection, the live regrid now runs in recovery mode: one order operation per cycle, spent on the placement closest to the grid center (the level most likely to fill — fills are the only thing that repays the deficit). Existing resting orders are kept as fill chances; a cancel only runs when there is nothing left to place or the book already holds the desired number of levels.
+- Outside recovery mode the regrid now reserves at least half of `MAX_ORDER_OPS_PER_CYCLE` for placements whenever there is something to place, so a cancel backlog can no longer starve the grid of resting orders, and pending placements are always ordered closest-to-mid first.
+- `last_rate_limit_ts` is persisted in the live state file so a restart does not drop the bot out of recovery mode.
+
 ## Address rate-limit cooldown
 
 - When Hyperliquid rejects an order with the cumulative-request rate limit ("Too many cumulative requests sent ... Place taker orders to free up 1 request per USDC traded"), the live engine now enters a 120s cooldown during which new entry orders are skipped locally instead of being sent and rejected — every rejected attempt deepens the request deficit. Reduce-only closes stay allowed.
