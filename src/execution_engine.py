@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 import logging
+import re
 from decimal import Decimal
 from datetime import datetime, timezone
 import time
@@ -169,7 +170,28 @@ def _is_post_only_reject(error: str) -> bool:
 
 def _is_cumulative_rate_limit_error(error: str) -> bool:
     lowered = error.lower()
-    return "too many cumulative requests" in lowered or "cumulative volume traded" in lowered
+    request_budget_markers = (
+        "too many cumulative requests",
+        "cumulative volume traded",
+        "cumulative request",
+        "request payload",
+        "free up",
+        "request per usdc",
+    )
+    return any(marker in lowered for marker in request_budget_markers) and ("request" in lowered or "cumulative" in lowered)
+
+
+def _extract_request_deficit(error: str) -> float:
+    """Return a best-effort Hyperliquid cumulative request deficit from an error."""
+    match = re.search(r"\((\d+(?:\.\d+)?)\s*>\s*(\d+(?:\.\d+)?)\)", error)
+    if match:
+        used = float(match.group(1))
+        allowed = float(match.group(2))
+        return max(used - allowed, 0.0)
+    match = re.search(r"deficit[^0-9]*(\d+(?:\.\d+)?)", error, flags=re.IGNORECASE)
+    if match:
+        return max(float(match.group(1)), 0.0)
+    return 0.0
 
 
 def classify_exposure_action(position_size: float, side: str, qty: float) -> str:
@@ -833,9 +855,13 @@ class LiveExecutionEngine:
         self.paired_tp_placed_count = 0
         self.last_grid_spacing_pct = 0.003
         self.rate_limit_cooldown_seconds = max(float(kwargs.pop("rate_limit_cooldown_seconds", 120.0)), 0.0)
+        self.rate_limit_deficit_cooldown_seconds_per_request = max(float(kwargs.pop("rate_limit_deficit_cooldown_seconds_per_request", 0.05)), 0.0)
+        self.rate_limit_max_cooldown_seconds = max(float(kwargs.pop("rate_limit_max_cooldown_seconds", 900.0)), self.rate_limit_cooldown_seconds)
         self.rate_limit_orphan_grace_seconds = max(float(kwargs.pop("rate_limit_orphan_grace_seconds", 600.0)), 0.0)
+        self.max_order_ops_per_cycle = max(int(kwargs.pop("max_order_ops_per_cycle", 2)), 1)
         self.rate_limited_until = 0.0
         self.last_rate_limit_ts = 0.0
+        self.last_request_deficit = 0.0
         self.rate_limit_trigger_count = 0
         self.rate_limited_skip_count = 0
         self._seen_fill_ids: set[str] = set()
@@ -1040,9 +1066,10 @@ class LiveExecutionEngine:
         desired = [{"side": o.side, "price": o.price, "size": o.size} for o in plan.long_levels + plan.short_levels]
         kept, to_cancel, to_place = _diff_grid_orders(active, desired, self.min_reprice_distance_pct)
         now_ts = time.time()
+        op_budget = self.max_order_ops_per_cycle
         canceled = 0
         cancel_oids: set[int] = set()
-        for old in to_cancel:
+        for old in to_cancel[:op_budget]:
             oid = old.get("oid")
             if oid is None:
                 continue
@@ -1058,24 +1085,28 @@ class LiveExecutionEngine:
             created = old.get("created_ts")
             lifetime = (now_ts - float(created)) if created else None
             self._record_order_event("cancelled", symbol=symbol, side=str(old.get("side", "")), price=float(old.get("price", 0.0) or 0.0), size=float(old.get("size", 0.0) or 0.0), lifetime_seconds=lifetime)
-        if to_cancel:
+        skipped_cancels = max(len(to_cancel) - canceled, 0)
+        if canceled:
             remaining_after_cancel = self.sync_open_orders(symbol)
             still_present = [o for o in remaining_after_cancel if o.get("oid") is not None and int(o["oid"]) in cancel_oids]
-            if still_present or canceled < len(to_cancel):
+            if still_present or canceled < len(to_cancel[:op_budget]):
                 logger.warning(
                     "live_grid_rebuild_skipped reason=cancel_confirmation_pending remaining_canceled_orders=%s cancel_failures=%s kept=%s",
                     len(still_present),
-                    len(to_cancel) - canceled,
+                    max(len(to_cancel[:op_budget]) - canceled, 0),
                     len(kept),
                 )
                 return {"canceled": canceled, "placed": 0, "kept": len(kept), "symbol": symbol, "error": "cancel_confirmation_pending", "reprice_decision": "replace", "reprice_reason": reprice_reason}
+        remaining_budget = max(op_budget - canceled, 0)
         placed = 0
-        for level in to_place:
+        for level in to_place[:remaining_budget]:
             if self._submit_live_limit(symbol, level["side"], level["size"], level["price"], reduce_only=False):
                 placed += 1
         self.sync_open_orders(symbol)
-        logger.info("reprice_decision decision=replace reprice_reason=%s canceled=%s placed=%s kept=%s", reprice_reason, canceled, placed, len(kept))
-        return {"canceled": canceled, "placed": placed, "kept": len(kept), "symbol": symbol, "reprice_decision": "replace", "reprice_reason": reprice_reason}
+        skipped_places = max(len(to_place) - placed, 0)
+        budget_exhausted = skipped_cancels > 0 or skipped_places > 0
+        logger.info("reprice_decision decision=replace reprice_reason=%s canceled=%s placed=%s kept=%s skipped_cancels=%s skipped_places=%s max_order_ops_per_cycle=%s", reprice_reason, canceled, placed, len(kept), skipped_cancels, skipped_places, self.max_order_ops_per_cycle)
+        return {"canceled": canceled, "placed": placed, "kept": len(kept), "symbol": symbol, "reprice_decision": "replace", "reprice_reason": reprice_reason, "skipped_cancels": skipped_cancels, "skipped_places": skipped_places, "order_op_budget_exhausted": budget_exhausted}
 
     def cancel_all_orders(self, symbol: str) -> int:
         canceled = self.client.cancel_all_orders(symbol)
@@ -1091,7 +1122,7 @@ class LiveExecutionEngine:
         remaining = abs(live_position_size)
         per_level = max(min(order_size, remaining), 0.0)
         placed = 0
-        for i in range(levels):
+        for i in range(min(levels, self.max_order_ops_per_cycle)):
             if remaining <= 1e-12:
                 break
             size = min(per_level, remaining)
@@ -1350,11 +1381,15 @@ class LiveExecutionEngine:
             elif _is_cumulative_rate_limit_error(error):
                 self.rate_limit_trigger_count += 1
                 self.last_rate_limit_ts = time.time()
-                if self.rate_limit_cooldown_seconds > 0:
-                    self.rate_limited_until = time.time() + self.rate_limit_cooldown_seconds
+                self.last_request_deficit = _extract_request_deficit(error)
+                deficit_cooldown = self.last_request_deficit * self.rate_limit_deficit_cooldown_seconds_per_request
+                cooldown_seconds = min(max(self.rate_limit_cooldown_seconds, deficit_cooldown), self.rate_limit_max_cooldown_seconds)
+                if cooldown_seconds > 0:
+                    self.rate_limited_until = time.time() + cooldown_seconds
                 logger.warning(
-                    "live_order_rate_limited cooldown_seconds=%.0f rate_limit_trigger_count=%s side=%s price=%s size=%s error=%s",
-                    self.rate_limit_cooldown_seconds,
+                    "live_order_rate_limited cooldown_seconds=%.0f request_deficit=%.0f rate_limit_trigger_count=%s side=%s price=%s size=%s error=%s",
+                    cooldown_seconds,
+                    self.last_request_deficit,
                     self.rate_limit_trigger_count,
                     side,
                     normalized_price,
