@@ -4193,6 +4193,56 @@ def test_live_rate_limit_error_starts_cooldown_and_skips_new_entries(tmp_path, c
     assert eng.rate_limited_skip_count == 1
 
 
+
+def test_live_rate_limit_deficit_extends_cooldown(tmp_path, caplog):
+    client = _StatefulLiveClient()
+    client.place_response = {
+        "status": "ok",
+        "response": {"type": "order", "data": {"statuses": [{"error": "Too many cumulative requests sent (18584 > 14437) for cumulative volume traded $4438.68. Place taker orders to free up 1 request per USDC traded."}]}},
+    }
+    eng = _live_engine(
+        tmp_path,
+        client,
+        rate_limit_cooldown_seconds=10,
+        rate_limit_deficit_cooldown_seconds_per_request=0.1,
+        rate_limit_max_cooldown_seconds=1000,
+    )
+
+    assert not eng._submit_live_limit("BTC", "buy", 1.0, 99.0, reduce_only=False)
+
+    assert eng.last_request_deficit == pytest.approx(4147.0)
+    assert eng.rate_limited_until - time.time() > 400
+    assert "request_deficit=4147" in caplog.text
+
+
+def test_live_regrid_limits_order_operations_per_cycle(tmp_path):
+    client = _StatefulLiveClient(orders=[
+        {"coin": "BTC", "side": "B", "limitPx": "90.0", "sz": "1.0", "oid": 1},
+        {"coin": "BTC", "side": "A", "limitPx": "110.0", "sz": "1.0", "oid": 2},
+        {"coin": "BTC", "side": "B", "limitPx": "89.0", "sz": "1.0", "oid": 3},
+    ])
+    eng = _live_engine(tmp_path, client, max_order_ops_per_cycle=2)
+    plan = GridManager().build_grid(100, 2, 0.02, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    result = eng.cancel_replace_grid("BTC", plan)
+
+    assert result["canceled"] + result["placed"] <= 2
+    assert result["order_op_budget_exhausted"] is True
+    assert len(client.canceled_oids) <= 2
+    assert len(client.placed) <= 2
+
+
+def test_live_reduce_only_orders_are_limited_per_cycle(tmp_path):
+    client = _StatefulLiveClient()
+    client.get_position = lambda symbol: {"coin": symbol, "szi": "3", "entryPx": "100"}
+    eng = _live_engine(tmp_path, client, max_order_ops_per_cycle=2)
+
+    placed = eng.place_reduce_only_orders("BTC", 3.0, 100.0, 1.0, levels=5)
+
+    assert placed == 2
+    assert len(client.placed) == 2
+    assert all(o["reduce_only"] for o in client.placed)
+
 def test_live_rate_limit_cooldown_still_allows_reduce_only(tmp_path):
     client = _StatefulLiveClient()
     eng = _live_engine(tmp_path, client)

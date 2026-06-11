@@ -150,6 +150,11 @@ class BotConfig:
     no_fill_min_spacing_pct: float
     min_order_lifetime_seconds: int
     min_reprice_distance_pct: float
+    max_order_ops_per_cycle: int
+    rate_limit_cooldown_seconds: float
+    rate_limit_deficit_cooldown_seconds_per_request: float
+    rate_limit_max_cooldown_seconds: float
+    rate_limit_orphan_grace_seconds: float
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -314,6 +319,11 @@ class BotConfig:
             no_fill_min_spacing_pct=float(os.getenv("NO_FILL_MIN_SPACING_PCT", "0.0022")),
             min_order_lifetime_seconds=int(os.getenv("MIN_ORDER_LIFETIME_SECONDS", "90")),
             min_reprice_distance_pct=float(os.getenv("MIN_REPRICE_DISTANCE_PCT", "0.0015")),
+            max_order_ops_per_cycle=int(os.getenv("MAX_ORDER_OPS_PER_CYCLE", "2")),
+            rate_limit_cooldown_seconds=float(os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "120")),
+            rate_limit_deficit_cooldown_seconds_per_request=float(os.getenv("RATE_LIMIT_DEFICIT_COOLDOWN_SECONDS_PER_REQUEST", "0.05")),
+            rate_limit_max_cooldown_seconds=float(os.getenv("RATE_LIMIT_MAX_COOLDOWN_SECONDS", "900")),
+            rate_limit_orphan_grace_seconds=float(os.getenv("RATE_LIMIT_ORPHAN_GRACE_SECONDS", "600")),
         )
         cfg.validate()
         return cfg
@@ -334,6 +344,8 @@ class BotConfig:
             errors.append(f"grid_spacing_pct must be > 0, got {self.grid_spacing_pct}")
         if self.tick_seconds < 1:
             errors.append(f"tick_seconds must be >= 1, got {self.tick_seconds}")
+        if self.max_order_ops_per_cycle < 1:
+            errors.append(f"max_order_ops_per_cycle must be >= 1, got {self.max_order_ops_per_cycle}")
         if self.maker_fee_rate < 0 or self.maker_fee_rate > 0.01:
             errors.append(f"maker_fee_rate must be in [0, 0.01], got {self.maker_fee_rate}")
         if self.taker_fee_rate < 0 or self.taker_fee_rate > 0.01:
