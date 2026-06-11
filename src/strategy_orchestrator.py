@@ -9,6 +9,7 @@ import pandas as pd
 
 from .config import BotConfig
 from .grid_manager import GridManager, GridPlan
+from .hyperliquid_client import normalize_size_up
 from .market_stress import OpportunityMode, decide_market_stress
 from .orderbook_analyzer import OrderBookAnalyzer
 from .prediction_layer import PredictionLayer, PredictionResult
@@ -1647,7 +1648,11 @@ class StrategyOrchestrator:
         max_size = max(0.0, min(float(self.config.max_order_size), max_size_by_trade))
         if max_size <= 0:
             return size
-        return min(min_notional / level_price, max_size)
+        # Round UP to the symbol's size step: the submit-side normalization
+        # rounds down, so the exact fraction would land one step below the
+        # minimum again (observed live: 10/62927 -> 0.00015 -> $9.44 skipped).
+        required = normalize_size_up(self.config.default_symbol, min_notional / level_price)
+        return min(required, max_size)
 
     def _apply_orderbook_size_multipliers(self, plan: GridPlan, price: float, long_multiplier: float, short_multiplier: float) -> None:
         max_size_by_notional = self.config.max_notional_per_trade_usd / max(price, 1e-9)

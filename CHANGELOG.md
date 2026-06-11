@@ -1,5 +1,9 @@
 # Changelog
 
+## Min-notional floor must round up to the size step
+
+- Live logs showed the sell side never placing for hours: `live_order_skipped reason=min_notional side=sell qty=0.00015 notional=9.44`. The bias-multiplier floor computed the exact minimum size (10 / 62927 = 0.000158913), but the submit-side normalization rounds **down** to the symbol's size step, landing one step below the minimum again. `_floor_size_to_min_order_notional` now rounds up to the size step (`normalize_size_up`), overshooting the minimum by at most one step, so floored levels survive submission. This restores the sell half of the grid (and its fills/volume).
+
 ## No price-chasing while repaying the request deficit
 
 - After the orphan fix the live burn dropped from ~27 to ~15 requests/hour, but the budget alerts showed it still bleeding with zero volume: the single resting order kept being canceled after the normal 90s lifetime and re-placed ~0.15% higher as the price trended away — 2 requests per chase, no fills. While in rate-limit recovery/frugal mode the reprice gates now harden to `RATE_LIMIT_RECOVERY_MIN_ORDER_LIFETIME_SECONDS` (600s) and `RATE_LIMIT_RECOVERY_MIN_REPRICE_DISTANCE_PCT` (0.5%, floored at one full grid spacing), so resting orders stay put and wait for a pullback instead of following the price.

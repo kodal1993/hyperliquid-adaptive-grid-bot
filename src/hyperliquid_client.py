@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -54,6 +54,21 @@ def normalize_size_decimal(symbol: str, size: float | int | str | Decimal) -> De
     decimals = _SIZE_DECIMALS_BY_SYMBOL.get(symbol.upper(), _DEFAULT_SIZE_DECIMALS)
     quantum = Decimal(f"1e-{decimals}")
     return raw_size.quantize(quantum, rounding=ROUND_DOWN).normalize()
+
+
+def normalize_size_up(symbol: str, size: float | int | str | Decimal) -> float:
+    """Round an order size UP to the symbol's size step.
+
+    Used when a size must clear a lower bound (e.g. the exchange minimum
+    notional): the submit-side normalization rounds down, so a size computed
+    as an exact fraction would land one step below the bound again.
+    """
+    raw_size = _decimal_from_number(size)
+    if raw_size <= 0:
+        return 0.0
+    decimals = _SIZE_DECIMALS_BY_SYMBOL.get(symbol.upper(), _DEFAULT_SIZE_DECIMALS)
+    quantum = Decimal(f"1e-{decimals}")
+    return float(raw_size.quantize(quantum, rounding=ROUND_UP).normalize())
 
 
 def normalize_price(symbol: str, price: float | int | str | Decimal) -> float:
