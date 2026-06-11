@@ -4221,7 +4221,9 @@ def test_size_multiplier_floors_at_min_order_notional(tmp_path):
     orch._apply_orderbook_size_multipliers(plan, 100.0, 1.0, 0.75)
 
     sell = plan.short_levels[0]
-    assert sell.price * sell.size == pytest.approx(10.0, rel=1e-6)
+    # Floored to >= min notional, overshooting by at most one size step.
+    assert sell.price * sell.size >= 10.0
+    assert sell.price * sell.size <= 10.0 + sell.price * 1e-5
     buy = plan.long_levels[0]
     assert buy.price * buy.size == pytest.approx(0.12 * buy.price, rel=1e-6)
 
@@ -4236,6 +4238,22 @@ def test_size_floor_helper_keeps_orders_above_min_notional(tmp_path):
     assert orch._floor_size_to_min_order_notional(100.0, 0.09) == pytest.approx(0.10)
     assert orch._floor_size_to_min_order_notional(100.0, 0.11) == pytest.approx(0.11)
     assert orch._floor_size_to_min_order_notional(100.0, 0.0) == 0.0
+
+
+def test_size_floor_survives_submit_side_round_down(tmp_path):
+    # 10 / 62927 = 0.000158913: the exact fraction truncates to 0.00015 at the
+    # submit-side ROUND_DOWN normalization ($9.44 < $10, observed live as the
+    # sell side never placing). The floor must round UP to the size step.
+    cfg = BotConfig.from_env()
+    cfg.min_order_notional_usd = 10.0
+    cfg.max_notional_per_trade_usd = 12.0
+    cfg.max_order_size = 10.0
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "floor_round_down.json"))
+
+    floored = orch._floor_size_to_min_order_notional(62927.0, 0.00015)
+
+    assert floored == pytest.approx(0.00016)
+    assert normalize_size("BTC", floored) * 62927.0 >= 10.0
 
 
 def test_live_rate_limit_error_starts_cooldown_and_skips_new_entries(tmp_path, caplog):
