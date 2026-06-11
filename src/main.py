@@ -76,6 +76,18 @@ def calculate_daily_pnl_metrics(*, current_equity: float, daily_start_equity: fl
     }
 
 
+
+def calculate_bot_daily_pnl_metrics(*, bot_daily_realized_pnl: float, bot_daily_fees_paid: float, account_daily_pnl: float, daily_start_equity: float) -> dict:
+    bot_daily_pnl = bot_daily_realized_pnl - bot_daily_fees_paid
+    manual_external_pnl_estimate = account_daily_pnl - bot_daily_pnl
+    return {
+        "bot_daily_realized_pnl": bot_daily_realized_pnl,
+        "bot_daily_fees": bot_daily_fees_paid,
+        "bot_daily_pnl": bot_daily_pnl,
+        "bot_daily_pnl_pct": 0.0 if daily_start_equity <= 0 else bot_daily_pnl / daily_start_equity,
+        "manual_external_pnl_estimate": manual_external_pnl_estimate,
+    }
+
 def _write_status(payload: dict) -> None:
     STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATUS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -299,6 +311,8 @@ def run() -> None:
             engine.state.daily_start_equity = daily_start_equity
             engine.state.daily_start_realized_pnl = daily_start_realized_pnl
             engine.state.daily_start_fees_paid = daily_start_fees_paid
+            engine.state.bot_daily_realized_pnl = 0.0
+            engine.state.bot_daily_fees_paid = 0.0
             engine.save_state()
         if now_day != current_day:
             current_day = now_day
@@ -309,9 +323,18 @@ def run() -> None:
             engine.state.daily_start_equity = daily_start_equity
             engine.state.daily_start_realized_pnl = daily_start_realized_pnl
             engine.state.daily_start_fees_paid = daily_start_fees_paid
+            engine.state.bot_daily_realized_pnl = 0.0
+            engine.state.bot_daily_fees_paid = 0.0
             engine.save_state()
         daily_metrics = calculate_daily_pnl_metrics(current_equity=equity, daily_start_equity=daily_start_equity, realized_pnl_total=account_state.realized_pnl, daily_start_realized_pnl=daily_start_realized_pnl, unrealized_pnl=unrealized_pnl, fees_paid_total=account_state.fees_paid, daily_start_fees_paid=daily_start_fees_paid)
-        daily_pnl_pct = daily_metrics["daily_pnl_pct"]
+        bot_daily_metrics = calculate_bot_daily_pnl_metrics(
+            bot_daily_realized_pnl=float(getattr(engine.state, "bot_daily_realized_pnl", 0.0) or 0.0),
+            bot_daily_fees_paid=float(getattr(engine.state, "bot_daily_fees_paid", 0.0) or 0.0),
+            account_daily_pnl=daily_metrics["daily_pnl"],
+            daily_start_equity=daily_start_equity,
+        )
+        account_daily_pnl_pct = daily_metrics["daily_pnl_pct"]
+        bot_daily_pnl_pct = bot_daily_metrics["bot_daily_pnl_pct"]
 
         order_book_snapshot = None
         try:
@@ -320,7 +343,7 @@ def run() -> None:
                 order_book_snapshot = {**order_book_snapshot, "received_ts": time.time()}
         except Exception as exc:
             logger.warning("orderbook_unavailable symbol=%s reason=fetch_error fallback=existing_strategy error=%s", cfg.default_symbol, exc)
-        status = orchestrator.on_tick(candles, equity=equity, daily_pnl_pct=daily_pnl_pct, symbol=cfg.default_symbol, position_notional=position_notional, order_book_snapshot=order_book_snapshot)
+        status = orchestrator.on_tick(candles, equity=equity, daily_pnl_pct=bot_daily_pnl_pct, symbol=cfg.default_symbol, position_notional=position_notional, order_book_snapshot=order_book_snapshot)
         risk = status.get("risk")
         reason = status.get("reason") or (getattr(risk, "reason", "") if risk else "")
         strategy_status = status.get("status", "unknown")
@@ -345,6 +368,14 @@ def run() -> None:
         account_state = _account_metrics(cfg, engine, client, latest_close)
         unrealized_pnl, equity, position_notional = account_state.unrealized_pnl, account_state.equity, account_state.position_notional
         daily_metrics = calculate_daily_pnl_metrics(current_equity=equity, daily_start_equity=daily_start_equity, realized_pnl_total=account_state.realized_pnl, daily_start_realized_pnl=daily_start_realized_pnl, unrealized_pnl=unrealized_pnl, fees_paid_total=account_state.fees_paid, daily_start_fees_paid=daily_start_fees_paid)
+        bot_daily_metrics = calculate_bot_daily_pnl_metrics(
+            bot_daily_realized_pnl=float(getattr(engine.state, "bot_daily_realized_pnl", 0.0) or 0.0),
+            bot_daily_fees_paid=float(getattr(engine.state, "bot_daily_fees_paid", 0.0) or 0.0),
+            account_daily_pnl=daily_metrics["daily_pnl"],
+            daily_start_equity=daily_start_equity,
+        )
+        account_daily_pnl_pct = daily_metrics["daily_pnl_pct"]
+        bot_daily_pnl_pct = bot_daily_metrics["bot_daily_pnl_pct"]
 
         for tr in trade_events:
             recent_trades.append(tr)
@@ -390,7 +421,10 @@ def run() -> None:
             "unrealized_pnl": unrealized_pnl,
             "fees_paid": account_state.fees_paid,
             "equity": equity,
-            "daily_pnl_pct": daily_pnl_pct,
+            "daily_pnl_pct": account_daily_pnl_pct,
+            "account_daily_pnl_pct": account_daily_pnl_pct,
+            "bot_daily_pnl_pct": bot_daily_pnl_pct,
+            "risk_daily_pnl_pct": bot_daily_pnl_pct,
             "risk_state": risk_state,
             "strategy_status": strategy_status,
             "pause_reason": reason,
@@ -515,6 +549,16 @@ def run() -> None:
                 "net_daily_pnl": daily_metrics["net_daily_pnl"],
                 "daily_pnl": daily_metrics["daily_pnl"],
                 "daily_pnl_pct": daily_metrics["daily_pnl_pct"],
+                "account_daily_pnl": daily_metrics["daily_pnl"],
+                "account_daily_pnl_pct": daily_metrics["daily_pnl_pct"],
+                "bot_daily_realized_pnl": bot_daily_metrics["bot_daily_realized_pnl"],
+                "bot_daily_fees": bot_daily_metrics["bot_daily_fees"],
+                "bot_daily_pnl": bot_daily_metrics["bot_daily_pnl"],
+                "bot_daily_pnl_pct": bot_daily_metrics["bot_daily_pnl_pct"],
+                "risk_daily_pnl_pct": bot_daily_metrics["bot_daily_pnl_pct"],
+                "manual_external_pnl_estimate": bot_daily_metrics["manual_external_pnl_estimate"],
+                "bot_position_size": float(getattr(engine.state, "bot_position_size", 0.0) or 0.0),
+                "open_bot_orders": sum(1 for o in getattr(engine, "open_orders", []) if bool(o.get("is_bot_order", True))),
                 "unrealized_pnl_pct": ((unrealized_pnl / abs(account_state.avg_entry * account_state.position_size)) if abs(account_state.avg_entry * account_state.position_size) > 1e-9 else 0.0),
                 "exposure_pct": (position_notional / equity) if equity > 1e-9 else 0.0,
                 "avg_entry": account_state.avg_entry,

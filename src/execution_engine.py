@@ -38,6 +38,11 @@ class ExecutionState:
     daily_start_equity: float = 0.0
     daily_start_realized_pnl: float = 0.0
     daily_start_fees_paid: float = 0.0
+    bot_position_size: float = 0.0
+    bot_realized_pnl: float = 0.0
+    bot_fees_paid: float = 0.0
+    bot_daily_realized_pnl: float = 0.0
+    bot_daily_fees_paid: float = 0.0
     current_day: str = ""
 
     @property
@@ -133,6 +138,28 @@ def _order_submit_error(response: object) -> str:
                 if isinstance(status, dict) and status.get("error"):
                     return str(status["error"])
     return ""
+
+
+
+def _extract_order_oid(response: object) -> int | None:
+    """Best-effort extraction of the exchange order id from an SDK response."""
+    if isinstance(response, dict):
+        for key in ("oid", "orderId", "order_id"):
+            if response.get(key) is not None:
+                try:
+                    return int(response[key])
+                except (TypeError, ValueError):
+                    pass
+        for value in response.values():
+            found = _extract_order_oid(value)
+            if found is not None:
+                return found
+    elif isinstance(response, list):
+        for item in response:
+            found = _extract_order_oid(item)
+            if found is not None:
+                return found
+    return None
 
 
 def _is_post_only_reject(error: str) -> bool:
@@ -272,7 +299,9 @@ class PaperExecutionEngine:
 
     def _load_state(self, start_balance: float) -> ExecutionState:
         if self.state_file.exists():
-            return ExecutionState(**json.loads(self.state_file.read_text()))
+            payload = json.loads(self.state_file.read_text())
+            valid = set(ExecutionState.__dataclass_fields__)
+            return ExecutionState(**{k: v for k, v in payload.items() if k in valid})
         return ExecutionState(equity=start_balance, daily_start_equity=start_balance)
 
     def save_state(self) -> None:
@@ -597,6 +626,11 @@ class PaperExecutionEngine:
             self.paper.avg_entry = 0.0
 
         realized_delta = self.paper.realized_pnl - realized_before
+        self.paper.bot_position_size = self.paper.position_size
+        self.paper.bot_realized_pnl += realized_delta
+        self.paper.bot_fees_paid += fee
+        self.paper.bot_daily_realized_pnl += realized_delta
+        self.paper.bot_daily_fees_paid += fee
         position_notional = abs(self.paper.position_size * price)
         if is_flip_trade:
             self.flip_trade_count += 1
@@ -631,6 +665,7 @@ class PaperExecutionEngine:
             "pause_reason": pause_reason,
             "reason": reason,
             "order_source": fill.get("order_source") or ("dust_cleanup" if fill.get("dust_cleanup") else ("reduce_only" if fill.get("reduce_only") else "normal_entry")),
+            "is_bot_fill": True,
             "sub_10_usd_fill": 0.0 < notional < 10.0,
             "sub_5_usd_fill": 0.0 < notional < 5.0,
             "orderbook_classification": orderbook_classification,
@@ -706,9 +741,10 @@ class PaperExecutionEngine:
     def equity(self, mark_price: float) -> float:
         return self.paper.cash + self.unrealized_pnl(mark_price)
 
+
     def _append_trade_ledger(self, entry: dict) -> None:
         self.trade_ledger_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "fill_liquidity", "is_maker_fill", "is_taker_fill", "dust_fill", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason", "order_source", "sub_10_usd_fill", "sub_5_usd_fill", "orderbook_classification", "orderbook_imbalance_ratio", "orderbook_pressure_score", "prediction_bias"]
+        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "fill_liquidity", "is_maker_fill", "is_taker_fill", "dust_fill", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason", "order_source", "is_bot_fill", "sub_10_usd_fill", "sub_5_usd_fill", "orderbook_classification", "orderbook_imbalance_ratio", "orderbook_pressure_score", "prediction_bias"]
         write_header = not self.trade_ledger_csv.exists()
         with self.trade_ledger_csv.open("a", encoding="utf-8") as f:
             if write_header:
@@ -803,6 +839,7 @@ class LiveExecutionEngine:
         self.rate_limit_trigger_count = 0
         self.rate_limited_skip_count = 0
         self._seen_fill_ids: set[str] = set()
+        self._bot_order_oids: set[int] = set()
         self._load_live_seen_fills()
         self.min_order_lifetime_seconds = max(int(kwargs.pop("min_order_lifetime_seconds", 90)), 0)
         self.min_reprice_distance_pct = max(float(kwargs.pop("min_reprice_distance_pct", 0.0015)), 0.0)
@@ -869,9 +906,15 @@ class LiveExecutionEngine:
             return
         if isinstance(payload, dict):
             self._seen_fill_ids = {str(x) for x in payload.get("seen_fill_ids", [])}
+            self._bot_order_oids = {int(x) for x in payload.get("bot_order_oids", []) if str(x).lstrip("-").isdigit()}
             self.state.daily_start_equity = float(payload.get("daily_start_equity", self.state.daily_start_equity) or 0.0)
             self.state.daily_start_realized_pnl = float(payload.get("daily_start_realized_pnl", self.state.daily_start_realized_pnl) or 0.0)
             self.state.daily_start_fees_paid = float(payload.get("daily_start_fees_paid", self.state.daily_start_fees_paid) or 0.0)
+            self.state.bot_position_size = float(payload.get("bot_position_size", self.state.bot_position_size) or 0.0)
+            self.state.bot_realized_pnl = float(payload.get("bot_realized_pnl", self.state.bot_realized_pnl) or 0.0)
+            self.state.bot_fees_paid = float(payload.get("bot_fees_paid", self.state.bot_fees_paid) or 0.0)
+            self.state.bot_daily_realized_pnl = float(payload.get("bot_daily_realized_pnl", self.state.bot_daily_realized_pnl) or 0.0)
+            self.state.bot_daily_fees_paid = float(payload.get("bot_daily_fees_paid", self.state.bot_daily_fees_paid) or 0.0)
             self.state.current_day = str(payload.get("current_day", self.state.current_day) or "")
 
     def save_state(self) -> None:
@@ -879,10 +922,16 @@ class LiveExecutionEngine:
         payload = {
             "mode": "live",
             "seen_fill_ids": sorted(self._seen_fill_ids)[-1000:],
+            "bot_order_oids": sorted(self._bot_order_oids)[-1000:],
             "last_real_trade_ts": self.last_real_trade_ts.isoformat() if self.last_real_trade_ts else "",
             "daily_start_equity": self.state.daily_start_equity,
             "daily_start_realized_pnl": self.state.daily_start_realized_pnl,
             "daily_start_fees_paid": self.state.daily_start_fees_paid,
+            "bot_position_size": self.state.bot_position_size,
+            "bot_realized_pnl": self.state.bot_realized_pnl,
+            "bot_fees_paid": self.state.bot_fees_paid,
+            "bot_daily_realized_pnl": self.state.bot_daily_realized_pnl,
+            "bot_daily_fees_paid": self.state.bot_daily_fees_paid,
             "current_day": self.state.current_day,
         }
         self.state_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -929,14 +978,22 @@ class LiveExecutionEngine:
         for raw in self.client.get_open_orders(symbol):
             side_raw = str(raw.get("side", "")).lower()
             side = "buy" if side_raw in {"b", "buy"} else "sell"
+            oid_raw = raw.get("oid")
+            try:
+                oid_int = int(oid_raw) if oid_raw is not None else None
+            except (TypeError, ValueError):
+                oid_int = None
+            is_bot_order = oid_int is not None and oid_int in self._bot_order_oids
             orders.append(
                 {
                     "symbol": raw.get("coin", symbol),
                     "side": side,
                     "price": float(raw.get("limitPx", raw.get("px", 0.0)) or 0.0),
                     "size": float(raw.get("sz", 0.0) or 0.0),
-                    "oid": raw.get("oid"),
+                    "oid": oid_raw,
                     "reduce_only": bool(raw.get("reduceOnly", False)),
+                    "is_bot_order": is_bot_order,
+                    "order_source": "bot" if is_bot_order else "external",
                     "created_ts": self._order_created_ts(raw),
                     "raw": raw,
                 }
@@ -1112,20 +1169,38 @@ class LiveExecutionEngine:
     def sync_user_fills(self, symbol: str | None = None, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None, prediction_bias: str = "") -> list[dict]:
         fills = self.client.get_user_fills(symbol)
         new_entries: list[dict] = []
+        new_seen_fill = False
         for raw in fills:
             fill_id = self._fill_id(raw)
             if fill_id in self._seen_fill_ids:
                 continue
-            entry = self._ledger_entry_from_exchange_fill(raw, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason, orderbook_classification=orderbook_classification, orderbook_imbalance_ratio=orderbook_imbalance_ratio, orderbook_pressure_score=orderbook_pressure_score, prediction_bias=prediction_bias)
+            is_bot_fill = self._is_bot_exchange_fill(raw)
             self._seen_fill_ids.add(fill_id)
-            self.state.realized_pnl += float(entry.get("realized_pnl_delta", 0.0) or 0.0)
-            self.state.fees_paid += float(entry.get("fee", 0.0) or 0.0)
+            new_seen_fill = True
+            if not is_bot_fill:
+                logger.info("external_fill_ignored_for_bot_pnl symbol=%s oid=%s tid=%s", raw.get("coin", symbol or ""), raw.get("oid"), raw.get("tid"))
+                continue
+            entry = self._ledger_entry_from_exchange_fill(raw, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason, orderbook_classification=orderbook_classification, orderbook_imbalance_ratio=orderbook_imbalance_ratio, orderbook_pressure_score=orderbook_pressure_score, prediction_bias=prediction_bias, is_bot_fill=True)
+            realized_delta = float(entry.get("realized_pnl_delta", 0.0) or 0.0)
+            fee = float(entry.get("fee", 0.0) or 0.0)
+            self.state.realized_pnl += realized_delta
+            self.state.fees_paid += fee
+            self.state.bot_realized_pnl += realized_delta
+            self.state.bot_fees_paid += fee
+            self.state.bot_daily_realized_pnl += realized_delta
+            self.state.bot_daily_fees_paid += fee
+            self.state.bot_position_size += _signed_order_size(str(entry.get("side", "")), float(entry.get("qty", 0.0) or 0.0))
+            if abs(self.state.bot_position_size) < 1e-12:
+                self.state.bot_position_size = 0.0
             if entry.get("is_flip_trade"):
                 self.flip_trade_count += 1
                 self.last_flip_trade_ts = datetime.now(timezone.utc)
                 entry["flip_trade_count"] = self.flip_trade_count
             entry["realized_pnl_total"] = self.state.realized_pnl
             entry["fees_paid"] = self.state.fees_paid
+            entry["bot_position_size"] = self.state.bot_position_size
+            entry["bot_daily_realized_pnl"] = self.state.bot_daily_realized_pnl
+            entry["bot_daily_fees_paid"] = self.state.bot_daily_fees_paid
             self._record_order_event("filled", symbol=str(entry.get("symbol", symbol or "")), side=str(entry.get("side", "")), price=float(entry.get("price", 0.0) or 0.0), size=float(entry.get("qty", 0.0) or 0.0))
             entry["paired_tp_placed"] = self._maybe_place_paired_take_profit(str(entry.get("symbol") or symbol or ""), entry, raw)
             self.trade_log.append(entry)
@@ -1139,12 +1214,24 @@ class LiveExecutionEngine:
             self.save_state()
         else:
             self.no_fill_cycles += 1
+            if new_seen_fill:
+                self.save_state()
         return new_entries
+
+
+    def _is_bot_exchange_fill(self, raw: dict) -> bool:
+        oid = raw.get("oid")
+        if oid is None:
+            return False
+        try:
+            return int(oid) in self._bot_order_oids
+        except (TypeError, ValueError):
+            return False
 
 
     def _append_trade_ledger(self, entry: dict) -> None:
         self.trade_ledger_csv.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "fill_liquidity", "is_maker_fill", "is_taker_fill", "dust_fill", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason", "order_source", "sub_10_usd_fill", "sub_5_usd_fill", "orderbook_classification", "orderbook_imbalance_ratio", "orderbook_pressure_score", "prediction_bias"]
+        fields = ["timestamp", "symbol", "side", "price", "qty", "notional", "fee", "fill_liquidity", "is_maker_fill", "is_taker_fill", "dust_fill", "realized_pnl_delta", "realized_pnl_total", "cash", "equity", "position_before", "position_after", "position_size", "position_notional", "exposure_action", "trade_category", "is_flip_trade", "flip_trade_count", "regime", "mode", "risk_state", "pause_reason", "reason", "order_source", "is_bot_fill", "sub_10_usd_fill", "sub_5_usd_fill", "orderbook_classification", "orderbook_imbalance_ratio", "orderbook_pressure_score", "prediction_bias"]
         write_header = not self.trade_ledger_csv.exists()
         with self.trade_ledger_csv.open("a", encoding="utf-8") as f:
             if write_header:
@@ -1277,8 +1364,10 @@ class LiveExecutionEngine:
             else:
                 logger.warning("live_order_rejected side=%s price=%s size=%s reduce_only=%s error=%s", side, normalized_price, normalized_size, reduce_only, error)
             return False
-        if not reduce_only:
-            self._record_order_event("submitted", symbol=symbol, side=side, price=normalized_price, size=normalized_size)
+        oid = _extract_order_oid(response)
+        if oid is not None:
+            self._bot_order_oids.add(oid)
+        self._record_order_event("submitted", symbol=symbol, side=side, price=normalized_price, size=normalized_size)
         return True
 
     def _is_opening_fill(self, raw: dict, entry: dict) -> bool:
@@ -1334,7 +1423,7 @@ class LiveExecutionEngine:
                 return f"{key}:{raw.get(key)}:{raw.get('time', '')}"
         return json.dumps(raw, sort_keys=True)
 
-    def _ledger_entry_from_exchange_fill(self, raw: dict, *, regime: str, mode: str, risk_state: str, pause_reason: str, orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None, prediction_bias: str = "") -> dict:
+    def _ledger_entry_from_exchange_fill(self, raw: dict, *, regime: str, mode: str, risk_state: str, pause_reason: str, orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None, prediction_bias: str = "", is_bot_fill: bool = False) -> dict:
         price = float(raw.get("px", raw.get("price", 0.0)) or 0.0)
         size = float(raw.get("sz", raw.get("size", 0.0)) or 0.0)
         side_raw = str(raw.get("side", "")).lower()
@@ -1385,6 +1474,7 @@ class LiveExecutionEngine:
             "pause_reason": pause_reason,
             "reason": "exchange_fill",
             "order_source": raw.get("order_source") or ("reduce_only" if bool(raw.get("reduceOnly", raw.get("reduce_only", False))) else "normal_entry"),
+            "is_bot_fill": is_bot_fill,
             "sub_10_usd_fill": 0.0 < notional < 10.0,
             "sub_5_usd_fill": 0.0 < notional < 5.0,
             "orderbook_classification": orderbook_classification,
