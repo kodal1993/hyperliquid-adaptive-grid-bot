@@ -1,5 +1,10 @@
 # Changelog
 
+## Flat-orphan cleanup no longer nukes a healthy one-sided grid
+
+- Observed live (Order History): the bot placed a ~$12 buy, the flat-orphan cleanup canceled it within 14–16 seconds because the *sell* side was "missing", the forced rebuild re-placed the same buy (same price), and the loop repeated — zero fills, steady request burn, with ~10-minute quiet gaps wherever a trickle rejection re-armed the rate-limit orphan grace.
+- The cleanup's expectation now follows the **last executed plan**: a side that stress one-siding or the edge/orderbook filters generated no levels for is not "missing". Orders younger than `MIN_ORDER_LIFETIME_SECONDS` never count as orphans (the op-budgeted regrid may simply not have placed the other side yet), and a confirmed missing side must persist for `ORPHAN_CLEANUP_CONFIRM_TICKS` (default 3) consecutive ticks before anything is canceled.
+
 ## Proactive budget watch, flip-churn brake, maker TPs, health telemetry
 
 - **Proactive request-budget monitoring**: the live engine polls the public `userRateLimit` endpoint every `RATE_LIMIT_BUDGET_POLL_SECONDS` (600s) and exposes cumulative volume, requests used/cap, headroom and requests-per-USDC. Below `RATE_LIMIT_HEADROOM_ALERT` (1000) a Telegram alert fires (risk-alert cooldown applies); below `RATE_LIMIT_HEADROOM_FRUGAL` (500) the engine pre-arms the frugal recovery regrid *before* the exchange ever rejects a request. The June deficit was visible in these numbers weeks in advance.

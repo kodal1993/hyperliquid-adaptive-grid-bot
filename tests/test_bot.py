@@ -1797,46 +1797,109 @@ def test_flat_one_buy_order_valid_when_only_buys_allowed(tmp_path, monkeypatch):
     assert status["cleanup_canceled_orders"] == 0
 
 
-def test_flat_missing_allowed_sell_side_triggers_orphan_cleanup(tmp_path, monkeypatch):
+def test_flat_missing_allowed_sell_side_triggers_orphan_cleanup_after_confirmation(tmp_path, monkeypatch):
     cfg = _cfg_for_grid_tests(monkeypatch)
     eng = make_test_engine(tmp_path, "orphan_missing_sell.json", paper_mode=True)
-    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 199.0, "size": 0.01}]
     orch = StrategyOrchestrator(cfg, eng)
     candles = pd.DataFrame({"close": [200 - i for i in range(80)], "high": [201 - i for i in range(80)], "low": [199 - i for i in range(80)]})
 
-    status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+    statuses = []
+    for _ in range(orch.orphan_cleanup_confirm_ticks):
+        # Re-inject the wrong-side-only book each tick so the missing-sell
+        # condition persists across the confirmation window.
+        eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 199.0, "size": 0.01}]
+        statuses.append(orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0))
 
-    assert status["allow_buys"] is False
-    assert status["allow_sells"] is True
-    assert status["expected_buy_orders"] == 0
-    assert status["expected_sell_orders"] == 1
-    assert status["actual_buy_orders"] == 1
-    assert status["actual_sell_orders"] == 0
-    assert status["orphan_decision_reason"] == "expected_active_side_missing:sell"
-    assert status["orphan_order_detected"] is True
-    assert status["orphan_order_cleanup_count"] == 1
-    assert status["cleanup_canceled_orders"] == 1
+    # Deferred during confirmation, then the backstop fires.
+    assert statuses[0]["orphan_order_detected"] is False
+    assert str(statuses[0]["orphan_decision_reason"]).startswith("missing_side_awaiting_confirmation")
+    assert statuses[0]["cleanup_canceled_orders"] == 0
+    final = statuses[-1]
+    assert final["allow_buys"] is False
+    assert final["allow_sells"] is True
+    assert final["orphan_decision_reason"] == "expected_active_side_missing:sell"
+    assert final["orphan_order_detected"] is True
+    assert final["orphan_order_cleanup_count"] == 1
+    assert final["cleanup_canceled_orders"] == 1
 
 
-def test_flat_missing_allowed_buy_side_triggers_orphan_cleanup(tmp_path, monkeypatch):
+def test_flat_missing_allowed_buy_side_triggers_orphan_cleanup_after_confirmation(tmp_path, monkeypatch):
     cfg = _cfg_for_grid_tests(monkeypatch)
     eng = make_test_engine(tmp_path, "orphan_missing_buy.json", paper_mode=True)
-    eng.open_orders = [{"symbol": "BTC", "side": "sell", "price": 101.0, "size": 0.1}]
     orch = StrategyOrchestrator(cfg, eng)
     candles = pd.DataFrame({"close": [100 + i for i in range(80)], "high": [101 + i for i in range(80)], "low": [99 + i for i in range(80)]})
 
-    status = orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0)
+    statuses = []
+    for _ in range(orch.orphan_cleanup_confirm_ticks):
+        eng.open_orders = [{"symbol": "BTC", "side": "sell", "price": 101.0, "size": 0.1}]
+        statuses.append(orch.on_tick(candles, equity=160.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=0.0))
 
-    assert status["allow_buys"] is True
-    assert status["allow_sells"] is False
-    assert status["expected_buy_orders"] == 1
-    assert status["expected_sell_orders"] == 0
-    assert status["actual_buy_orders"] == 0
-    assert status["actual_sell_orders"] == 1
-    assert status["orphan_decision_reason"] == "expected_active_side_missing:buy"
-    assert status["orphan_order_detected"] is True
-    assert status["orphan_order_cleanup_count"] == 1
-    assert status["cleanup_canceled_orders"] == 1
+    assert statuses[0]["orphan_order_detected"] is False
+    assert statuses[0]["cleanup_canceled_orders"] == 0
+    final = statuses[-1]
+    assert final["allow_buys"] is True
+    assert final["allow_sells"] is False
+    assert final["orphan_decision_reason"] == "expected_active_side_missing:buy"
+    assert final["orphan_order_detected"] is True
+    assert final["orphan_order_cleanup_count"] == 1
+    assert final["cleanup_canceled_orders"] == 1
+
+
+def test_one_sided_plan_never_flags_missing_side_as_orphan(tmp_path, monkeypatch):
+    cfg = _cfg_for_grid_tests(monkeypatch)
+    eng = make_test_engine(tmp_path, "orphan_one_sided_plan.json", paper_mode=True)
+    orch = StrategyOrchestrator(cfg, eng)
+    # The executed plan had buy levels only (stress/edge filters one-sided it),
+    # so a resting buy without any sell must NOT be treated as an orphan.
+    orch._last_plan_buy_levels = 1
+    orch._last_plan_sell_levels = 0
+    open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 0.01, "created_ts": time.time() - 3600}]
+
+    for _ in range(5):
+        detected, reason, _ = orch._detect_flat_orphan_orders(open_orders=open_orders, position_side="FLAT", mode=GridMode.LONG_BIASED, allowed_buys=True, allowed_sells=True)
+        assert detected is False
+        assert reason == "active_allowed_sides_present"
+    assert orch._orphan_missing_side_streak == 0
+
+
+def test_young_orders_never_count_as_orphans(tmp_path, monkeypatch):
+    cfg = _cfg_for_grid_tests(monkeypatch)
+    eng = make_test_engine(tmp_path, "orphan_young_orders.json", paper_mode=True)
+    eng.min_order_lifetime_seconds = 90
+    orch = StrategyOrchestrator(cfg, eng)
+    orch._last_plan_buy_levels = 1
+    orch._last_plan_sell_levels = 1
+    open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 0.01, "created_ts": time.time() - 15}]
+
+    detected, reason, _ = orch._detect_flat_orphan_orders(open_orders=open_orders, position_side="FLAT", mode=GridMode.NEUTRAL, allowed_buys=True, allowed_sells=True)
+
+    assert detected is False
+    assert reason == "young_orders_grace"
+    assert orch._orphan_missing_side_streak == 0
+
+
+def test_orphan_detection_requires_consecutive_confirmation_ticks(tmp_path, monkeypatch):
+    cfg = _cfg_for_grid_tests(monkeypatch)
+    eng = make_test_engine(tmp_path, "orphan_confirm.json", paper_mode=True)
+    eng.min_order_lifetime_seconds = 90
+    orch = StrategyOrchestrator(cfg, eng)
+    orch._last_plan_buy_levels = 1
+    orch._last_plan_sell_levels = 1
+    open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 0.01, "created_ts": time.time() - 3600}]
+
+    results = [
+        orch._detect_flat_orphan_orders(open_orders=open_orders, position_side="FLAT", mode=GridMode.NEUTRAL, allowed_buys=True, allowed_sells=True)[0]
+        for _ in range(orch.orphan_cleanup_confirm_ticks)
+    ]
+
+    assert results[:-1] == [False] * (orch.orphan_cleanup_confirm_ticks - 1)
+    assert results[-1] is True
+
+    # A tick where the side reappears resets the streak.
+    healthy = open_orders + [{"symbol": "BTC", "side": "sell", "price": 101.0, "size": 0.01, "created_ts": time.time() - 3600}]
+    detected, _, _ = orch._detect_flat_orphan_orders(open_orders=healthy, position_side="FLAT", mode=GridMode.NEUTRAL, allowed_buys=True, allowed_sells=True)
+    assert detected is False
+    assert orch._orphan_missing_side_streak == 0
 
 
 def test_flat_no_orders_rebuilds_grid_even_without_price_recenter(tmp_path, monkeypatch):
@@ -4265,9 +4328,12 @@ def test_orphan_cleanup_skipped_during_rate_limit_cooldown(tmp_path):
     cfg.min_order_lifetime_seconds = 0
     cfg.stale_order_max_age_sec = 999999
     eng = make_test_engine(tmp_path, "rate_limit_orphan.json", paper_mode=True, min_order_lifetime_seconds=0)
-    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.7, "size": 0.1, "created_ts": time.time() - 60}]
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.7, "size": 0.1, "created_ts": time.time() - 3600}]
     eng.rate_limited_until = time.time() + 100
     orch = StrategyOrchestrator(cfg, eng)
+    # Prime the detector past the confirmation window so this tick would fire
+    # the cleanup if the rate-limit skip did not intervene.
+    orch._orphan_missing_side_streak = orch.orphan_cleanup_confirm_ticks
 
     status = orch.on_tick(_candles_for_watchdog(100.0), equity=500, daily_pnl_pct=0, symbol="BTC")
 
@@ -4537,11 +4603,12 @@ def test_orphan_cleanup_skipped_within_rate_limit_grace_after_cooldown(tmp_path)
     cfg.min_order_lifetime_seconds = 0
     cfg.stale_order_max_age_sec = 999999
     eng = make_test_engine(tmp_path, "rate_limit_grace.json", paper_mode=True, min_order_lifetime_seconds=0)
-    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.7, "size": 0.1, "created_ts": time.time() - 60}]
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.7, "size": 0.1, "created_ts": time.time() - 3600}]
     eng.rate_limited_until = time.time() - 5
     eng.last_rate_limit_ts = time.time() - 60
     eng.rate_limit_orphan_grace_seconds = 600.0
     orch = StrategyOrchestrator(cfg, eng)
+    orch._orphan_missing_side_streak = orch.orphan_cleanup_confirm_ticks
 
     status = orch.on_tick(_candles_for_watchdog(100.0), equity=500, daily_pnl_pct=0, symbol="BTC")
 
