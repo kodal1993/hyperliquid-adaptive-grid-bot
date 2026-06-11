@@ -120,6 +120,19 @@ def _diff_grid_orders(
     return keep, unmatched_active, place
 
 
+def _grid_plan_center(plan: GridPlan) -> float:
+    """Approximate the mid the grid was built around, for fill-proximity sorting."""
+    buys = [float(level.price) for level in plan.long_levels]
+    sells = [float(level.price) for level in plan.short_levels]
+    if buys and sells:
+        return (max(buys) + min(sells)) / 2.0
+    if buys:
+        return max(buys)
+    if sells:
+        return min(sells)
+    return 0.0
+
+
 def _order_submit_error(response: object) -> str:
     """Extract an error message from a Hyperliquid order response, if any.
 
@@ -858,6 +871,7 @@ class LiveExecutionEngine:
         self.rate_limit_deficit_cooldown_seconds_per_request = max(float(kwargs.pop("rate_limit_deficit_cooldown_seconds_per_request", 0.05)), 0.0)
         self.rate_limit_max_cooldown_seconds = max(float(kwargs.pop("rate_limit_max_cooldown_seconds", 900.0)), self.rate_limit_cooldown_seconds)
         self.rate_limit_orphan_grace_seconds = max(float(kwargs.pop("rate_limit_orphan_grace_seconds", 600.0)), 0.0)
+        self.rate_limit_recovery_window_seconds = max(float(kwargs.pop("rate_limit_recovery_window_seconds", 1800.0)), 0.0)
         self.max_order_ops_per_cycle = max(int(kwargs.pop("max_order_ops_per_cycle", 2)), 1)
         self.rate_limited_until = 0.0
         self.last_rate_limit_ts = 0.0
@@ -920,6 +934,19 @@ class LiveExecutionEngine:
             return False, "min_reprice_distance"
         return True, "reprice_threshold_met"
 
+    def _in_rate_limit_recovery(self, now_ts: float | None = None) -> bool:
+        """True while the address is presumed to still carry a cumulative-request deficit.
+
+        The deficit only shrinks with traded volume, so it outlives the
+        rejection cooldown by a wide margin; the recovery window keeps order
+        operations frugal (one per cycle, placements first) after the last
+        observed rate-limit rejection.
+        """
+        if self.last_rate_limit_ts <= 0 or self.rate_limit_recovery_window_seconds <= 0:
+            return False
+        now = time.time() if now_ts is None else now_ts
+        return (now - self.last_rate_limit_ts) <= self.rate_limit_recovery_window_seconds
+
     def _require_paper_execution(self, action: str) -> None:
         raise RuntimeError(f"live_execution_forbids_paper_simulation: {action} cannot run in LIVE mode")
 
@@ -942,6 +969,7 @@ class LiveExecutionEngine:
             self.state.bot_daily_realized_pnl = float(payload.get("bot_daily_realized_pnl", self.state.bot_daily_realized_pnl) or 0.0)
             self.state.bot_daily_fees_paid = float(payload.get("bot_daily_fees_paid", self.state.bot_daily_fees_paid) or 0.0)
             self.state.current_day = str(payload.get("current_day", self.state.current_day) or "")
+            self.last_rate_limit_ts = float(payload.get("last_rate_limit_ts", 0.0) or 0.0)
 
     def save_state(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -959,6 +987,7 @@ class LiveExecutionEngine:
             "bot_daily_realized_pnl": self.state.bot_daily_realized_pnl,
             "bot_daily_fees_paid": self.state.bot_daily_fees_paid,
             "current_day": self.state.current_day,
+            "last_rate_limit_ts": self.last_rate_limit_ts,
         }
         self.state_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -1066,10 +1095,36 @@ class LiveExecutionEngine:
         desired = [{"side": o.side, "price": o.price, "size": o.size} for o in plan.long_levels + plan.short_levels]
         kept, to_cancel, to_place = _diff_grid_orders(active, desired, self.min_reprice_distance_pct)
         now_ts = time.time()
-        op_budget = self.max_order_ops_per_cycle
+        # Place the levels most likely to fill first; when the op budget cuts
+        # the list short, the surviving orders should be the closest to mid.
+        plan_center = _grid_plan_center(plan)
+        if plan_center > 0:
+            to_place = sorted(to_place, key=lambda lvl: abs(float(lvl.get("price", 0.0) or 0.0) - plan_center))
+        in_recovery = self._in_rate_limit_recovery(now_ts)
+        if in_recovery:
+            # The address is repaying a cumulative-request deficit, so the
+            # exchange accepts roughly one action per 10s. Only traded volume
+            # repays the deficit and only resting orders can trade, so the
+            # single slot goes to the placement closest to mid; cancels would
+            # just burn it (observed live as a grid bleeding to zero resting
+            # orders: cancel accepted, replacement rejected, cooldown).
+            # Existing orders are kept as fill chances, and cancels only run
+            # when there is nothing to place or the book is already full.
+            op_budget = 1
+            if to_place and len(active) < max(len(desired), 1):
+                cancel_budget = 0
+            else:
+                to_place = []
+                cancel_budget = op_budget
+        else:
+            op_budget = self.max_order_ops_per_cycle
+            # Reserve at least half the budget for placements so a long cancel
+            # backlog cannot starve the grid of resting orders.
+            place_budget = min(len(to_place), max(op_budget - len(to_cancel), (op_budget + 1) // 2))
+            cancel_budget = op_budget - place_budget
         canceled = 0
         cancel_oids: set[int] = set()
-        for old in to_cancel[:op_budget]:
+        for old in to_cancel[:cancel_budget]:
             oid = old.get("oid")
             if oid is None:
                 continue
@@ -1089,11 +1144,11 @@ class LiveExecutionEngine:
         if canceled:
             remaining_after_cancel = self.sync_open_orders(symbol)
             still_present = [o for o in remaining_after_cancel if o.get("oid") is not None and int(o["oid"]) in cancel_oids]
-            if still_present or canceled < len(to_cancel[:op_budget]):
+            if still_present or canceled < len(to_cancel[:cancel_budget]):
                 logger.warning(
                     "live_grid_rebuild_skipped reason=cancel_confirmation_pending remaining_canceled_orders=%s cancel_failures=%s kept=%s",
                     len(still_present),
-                    max(len(to_cancel[:op_budget]) - canceled, 0),
+                    max(len(to_cancel[:cancel_budget]) - canceled, 0),
                     len(kept),
                 )
                 return {"canceled": canceled, "placed": 0, "kept": len(kept), "symbol": symbol, "error": "cancel_confirmation_pending", "reprice_decision": "replace", "reprice_reason": reprice_reason}
@@ -1105,8 +1160,8 @@ class LiveExecutionEngine:
         self.sync_open_orders(symbol)
         skipped_places = max(len(to_place) - placed, 0)
         budget_exhausted = skipped_cancels > 0 or skipped_places > 0
-        logger.info("reprice_decision decision=replace reprice_reason=%s canceled=%s placed=%s kept=%s skipped_cancels=%s skipped_places=%s max_order_ops_per_cycle=%s", reprice_reason, canceled, placed, len(kept), skipped_cancels, skipped_places, self.max_order_ops_per_cycle)
-        return {"canceled": canceled, "placed": placed, "kept": len(kept), "symbol": symbol, "reprice_decision": "replace", "reprice_reason": reprice_reason, "skipped_cancels": skipped_cancels, "skipped_places": skipped_places, "order_op_budget_exhausted": budget_exhausted}
+        logger.info("reprice_decision decision=replace reprice_reason=%s canceled=%s placed=%s kept=%s skipped_cancels=%s skipped_places=%s max_order_ops_per_cycle=%s rate_limit_recovery_mode=%s", reprice_reason, canceled, placed, len(kept), skipped_cancels, skipped_places, self.max_order_ops_per_cycle, in_recovery)
+        return {"canceled": canceled, "placed": placed, "kept": len(kept), "symbol": symbol, "reprice_decision": "replace", "reprice_reason": reprice_reason, "skipped_cancels": skipped_cancels, "skipped_places": skipped_places, "order_op_budget_exhausted": budget_exhausted, "rate_limit_recovery_mode": in_recovery}
 
     def cancel_all_orders(self, symbol: str) -> int:
         canceled = self.client.cancel_all_orders(symbol)
