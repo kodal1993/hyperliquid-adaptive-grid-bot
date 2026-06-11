@@ -1,5 +1,10 @@
 # Changelog
 
+## No price-chasing while repaying the request deficit
+
+- After the orphan fix the live burn dropped from ~27 to ~15 requests/hour, but the budget alerts showed it still bleeding with zero volume: the single resting order kept being canceled after the normal 90s lifetime and re-placed ~0.15% higher as the price trended away — 2 requests per chase, no fills. While in rate-limit recovery/frugal mode the reprice gates now harden to `RATE_LIMIT_RECOVERY_MIN_ORDER_LIFETIME_SECONDS` (600s) and `RATE_LIMIT_RECOVERY_MIN_REPRICE_DISTANCE_PCT` (0.5%, floored at one full grid spacing), so resting orders stay put and wait for a pullback instead of following the price.
+- The anti-churn gates (order lifetime, reprice distance) now only guard cancels: when the diff has nothing to cancel and levels are missing, the regrid is allowed to fill them in (`missing_levels_fill_in`) regardless of how young the resting orders are.
+
 ## Flat-orphan cleanup no longer nukes a healthy one-sided grid
 
 - Observed live (Order History): the bot placed a ~$12 buy, the flat-orphan cleanup canceled it within 14–16 seconds because the *sell* side was "missing", the forced rebuild re-placed the same buy (same price), and the loop repeated — zero fills, steady request burn, with ~10-minute quiet gaps wherever a trickle rejection re-armed the rate-limit orphan grace.
