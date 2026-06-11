@@ -34,7 +34,7 @@ class RiskManager:
             reason = "emergency_stop"
         elif drawdown >= self.max_drawdown_pct:
             blocked, reason = True, "max_drawdown"
-        elif daily_pnl_pct <= -self.daily_loss_limit_pct:
+        elif daily_pnl_pct <= -self.daily_loss_limit_pct and not exposure_reducing_override:
             blocked, reason = True, "daily_loss"
         elif would_increase_exposure:
             if position_notional > max_position_notional:

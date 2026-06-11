@@ -137,6 +137,32 @@ def test_risk_allows_exposure_reducing_trade_even_when_directional_cap_exceeded(
     assert snap.exposure_reducing_override is True
 
 
+def test_daily_loss_allows_risk_manager_exposure_reduction():
+    rm = RiskManager(0.1, 0.05)
+    snap = rm.evaluate(
+        equity=1000,
+        daily_pnl_pct=-0.06,
+        attempted_side="sell",
+        would_increase_exposure=False,
+        stop_file="/tmp/nonexistent_stop_for_test",
+    )
+    assert snap.can_trade
+    assert snap.exposure_reducing_override is True
+
+
+def test_daily_loss_blocks_new_flat_entries_in_risk_manager():
+    rm = RiskManager(0.1, 0.05)
+    snap = rm.evaluate(
+        equity=1000,
+        daily_pnl_pct=-0.06,
+        attempted_side="buy",
+        would_increase_exposure=True,
+        stop_file="/tmp/nonexistent_stop_for_test",
+    )
+    assert not snap.can_trade
+    assert snap.reason == "daily_loss"
+
+
 def test_paper_fill_simulation(tmp_path):
     eng = make_test_engine(tmp_path, "state.json", paper_mode=True, enable_live_trading=False)
     eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 100, "size": 1}]
@@ -491,6 +517,54 @@ def test_orphan_position_without_open_orders_forces_recenter_despite_cooldown(tm
     assert status["recenter_blocked_by_cooldown"] is True
     assert len(eng.open_orders) > 0
     assert all(o["side"] == "sell" for o in eng.open_orders)
+
+def test_daily_loss_flat_cancels_entries_and_does_not_rebuild_grid(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.daily_loss_limit_pct = 0.05
+    cfg.min_order_notional_usd = 1
+    cfg.min_notional_usd = 1
+    cfg.order_notional_usd = 10
+    cfg.max_notional_per_trade_usd = 10
+    cfg.min_order_size = 0
+    cfg.regrid_threshold_pct = 0
+    cfg.min_order_lifetime_seconds = 0
+    eng = make_test_engine(tmp_path, "daily_loss_flat.json", paper_mode=True, enable_live_trading=False, min_order_lifetime_seconds=0)
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 0.1, "created_ts": time.time()}]
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100.0 for _ in range(80)], "high": [101.0 for _ in range(80)], "low": [99.0 for _ in range(80)]})
+
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=-0.06, symbol="BTC", position_notional=0.0)
+
+    assert status["reason"] == "daily_loss_limit_position_management"
+    assert status["allowed_to_trade"] is False
+    assert status["allowed_to_reduce"] is False
+    assert eng.open_orders == []
+
+
+def test_daily_loss_position_places_reduce_only_after_canceling_entries(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.daily_loss_limit_pct = 0.05
+    cfg.min_order_notional_usd = 1
+    cfg.min_notional_usd = 1
+    cfg.order_notional_usd = 10
+    cfg.max_notional_per_trade_usd = 10
+    cfg.min_order_size = 0
+    cfg.regrid_threshold_pct = 0
+    cfg.min_order_lifetime_seconds = 0
+    eng = make_test_engine(tmp_path, "daily_loss_position.json", paper_mode=True, enable_live_trading=False, min_order_lifetime_seconds=0)
+    eng.paper.position_size = 0.5
+    eng.paper.avg_entry = 100.0
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.0, "size": 0.1, "created_ts": time.time()}]
+    orch = StrategyOrchestrator(cfg, eng)
+    candles = pd.DataFrame({"close": [100.0 for _ in range(80)], "high": [101.0 for _ in range(80)], "low": [99.0 for _ in range(80)]})
+
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=-0.06, symbol="BTC", position_notional=50.0)
+
+    assert status["reason"] == "daily_loss_limit_position_management"
+    assert status["allowed_to_reduce"] is True
+    assert status["reduce_only_placed"] > 0
+    assert all(o.get("reduce_only") and o["side"] == "sell" for o in eng.open_orders)
+
 
 def test_trend_with_flat_position_blocks_neutral_grid_generation(tmp_path):
     cfg = BotConfig.from_env()
