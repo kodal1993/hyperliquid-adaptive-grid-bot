@@ -156,6 +156,12 @@ class BotConfig:
     rate_limit_max_cooldown_seconds: float
     rate_limit_orphan_grace_seconds: float
     rate_limit_recovery_window_seconds: float
+    rate_limit_budget_poll_seconds: float
+    rate_limit_headroom_alert: float
+    rate_limit_headroom_frugal: float
+    rate_limit_min_action_interval_seconds: float
+    trend_flip_cooldown_minutes: float
+    paired_tp_post_only: bool
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -326,6 +332,12 @@ class BotConfig:
             rate_limit_max_cooldown_seconds=float(os.getenv("RATE_LIMIT_MAX_COOLDOWN_SECONDS", "900")),
             rate_limit_orphan_grace_seconds=float(os.getenv("RATE_LIMIT_ORPHAN_GRACE_SECONDS", "600")),
             rate_limit_recovery_window_seconds=float(os.getenv("RATE_LIMIT_RECOVERY_WINDOW_SECONDS", "1800")),
+            rate_limit_budget_poll_seconds=float(os.getenv("RATE_LIMIT_BUDGET_POLL_SECONDS", "600")),
+            rate_limit_headroom_alert=float(os.getenv("RATE_LIMIT_HEADROOM_ALERT", "1000")),
+            rate_limit_headroom_frugal=float(os.getenv("RATE_LIMIT_HEADROOM_FRUGAL", "500")),
+            rate_limit_min_action_interval_seconds=float(os.getenv("RATE_LIMIT_MIN_ACTION_INTERVAL_SECONDS", "12")),
+            trend_flip_cooldown_minutes=float(os.getenv("TREND_FLIP_COOLDOWN_MINUTES", "10")),
+            paired_tp_post_only=os.getenv("PAIRED_TP_POST_ONLY", "true").lower() == "true",
         )
         cfg.validate()
         return cfg

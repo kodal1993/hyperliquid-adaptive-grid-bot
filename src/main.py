@@ -268,7 +268,7 @@ def run() -> None:
     client = HyperliquidClient(cfg.private_key, cfg.account_address, cfg.hl_network, use_websocket=cfg.use_websocket, ws_symbol=cfg.default_symbol)
     client.connect()
     logger.info("market_data_source use_websocket=%s ws_active=%s ws_symbol=%s", cfg.use_websocket, client.ws_active, client.ws_symbol)
-    engine = LiveExecutionEngine(client=client, state_file=cfg.state_file, start_balance=0.0, max_position_notional_usd=cfg.max_position_notional_usd, allow_position_flip=cfg.allow_position_flip, max_notional_per_trade_usd=cfg.max_notional_per_trade_usd, min_notional_usd=cfg.min_notional_usd, min_order_notional_usd=cfg.min_order_notional_usd, dust_position_notional_usd=cfg.dust_position_notional_usd, leverage=cfg.base_leverage, min_order_lifetime_seconds=cfg.min_order_lifetime_seconds, min_reprice_distance_pct=cfg.min_reprice_distance_pct, max_order_ops_per_cycle=cfg.max_order_ops_per_cycle, rate_limit_cooldown_seconds=cfg.rate_limit_cooldown_seconds, rate_limit_deficit_cooldown_seconds_per_request=cfg.rate_limit_deficit_cooldown_seconds_per_request, rate_limit_max_cooldown_seconds=cfg.rate_limit_max_cooldown_seconds, rate_limit_orphan_grace_seconds=cfg.rate_limit_orphan_grace_seconds, rate_limit_recovery_window_seconds=cfg.rate_limit_recovery_window_seconds, maker_fee_rate=cfg.maker_fee_rate, taker_fee_rate=cfg.taker_fee_rate, use_alo_orders=cfg.use_alo_orders, paired_take_profit_enabled=cfg.paired_take_profit_enabled, paired_tp_spacing_multiplier=cfg.paired_tp_spacing_multiplier)
+    engine = LiveExecutionEngine(client=client, state_file=cfg.state_file, start_balance=0.0, max_position_notional_usd=cfg.max_position_notional_usd, allow_position_flip=cfg.allow_position_flip, max_notional_per_trade_usd=cfg.max_notional_per_trade_usd, min_notional_usd=cfg.min_notional_usd, min_order_notional_usd=cfg.min_order_notional_usd, dust_position_notional_usd=cfg.dust_position_notional_usd, leverage=cfg.base_leverage, min_order_lifetime_seconds=cfg.min_order_lifetime_seconds, min_reprice_distance_pct=cfg.min_reprice_distance_pct, max_order_ops_per_cycle=cfg.max_order_ops_per_cycle, rate_limit_cooldown_seconds=cfg.rate_limit_cooldown_seconds, rate_limit_deficit_cooldown_seconds_per_request=cfg.rate_limit_deficit_cooldown_seconds_per_request, rate_limit_max_cooldown_seconds=cfg.rate_limit_max_cooldown_seconds, rate_limit_orphan_grace_seconds=cfg.rate_limit_orphan_grace_seconds, rate_limit_recovery_window_seconds=cfg.rate_limit_recovery_window_seconds, rate_limit_budget_poll_seconds=cfg.rate_limit_budget_poll_seconds, rate_limit_headroom_alert=cfg.rate_limit_headroom_alert, rate_limit_headroom_frugal=cfg.rate_limit_headroom_frugal, rate_limit_min_action_interval_seconds=cfg.rate_limit_min_action_interval_seconds, paired_tp_post_only=cfg.paired_tp_post_only, maker_fee_rate=cfg.maker_fee_rate, taker_fee_rate=cfg.taker_fee_rate, use_alo_orders=cfg.use_alo_orders, paired_take_profit_enabled=cfg.paired_take_profit_enabled, paired_tp_spacing_multiplier=cfg.paired_tp_spacing_multiplier)
     logger.info("fee_model maker_fee_rate=%s taker_fee_rate=%s use_alo_orders=%s paired_take_profit_enabled=%s paired_tp_spacing_multiplier=%s", cfg.maker_fee_rate, cfg.taker_fee_rate, cfg.use_alo_orders, cfg.paired_take_profit_enabled, cfg.paired_tp_spacing_multiplier)
     logger.info("execution_mode=live_only")
     client.set_leverage(cfg.default_symbol, cfg.base_leverage)
@@ -281,6 +281,7 @@ def run() -> None:
     daily_start_fees_paid = engine.state.daily_start_fees_paid
 
     last_telegram_report_ts = 0.0
+    last_rate_limit_budget_alert_ts = 0.0
     last_pause_reason = ""
     last_risk_state_value = ""
     last_hard_risk_alert_ts: dict[str, float] = {}
@@ -400,6 +401,17 @@ def run() -> None:
             last_recovery_alert_ts = now_ts
         last_risk_state_value = risk_state
         last_pause_reason = reason
+
+        rate_limit_budget = engine.poll_rate_limit_budget() if hasattr(engine, "poll_rate_limit_budget") else None
+        if rate_limit_budget and rate_limit_budget.get("headroom_alert") and (now_ts - last_rate_limit_budget_alert_ts) >= cfg.telegram_risk_alert_cooldown_seconds:
+            tg.send(
+                "⚠️ Hyperliquid request-keret alacsony\n"
+                f"headroom: {rate_limit_budget.get('headroom', 0):,.0f} request\n"
+                f"used/cap: {rate_limit_budget.get('requests_used', 0):,.0f} / {rate_limit_budget.get('requests_cap', 0):,.0f}\n"
+                f"cum volume: ${rate_limit_budget.get('cum_volume_usd', 0):,.0f}\n"
+                f"frugal mode: {'AKTÍV' if rate_limit_budget.get('budget_frugal') else 'nem'}"
+            )
+            last_rate_limit_budget_alert_ts = now_ts
 
         append_csv("logs/equity_curve.csv", [time.time(), equity, account_state.equity, account_state.realized_pnl, unrealized_pnl, account_state.fees_paid], ["ts", "equity", "cash", "realized_pnl", "unrealized_pnl", "fees_paid"])
 
@@ -758,6 +770,8 @@ def run() -> None:
                 "active_sell_orders": len(sells),
                 "one_sided_grid_due_to_dust": bool(is_dust_position and ((len(buys) == 0) ^ (len(sells) == 0)) and (len(buys) + len(sells) > 0)),
                 "open_orders": len(engine.open_orders),
+                "rate_limit_budget": getattr(engine, "rate_limit_budget", {}) or {},
+                "trade_health_24h": engine.trade_health_metrics() if hasattr(engine, "trade_health_metrics") else {},
             }
         )
         _write_status(status_payload)

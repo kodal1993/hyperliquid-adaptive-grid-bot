@@ -3961,7 +3961,8 @@ def test_live_opening_fill_places_paired_reduce_only_tp(tmp_path):
     assert len(tp_orders) == 1
     assert tp_orders[0]["side"] == "sell"
     assert tp_orders[0]["price"] == pytest.approx(100.5)
-    assert tp_orders[0]["post_only"] is False
+    # TPs prefer post-only to keep the maker rate; Gtc is only the crossing fallback.
+    assert tp_orders[0]["post_only"] is True
 
 
 def test_live_closing_fill_does_not_place_paired_tp(tmp_path):
@@ -4356,6 +4357,146 @@ def test_live_regrid_recovery_mode_expires_after_window(tmp_path):
     assert eng._in_rate_limit_recovery() is False
     eng.last_rate_limit_ts = time.time() - 50
     assert eng._in_rate_limit_recovery() is True
+
+
+def test_live_budget_poll_pre_arms_frugal_mode(tmp_path, caplog):
+    client = _StatefulLiveClient()
+    client.get_user_rate_limit = lambda: {"cumVlm": "5000.0", "nRequestsUsed": "14800", "nRequestsCap": "15000"}
+    eng = _live_engine(tmp_path, client, rate_limit_budget_poll_seconds=600, rate_limit_headroom_alert=1000, rate_limit_headroom_frugal=500)
+
+    budget = eng.poll_rate_limit_budget()
+
+    assert budget is not None
+    assert budget["headroom"] == pytest.approx(200.0)
+    assert budget["headroom_alert"] is True
+    assert budget["budget_frugal"] is True
+    assert eng.rate_limit_budget_frugal is True
+    assert eng._in_rate_limit_recovery() is True
+    assert "rate_limit_budget_frugal_mode_entered" in caplog.text
+    # Polling is throttled to the configured interval.
+    assert eng.poll_rate_limit_budget() is None
+
+
+def test_live_budget_poll_clears_frugal_mode_and_never_raises(tmp_path):
+    client = _StatefulLiveClient()
+    client.get_user_rate_limit = lambda: {"cumVlm": "12000.0", "nRequestsUsed": "15000", "nRequestsCap": "22000"}
+    eng = _live_engine(tmp_path, client, rate_limit_budget_poll_seconds=600)
+    eng.rate_limit_budget_frugal = True
+
+    budget = eng.poll_rate_limit_budget()
+
+    assert budget["headroom"] == pytest.approx(7000.0)
+    assert budget["headroom_alert"] is False
+    assert eng.rate_limit_budget_frugal is False
+    assert eng._in_rate_limit_recovery() is False
+    assert budget["requests_per_usdc"] == pytest.approx(1.25)
+
+    failing = _StatefulLiveClient()
+    failing.get_user_rate_limit = lambda: (_ for _ in ()).throw(RuntimeError("api down"))
+    eng2 = _live_engine(tmp_path, failing, rate_limit_budget_poll_seconds=600)
+    assert eng2.poll_rate_limit_budget() is None
+
+
+def test_live_regrid_recovery_mode_waits_between_exchange_actions(tmp_path):
+    client = _StatefulLiveClient()
+    eng = _live_engine(tmp_path, client, rate_limit_min_action_interval_seconds=12)
+    eng.last_rate_limit_ts = time.time() - 30
+    eng._last_exchange_action_ts = time.time() - 5
+    plan = GridManager().build_grid(100, 2, 0.02, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    result = eng.cancel_replace_grid("BTC", plan)
+
+    assert result["reprice_decision"] == "skip"
+    assert result["reprice_reason"] == "rate_limit_trickle_spacing"
+    assert client.placed == []
+
+    eng._last_exchange_action_ts = time.time() - 20
+    result = eng.cancel_replace_grid("BTC", plan)
+    assert result["placed"] == 1
+
+
+def test_paired_tp_prefers_post_only_then_falls_back_to_gtc(tmp_path):
+    client = _StatefulLiveClient()
+    alo_reject = {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"error": "Post only order would have immediately matched"}]}}}
+    original_place = client.place_limit_order
+
+    def place(symbol, side, size, price, *, reduce_only=False, post_only=False):
+        if post_only:
+            client.placed.append({"side": side, "size": size, "price": price, "reduce_only": reduce_only, "post_only": post_only})
+            return alo_reject
+        return original_place(symbol, side, size, price, reduce_only=reduce_only, post_only=post_only)
+
+    client.place_limit_order = place
+    eng = _live_engine(tmp_path, client, paired_take_profit_enabled=True, paired_tp_post_only=True)
+    eng.last_grid_spacing_pct = 0.01
+    entry = {"symbol": "BTC", "side": "buy", "price": 100.0, "qty": 1.0, "exposure_action": "increasing"}
+
+    submitted = eng._maybe_place_paired_take_profit("BTC", entry, {"dir": "Open Long"})
+
+    assert submitted is True
+    assert len(client.placed) == 2
+    assert client.placed[0]["post_only"] is True
+    assert client.placed[1]["post_only"] is False
+    assert client.placed[1]["reduce_only"] is True
+    assert client.placed[1]["price"] == pytest.approx(101.0)
+
+
+def test_paired_tp_post_only_succeeds_without_fallback(tmp_path):
+    client = _StatefulLiveClient()
+    eng = _live_engine(tmp_path, client, paired_take_profit_enabled=True, paired_tp_post_only=True)
+    eng.last_grid_spacing_pct = 0.01
+    entry = {"symbol": "BTC", "side": "sell", "price": 100.0, "qty": 1.0, "exposure_action": "increasing"}
+
+    submitted = eng._maybe_place_paired_take_profit("BTC", entry, {"dir": "Open Short"})
+
+    assert submitted is True
+    assert len(client.placed) == 1
+    assert client.placed[0]["post_only"] is True
+    assert client.placed[0]["reduce_only"] is True
+    assert client.placed[0]["price"] == pytest.approx(99.0)
+
+
+def test_trade_health_metrics_rolling_window(tmp_path):
+    client = _StatefulLiveClient()
+    eng = _live_engine(tmp_path, client)
+    now = time.time()
+    eng.fill_health_events = [
+        {"ts": now - 60, "is_maker": True, "realized_pnl_delta": 0.03, "fee": 0.002, "notional": 12.0, "closing": False},
+        {"ts": now - 50, "is_maker": True, "realized_pnl_delta": 0.05, "fee": 0.002, "notional": 12.0, "closing": True},
+        {"ts": now - 40, "is_maker": False, "realized_pnl_delta": -0.01, "fee": 0.005, "notional": 12.0, "closing": True},
+        {"ts": now - 90000, "is_maker": False, "realized_pnl_delta": -9.0, "fee": 9.0, "notional": 999.0, "closing": True},
+    ]
+    eng.order_events = [
+        {"ts": now - 30, "event": "submitted", "symbol": "BTC", "side": "buy", "price": 99.0, "size": 0.1, "lifetime_seconds": None},
+        {"ts": now - 20, "event": "cancelled", "symbol": "BTC", "side": "buy", "price": 99.0, "size": 0.1, "lifetime_seconds": 100.0},
+        {"ts": now - 10, "event": "filled", "symbol": "BTC", "side": "buy", "price": 99.0, "size": 0.1, "lifetime_seconds": 50.0},
+    ]
+
+    health = eng.trade_health_metrics()
+
+    assert health["fills_24h"] == 3
+    assert health["maker_share_24h"] == pytest.approx(2 / 3)
+    assert health["net_realized_24h"] == pytest.approx(0.07)
+    assert health["fees_24h"] == pytest.approx(0.009)
+    assert health["roundtrips_24h"] == 2
+    assert health["avg_roundtrip_net_24h"] == pytest.approx(0.02)
+    assert health["order_ops_24h"] == 2
+    assert health["ops_per_fill_24h"] == pytest.approx(2 / 3)
+    assert health["ops_per_usdc_24h"] == pytest.approx(2 / 36.0)
+
+
+def test_trend_flip_cooldown_minutes_floor(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.tick_seconds = 10
+    cfg.trend_flip_cooldown_ticks = 6
+    cfg.trend_flip_cooldown_minutes = 10.0
+    orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "flip_cooldown.json"))
+
+    assert orch.trend_flip_cooldown_ticks == 60
+
+    cfg.trend_flip_cooldown_minutes = 0.0
+    orch2 = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "flip_cooldown2.json"))
+    assert orch2.trend_flip_cooldown_ticks == 6
 
 
 def test_live_regrid_reserves_place_budget_for_cancel_backlogs(tmp_path):
