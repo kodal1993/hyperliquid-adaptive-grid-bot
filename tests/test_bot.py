@@ -1558,7 +1558,7 @@ def test_live_execution_engine_writes_ledger_only_from_exchange_fills(tmp_path):
             return []
 
         def get_user_fills(self, symbol=None):
-            return [{"coin": "BTC", "side": "B", "px": "100000", "sz": "0.0001", "fee": "0.004", "closedPnl": "0", "time": 1760000000000, "tid": 123}]
+            return [{"coin": "BTC", "side": "B", "px": "100000", "sz": "0.0001", "fee": "0.004", "closedPnl": "0", "oid": 12345, "time": 1760000000000, "tid": 123}]
 
     eng = LiveExecutionEngine(
         FakeLiveClient(),
@@ -1568,6 +1568,7 @@ def test_live_execution_engine_writes_ledger_only_from_exchange_fills(tmp_path):
         trade_ledger_jsonl=str(tmp_path / "trades.jsonl"),
         risk_decisions_csv=str(tmp_path / "risk.csv"),
     )
+    eng._bot_order_oids.add(12345)
     fills = eng.sync_user_fills("BTC")
     assert len(fills) == 1
     assert fills[0]["reason"] == "exchange_fill"
@@ -2202,7 +2203,10 @@ class DummyLiveClient:
         return []
 
     def get_user_fills(self, symbol=None):
-        return []
+        fills = list(self.fills)
+        if symbol:
+            return [f for f in fills if str(f.get("coin", "")).upper() == symbol.upper()]
+        return fills
 
     def cancel_all_orders(self, symbol):
         return 0
@@ -3761,6 +3765,7 @@ class _StatefulLiveClient:
         self.orders = list(orders or [])
         self.canceled_oids = []
         self.placed = []
+        self.fills = []
         self.place_response = {"status": "ok"}
 
     def require_live_execution_support(self):
@@ -3776,7 +3781,10 @@ class _StatefulLiveClient:
         return list(self.orders)
 
     def get_user_fills(self, symbol=None):
-        return []
+        fills = list(self.fills)
+        if symbol:
+            return [f for f in fills if str(f.get("coin", "")).upper() == symbol.upper()]
+        return fills
 
     def cancel_order(self, symbol, oid):
         self.canceled_oids.append(int(oid))
@@ -3938,9 +3946,10 @@ def test_bot_config_fee_fields_from_env(monkeypatch, tmp_path):
 def test_live_opening_fill_places_paired_reduce_only_tp(tmp_path):
     client = _StatefulLiveClient()
     eng = _live_engine(tmp_path, client)
+    eng._bot_order_oids.add(101)
     eng.last_grid_spacing_pct = 0.005
     client.get_user_fills = lambda symbol=None: [
-        {"coin": "BTC", "px": "100.0", "sz": "1.0", "side": "B", "dir": "Open Long", "fee": "0.015", "closedPnl": "0", "tid": 1, "time": 1700000000000},
+        {"coin": "BTC", "px": "100.0", "sz": "1.0", "side": "B", "dir": "Open Long", "fee": "0.015", "closedPnl": "0", "oid": 101, "tid": 1, "time": 1700000000000},
     ]
 
     entries = eng.sync_user_fills("BTC")
@@ -3958,8 +3967,9 @@ def test_live_opening_fill_places_paired_reduce_only_tp(tmp_path):
 def test_live_closing_fill_does_not_place_paired_tp(tmp_path):
     client = _StatefulLiveClient()
     eng = _live_engine(tmp_path, client)
+    eng._bot_order_oids.add(102)
     client.get_user_fills = lambda symbol=None: [
-        {"coin": "BTC", "px": "100.5", "sz": "1.0", "side": "A", "dir": "Close Long", "fee": "0.015", "closedPnl": "0.5", "tid": 2, "time": 1700000001000},
+        {"coin": "BTC", "px": "100.5", "sz": "1.0", "side": "A", "dir": "Close Long", "fee": "0.015", "closedPnl": "0.5", "oid": 102, "tid": 2, "time": 1700000001000},
     ]
 
     entries = eng.sync_user_fills("BTC")
@@ -3973,9 +3983,10 @@ def test_live_closing_fill_does_not_place_paired_tp(tmp_path):
 def test_live_paired_tp_short_entry_places_buy_below(tmp_path):
     client = _StatefulLiveClient()
     eng = _live_engine(tmp_path, client)
+    eng._bot_order_oids.add(103)
     eng.last_grid_spacing_pct = 0.004
     client.get_user_fills = lambda symbol=None: [
-        {"coin": "BTC", "px": "100.0", "sz": "1.0", "side": "A", "dir": "Open Short", "fee": "0.015", "closedPnl": "0", "tid": 3, "time": 1700000002000},
+        {"coin": "BTC", "px": "100.0", "sz": "1.0", "side": "A", "dir": "Open Short", "fee": "0.015", "closedPnl": "0", "oid": 103, "tid": 3, "time": 1700000002000},
     ]
 
     eng.sync_user_fills("BTC")
@@ -3989,8 +4000,9 @@ def test_live_paired_tp_short_entry_places_buy_below(tmp_path):
 def test_live_paired_tp_disabled_via_flag(tmp_path):
     client = _StatefulLiveClient()
     eng = _live_engine(tmp_path, client, paired_take_profit_enabled=False)
+    eng._bot_order_oids.add(104)
     client.get_user_fills = lambda symbol=None: [
-        {"coin": "BTC", "px": "100.0", "sz": "1.0", "side": "B", "dir": "Open Long", "fee": "0.015", "closedPnl": "0", "tid": 4, "time": 1700000003000},
+        {"coin": "BTC", "px": "100.0", "sz": "1.0", "side": "B", "dir": "Open Long", "fee": "0.015", "closedPnl": "0", "oid": 104, "tid": 4, "time": 1700000003000},
     ]
 
     eng.sync_user_fills("BTC")
@@ -4250,3 +4262,55 @@ def test_orphan_cleanup_skipped_within_rate_limit_grace_after_cooldown(tmp_path)
 
     assert orch.orphan_order_cleanup_count == 0
     assert status.get("orphan_cleanup_skipped_rate_limit") is True
+
+
+def test_live_manual_fill_is_ignored_for_bot_daily_pnl(tmp_path):
+    client = _StatefulLiveClient()
+    client.fills = [
+        {"coin": "BTC", "side": "A", "px": "95", "sz": "1", "fee": "0.02", "closedPnl": "-25", "oid": 9999, "tid": 1, "time": 1_700_000_000_000}
+    ]
+    eng = _live_engine(tmp_path, client)
+
+    entries = eng.sync_user_fills("BTC")
+
+    assert entries == []
+    assert eng.state.bot_daily_realized_pnl == pytest.approx(0.0)
+    assert eng.state.bot_daily_fees_paid == pytest.approx(0.0)
+    assert eng.state.realized_pnl == pytest.approx(0.0)
+    assert eng.state.bot_position_size == pytest.approx(0.0)
+    assert not (tmp_path / "trades.csv").exists()
+
+
+def test_live_bot_fill_updates_bot_daily_pnl_and_position(tmp_path):
+    client = _StatefulLiveClient()
+    client.place_response = {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 1001}}]}}}
+    eng = _live_engine(tmp_path, client)
+
+    assert eng._submit_live_limit("BTC", "buy", 1.0, 99.0, reduce_only=False)
+    client.fills = [
+        {"coin": "BTC", "side": "B", "px": "99", "sz": "1", "fee": "0.01", "closedPnl": "0", "oid": 1001, "tid": 2, "time": 1_700_000_000_001}
+    ]
+
+    entries = eng.sync_user_fills("BTC")
+
+    assert len(entries) == 1
+    assert entries[0]["is_bot_fill"] is True
+    assert eng.state.bot_daily_realized_pnl == pytest.approx(0.0)
+    assert eng.state.bot_daily_fees_paid == pytest.approx(0.01)
+    assert eng.state.bot_position_size == pytest.approx(1.0)
+    assert (tmp_path / "trades.csv").exists()
+
+
+def test_bot_daily_pnl_metrics_split_account_and_manual_external():
+    from src.main import calculate_bot_daily_pnl_metrics
+
+    metrics = calculate_bot_daily_pnl_metrics(
+        bot_daily_realized_pnl=-10.0,
+        bot_daily_fees_paid=1.0,
+        account_daily_pnl=-50.0,
+        daily_start_equity=1000.0,
+    )
+
+    assert metrics["bot_daily_pnl"] == pytest.approx(-11.0)
+    assert metrics["bot_daily_pnl_pct"] == pytest.approx(-0.011)
+    assert metrics["manual_external_pnl_estimate"] == pytest.approx(-39.0)

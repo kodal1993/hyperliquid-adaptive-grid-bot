@@ -861,13 +861,34 @@ class StrategyOrchestrator:
             }
 
         if hard_risk_block_active:
-            if risk_state.reason == "max_position_notional":
-                canceled = self.execution_engine.cancel_all_orders(symbol) if open_orders else 0
-                flattened = False
+            canceled = self.execution_engine.cancel_all_orders(symbol) if open_orders else 0
+            reduce_only_placed = 0
+            if effective_position_side in {"LONG", "SHORT"}:
                 reduce_only_placed = self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, self._calculate_order_size(price))
-                logger.warning("reduce_only_requested symbol=%s reason=%s canceled=%s reduce_only_placed=%s", symbol, risk_state.reason, canceled, reduce_only_placed)
-                return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled, "reduce_only_placed": reduce_only_placed, "flattened": flattened, "state_source": account_state.state_source, **dust_context, **market_stress_context}
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": False, "allowed_to_trade": False, "allowed_to_reduce": False, **dust_context, **market_stress_context}
+            logger.warning(
+                "hard_risk_reduce_only_allowed symbol=%s reason=%s position_side=%s canceled=%s reduce_only_placed=%s",
+                symbol,
+                risk_state.reason or ("risk_off" if regime == MarketRegime.RISK_OFF else "unknown"),
+                effective_position_side,
+                canceled,
+                reduce_only_placed,
+            )
+            return {
+                "status": "paused",
+                "regime": regime.value,
+                "risk": risk_state,
+                "mode": mode.value,
+                "reduce_only": effective_position_side in {"LONG", "SHORT"},
+                "reason": "reduce_only_requested" if effective_position_side in {"LONG", "SHORT"} else (risk_state.reason or "risk_off"),
+                "allowed_to_trade": False,
+                "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"},
+                "canceled_orders": canceled,
+                "reduce_only_placed": reduce_only_placed,
+                "position_management_action": "reduce_only_grid" if effective_position_side in {"LONG", "SHORT"} else "none",
+                "state_source": account_state.state_source,
+                **dust_context,
+                **market_stress_context,
+            }
 
         forced_rebuild = bool(orphan_position_no_orders or flat_without_orders or cleanup_requested)
         rebuild_reason = "stale_cleanup" if stale_order_detected else ("orphan_cleanup" if orphan_order_detected else ("orphan_position_no_orders" if orphan_position_no_orders else ("flat_without_orders" if flat_without_orders else ("stale_recenter" if stale_recenter_requested else ("no_fill_recenter" if no_fill_recenter_requested else "none")))))
