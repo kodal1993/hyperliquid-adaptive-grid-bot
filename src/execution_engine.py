@@ -872,6 +872,8 @@ class LiveExecutionEngine:
         self.rate_limit_max_cooldown_seconds = max(float(kwargs.pop("rate_limit_max_cooldown_seconds", 900.0)), self.rate_limit_cooldown_seconds)
         self.rate_limit_orphan_grace_seconds = max(float(kwargs.pop("rate_limit_orphan_grace_seconds", 600.0)), 0.0)
         self.rate_limit_recovery_window_seconds = max(float(kwargs.pop("rate_limit_recovery_window_seconds", 1800.0)), 0.0)
+        self.rate_limit_recovery_min_order_lifetime_seconds = max(float(kwargs.pop("rate_limit_recovery_min_order_lifetime_seconds", 600.0)), 0.0)
+        self.rate_limit_recovery_min_reprice_distance_pct = max(float(kwargs.pop("rate_limit_recovery_min_reprice_distance_pct", 0.005)), 0.0)
         self.rate_limit_budget_poll_seconds = max(float(kwargs.pop("rate_limit_budget_poll_seconds", 600.0)), 0.0)
         self.rate_limit_headroom_alert = max(float(kwargs.pop("rate_limit_headroom_alert", 1000.0)), 0.0)
         self.rate_limit_headroom_frugal = max(float(kwargs.pop("rate_limit_headroom_frugal", 500.0)), 0.0)
@@ -930,8 +932,18 @@ class LiveExecutionEngine:
         if not active:
             return True, "no_existing_orders"
         now = time.time()
+        min_lifetime = float(self.min_order_lifetime_seconds)
+        min_distance = self.min_reprice_distance_pct
+        if self._in_rate_limit_recovery(now):
+            # While the request deficit is being repaid, chasing the price is
+            # pure budget burn: every cancel+replace costs 2 requests and earns
+            # nothing (observed live as a slow bleed with zero fills). Hold the
+            # resting orders much longer and only reprice on a move bigger than
+            # a full grid spacing.
+            min_lifetime = max(min_lifetime, self.rate_limit_recovery_min_order_lifetime_seconds)
+            min_distance = max(min_distance, self.rate_limit_recovery_min_reprice_distance_pct, float(plan.spacing_pct or 0.0))
         ages = [now - float(o.get("created_ts") or now) for o in active]
-        if ages and min(ages) < self.min_order_lifetime_seconds:
+        if ages and min(ages) < min_lifetime:
             return False, "min_order_lifetime"
         new_by_side = {"buy": sorted([x.price for x in plan.long_levels], reverse=True), "sell": sorted([x.price for x in plan.short_levels])}
         old_by_side = {"buy": sorted([float(o.get("price", 0.0) or 0.0) for o in active if str(o.get("side", "")).lower() == "buy"], reverse=True), "sell": sorted([float(o.get("price", 0.0) or 0.0) for o in active if str(o.get("side", "")).lower() == "sell"])}
@@ -940,8 +952,8 @@ class LiveExecutionEngine:
             for old_px, new_px in zip(old_by_side[side], new_by_side[side]):
                 deltas.append(abs(float(new_px) - old_px) / max(old_px, 1e-9))
             if len(old_by_side[side]) != len(new_by_side[side]):
-                deltas.append(self.min_reprice_distance_pct)
-        if (max(deltas) if deltas else self.min_reprice_distance_pct) < self.min_reprice_distance_pct:
+                deltas.append(min_distance)
+        if (max(deltas) if deltas else min_distance) < min_distance:
             return False, "min_reprice_distance"
         return True, "reprice_threshold_met"
 
@@ -1174,10 +1186,6 @@ class LiveExecutionEngine:
             self.last_grid_spacing_pct = float(plan.spacing_pct)
         if not plan.should_regrid:
             return {"canceled": 0, "placed": 0, "symbol": symbol, "reprice_decision": "skip", "reprice_reason": "regrid_not_required"}
-        can_replace, reprice_reason = self._can_replace_grid_now(symbol, plan)
-        if not can_replace:
-            logger.info("reprice_decision decision=skip reprice_reason=%s min_order_lifetime_seconds=%s min_reprice_distance_pct=%s", reprice_reason, self.min_order_lifetime_seconds, self.min_reprice_distance_pct)
-            return {"canceled": 0, "placed": 0, "symbol": symbol, "reprice_decision": "skip", "reprice_reason": reprice_reason}
         if time.time() < self.rate_limited_until:
             # Canceling here would be one-way: the replacement placement is
             # going to be rejected anyway, so the regrid would only shrink the
@@ -1191,6 +1199,14 @@ class LiveExecutionEngine:
         active = [o for o in self.open_orders if str(o.get("symbol", symbol)).upper() == symbol.upper() and not bool(o.get("reduce_only", False))]
         desired = [{"side": o.side, "price": o.price, "size": o.size} for o in plan.long_levels + plan.short_levels]
         kept, to_cancel, to_place = _diff_grid_orders(active, desired, self.min_reprice_distance_pct)
+        can_replace, reprice_reason = self._can_replace_grid_now(symbol, plan)
+        if not can_replace:
+            if to_cancel:
+                logger.info("reprice_decision decision=skip reprice_reason=%s min_order_lifetime_seconds=%s min_reprice_distance_pct=%s", reprice_reason, self.min_order_lifetime_seconds, self.min_reprice_distance_pct)
+                return {"canceled": 0, "placed": 0, "kept": len(kept), "symbol": symbol, "reprice_decision": "skip", "reprice_reason": reprice_reason}
+            # The anti-churn gates only guard resting orders from being
+            # canceled; filling in missing levels is always allowed.
+            reprice_reason = "missing_levels_fill_in"
         now_ts = time.time()
         # Place the levels most likely to fill first; when the op budget cuts
         # the list short, the surviving orders should be the closest to mid.

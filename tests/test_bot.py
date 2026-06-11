@@ -4362,7 +4362,7 @@ def test_live_regrid_recovery_mode_places_before_cancels(tmp_path):
     client = _StatefulLiveClient(orders=[
         {"coin": "BTC", "side": "B", "limitPx": "90.0", "sz": "1.0", "oid": 1},
     ])
-    eng = _live_engine(tmp_path, client, max_order_ops_per_cycle=2)
+    eng = _live_engine(tmp_path, client, max_order_ops_per_cycle=2, rate_limit_recovery_min_order_lifetime_seconds=0)
     eng.last_rate_limit_ts = time.time() - 30
     plan = GridManager().build_grid(100, 2, 0.02, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
 
@@ -4385,7 +4385,7 @@ def test_live_regrid_recovery_mode_cancels_only_when_nothing_to_place(tmp_path):
         {"coin": "BTC", "side": "A", "limitPx": "104.0", "sz": "1.0", "oid": 4},
         {"coin": "BTC", "side": "B", "limitPx": "90.0", "sz": "1.0", "oid": 5},
     ])
-    eng = _live_engine(tmp_path, client, max_order_ops_per_cycle=2)
+    eng = _live_engine(tmp_path, client, max_order_ops_per_cycle=2, rate_limit_recovery_min_order_lifetime_seconds=0)
     eng.last_rate_limit_ts = time.time() - 30
     plan = GridManager().build_grid(100, 2, 0.02, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
 
@@ -4398,13 +4398,16 @@ def test_live_regrid_recovery_mode_cancels_only_when_nothing_to_place(tmp_path):
 
 
 def test_live_regrid_recovery_mode_does_not_grow_book_past_desired_levels(tmp_path):
+    # Price drift beyond even the recovery reprice threshold, so the gate
+    # allows a regrid; the accumulation guard must still spend the single op
+    # on a cancel instead of growing the book past the desired level count.
     client = _StatefulLiveClient(orders=[
-        {"coin": "BTC", "side": "B", "limitPx": "97.5", "sz": "1.0", "oid": 1},
-        {"coin": "BTC", "side": "B", "limitPx": "95.5", "sz": "1.0", "oid": 2},
-        {"coin": "BTC", "side": "A", "limitPx": "102.5", "sz": "1.0", "oid": 3},
-        {"coin": "BTC", "side": "A", "limitPx": "104.5", "sz": "1.0", "oid": 4},
+        {"coin": "BTC", "side": "B", "limitPx": "95.0", "sz": "1.0", "oid": 1},
+        {"coin": "BTC", "side": "B", "limitPx": "93.0", "sz": "1.0", "oid": 2},
+        {"coin": "BTC", "side": "A", "limitPx": "105.0", "sz": "1.0", "oid": 3},
+        {"coin": "BTC", "side": "A", "limitPx": "107.0", "sz": "1.0", "oid": 4},
     ])
-    eng = _live_engine(tmp_path, client, max_order_ops_per_cycle=2)
+    eng = _live_engine(tmp_path, client, max_order_ops_per_cycle=2, rate_limit_recovery_min_order_lifetime_seconds=0)
     eng.last_rate_limit_ts = time.time() - 30
     plan = GridManager().build_grid(100, 2, 0.02, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
 
@@ -4413,6 +4416,60 @@ def test_live_regrid_recovery_mode_does_not_grow_book_past_desired_levels(tmp_pa
     assert result["rate_limit_recovery_mode"] is True
     assert result["placed"] == 0
     assert result["canceled"] == 1
+
+
+def test_live_recovery_mode_does_not_chase_price(tmp_path):
+    # An order that satisfies the normal anti-churn gates (aged past 90s,
+    # price moved > 0.15%) must still be held while the request deficit is
+    # being repaid: chasing costs 2 requests per move and earns nothing.
+    client = _StatefulLiveClient(orders=[
+        {"coin": "BTC", "side": "B", "limitPx": "99.4", "sz": "1.0", "oid": 1, "timestamp": (time.time() - 120) * 1000},
+    ])
+    eng = _live_engine(tmp_path, client, min_order_lifetime_seconds=90)
+    eng.last_rate_limit_ts = time.time() - 30
+    plan = GridManager().build_grid(100, 1, 0.003, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    result = eng.cancel_replace_grid("BTC", plan)
+
+    assert result["reprice_decision"] == "skip"
+    assert result["reprice_reason"] == "min_order_lifetime"
+    assert client.canceled_oids == []
+    assert any(int(o["oid"]) == 1 for o in client.orders)
+
+
+def test_live_recovery_mode_reprices_after_recovery_thresholds(tmp_path):
+    client = _StatefulLiveClient(orders=[
+        {"coin": "BTC", "side": "B", "limitPx": "99.0", "sz": "1.0", "oid": 1, "timestamp": (time.time() - 700) * 1000},
+    ])
+    eng = _live_engine(tmp_path, client, min_order_lifetime_seconds=90)
+    eng.last_rate_limit_ts = time.time() - 30
+    # Mid moved far: desired buy is ~0.7% above the resting one.
+    plan = GridManager().build_grid(100.7, 1, 0.003, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    result = eng.cancel_replace_grid("BTC", plan)
+
+    # Recovery still places before canceling; the stale order is no longer frozen.
+    assert result["reprice_decision"] == "replace"
+    assert result["placed"] == 1
+
+
+def test_live_recovery_missing_levels_bypass_lifetime_gate(tmp_path):
+    client = _StatefulLiveClient(orders=[
+        {"coin": "BTC", "side": "B", "limitPx": "98.0", "sz": "1.0", "oid": 1, "timestamp": (time.time() - 120) * 1000},
+    ])
+    eng = _live_engine(tmp_path, client, min_order_lifetime_seconds=90)
+    eng.last_rate_limit_ts = time.time() - 30
+    plan = GridManager().build_grid(100, 1, 0.02, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    result = eng.cancel_replace_grid("BTC", plan)
+
+    # The buy at 98 is kept; the young-order gate must not block adding the
+    # missing sell level.
+    assert result["reprice_reason"] == "missing_levels_fill_in"
+    assert result["canceled"] == 0
+    assert result["placed"] == 1
+    assert client.placed[0]["side"] == "sell"
+    assert client.canceled_oids == []
 
 
 def test_live_regrid_recovery_mode_expires_after_window(tmp_path):

@@ -161,6 +161,8 @@ class BotConfig:
     rate_limit_headroom_alert: float
     rate_limit_headroom_frugal: float
     rate_limit_min_action_interval_seconds: float
+    rate_limit_recovery_min_order_lifetime_seconds: float
+    rate_limit_recovery_min_reprice_distance_pct: float
     trend_flip_cooldown_minutes: float
     paired_tp_post_only: bool
 
@@ -338,6 +340,8 @@ class BotConfig:
             rate_limit_headroom_alert=float(os.getenv("RATE_LIMIT_HEADROOM_ALERT", "1000")),
             rate_limit_headroom_frugal=float(os.getenv("RATE_LIMIT_HEADROOM_FRUGAL", "500")),
             rate_limit_min_action_interval_seconds=float(os.getenv("RATE_LIMIT_MIN_ACTION_INTERVAL_SECONDS", "12")),
+            rate_limit_recovery_min_order_lifetime_seconds=float(os.getenv("RATE_LIMIT_RECOVERY_MIN_ORDER_LIFETIME_SECONDS", "600")),
+            rate_limit_recovery_min_reprice_distance_pct=float(os.getenv("RATE_LIMIT_RECOVERY_MIN_REPRICE_DISTANCE_PCT", "0.005")),
             trend_flip_cooldown_minutes=float(os.getenv("TREND_FLIP_COOLDOWN_MINUTES", "10")),
             paired_tp_post_only=os.getenv("PAIRED_TP_POST_ONLY", "true").lower() == "true",
         )
