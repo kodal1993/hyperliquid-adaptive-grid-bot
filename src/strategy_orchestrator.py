@@ -594,7 +594,12 @@ class StrategyOrchestrator:
             }
 
         attempted_side = "both" if (allow_buys and allow_sells) else ("buy" if allow_buys else ("sell" if allow_sells else "none"))
-        would_increase_exposure = (effective_position_side == "LONG" and attempted_side in {"buy", "both"}) or (effective_position_side == "SHORT" and attempted_side in {"sell", "both"})
+        would_increase_exposure = (
+            (effective_position_side == "FLAT" and attempted_side != "none")
+            or (effective_position_side == "LONG" and attempted_side in {"buy", "both"})
+            or (effective_position_side == "SHORT" and attempted_side in {"sell", "both"})
+        )
+        daily_loss_limit_active = daily_pnl_pct <= -self.config.daily_loss_limit_pct
 
         liquidation_distance_pct = 0.5
         one_direction_exposure_pct = 0.0 if equity <= 0 else effective_position_notional / equity
@@ -626,15 +631,6 @@ class StrategyOrchestrator:
             reduce_only_placed = self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, order_size)
             logger.warning("reduce_only_requested symbol=%s reason=max_position_notional canceled=%s reduce_only_placed=%s", symbol, canceled, reduce_only_placed)
             return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled, "reduce_only_placed": reduce_only_placed, "flattened": flattened, "state_source": account_state.state_source, **dust_context, **market_stress_context}
-
-        if not risk_state.can_trade or regime == MarketRegime.RISK_OFF:
-            if risk_state.reason == "max_position_notional":
-                canceled = self.execution_engine.cancel_all_orders(symbol)
-                flattened = False
-                reduce_only_placed = self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, self._calculate_order_size(price))
-                logger.warning("reduce_only_requested symbol=%s reason=%s canceled=%s reduce_only_placed=%s", symbol, risk_state.reason, canceled, reduce_only_placed)
-                return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled, "reduce_only_placed": reduce_only_placed, "flattened": flattened, "state_source": account_state.state_source, **dust_context, **market_stress_context}
-            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": False, **dust_context, **market_stress_context}
 
         if market_stress.opportunity_mode in {OpportunityMode.NO_NEW_EXPOSURE, OpportunityMode.REDUCE_ONLY} and effective_position_side == "FLAT":
             canceled = self.execution_engine.cancel_all_orders(symbol)
@@ -829,6 +825,50 @@ class StrategyOrchestrator:
             open_orders = []
             buy_order_count = 0
             sell_order_count = 0
+
+        hard_risk_block_active = (not risk_state.can_trade) or regime == MarketRegime.RISK_OFF
+        daily_loss_position_management_active = daily_loss_limit_active or risk_state.reason in {"daily_loss", "daily_loss_limit"}
+        if daily_loss_position_management_active:
+            canceled = self.execution_engine.cancel_all_orders(symbol) if open_orders else 0
+            reduce_only_placed = 0
+            if effective_position_side in {"LONG", "SHORT"}:
+                reduce_only_placed = self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, self._calculate_order_size(price))
+            logger.warning(
+                "daily_loss_limit_position_management symbol=%s position_side=%s position_notional=%.4f canceled=%s reduce_only_placed=%s daily_pnl_pct=%.6f limit=%.6f",
+                symbol,
+                effective_position_side,
+                effective_position_notional,
+                canceled,
+                reduce_only_placed,
+                daily_pnl_pct,
+                self.config.daily_loss_limit_pct,
+            )
+            return {
+                "status": "paused",
+                "regime": regime.value,
+                "risk": risk_state,
+                "mode": mode.value,
+                "reduce_only": effective_position_side in {"LONG", "SHORT"},
+                "reason": "daily_loss_limit_position_management",
+                "allowed_to_trade": False,
+                "allowed_to_reduce": effective_position_side in {"LONG", "SHORT"},
+                "canceled_orders": canceled,
+                "reduce_only_placed": reduce_only_placed,
+                "position_management_action": "reduce_only_grid" if effective_position_side in {"LONG", "SHORT"} else "cancel_entries",
+                "state_source": account_state.state_source,
+                **dust_context,
+                **market_stress_context,
+            }
+
+        if hard_risk_block_active:
+            if risk_state.reason == "max_position_notional":
+                canceled = self.execution_engine.cancel_all_orders(symbol) if open_orders else 0
+                flattened = False
+                reduce_only_placed = self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, self._calculate_order_size(price))
+                logger.warning("reduce_only_requested symbol=%s reason=%s canceled=%s reduce_only_placed=%s", symbol, risk_state.reason, canceled, reduce_only_placed)
+                return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": True, "reason": "reduce_only_requested", "canceled_orders": canceled, "reduce_only_placed": reduce_only_placed, "flattened": flattened, "state_source": account_state.state_source, **dust_context, **market_stress_context}
+            return {"status": "paused", "regime": regime.value, "risk": risk_state, "reduce_only": False, "allowed_to_trade": False, "allowed_to_reduce": False, **dust_context, **market_stress_context}
+
         forced_rebuild = bool(orphan_position_no_orders or flat_without_orders or cleanup_requested)
         rebuild_reason = "stale_cleanup" if stale_order_detected else ("orphan_cleanup" if orphan_order_detected else ("orphan_position_no_orders" if orphan_position_no_orders else ("flat_without_orders" if flat_without_orders else ("stale_recenter" if stale_recenter_requested else ("no_fill_recenter" if no_fill_recenter_requested else "none")))))
         force_recenter = (recenter_requested and not recenter_blocked_by_cooldown) or forced_rebuild
