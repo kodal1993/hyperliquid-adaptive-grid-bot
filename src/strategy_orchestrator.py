@@ -58,6 +58,13 @@ class StrategyOrchestrator:
         self.pending_regime_count = 0
         self.trend_flip_cooldown_remaining = 0
         self.trend_flip_cooldown_ticks = max(int(getattr(config, "trend_flip_cooldown_ticks", 6)), 0)
+        # Tick-based cooldowns shrink with the tick rate (6 ticks @ 10s = 60s),
+        # which let regime flips churn minutes apart in choppy trends; the
+        # minute-based floor makes the cooldown timer-real regardless of tick.
+        flip_cooldown_minutes = max(float(getattr(config, "trend_flip_cooldown_minutes", 0.0) or 0.0), 0.0)
+        if flip_cooldown_minutes > 0:
+            tick_seconds = max(int(getattr(config, "tick_seconds", 10)), 1)
+            self.trend_flip_cooldown_ticks = max(self.trend_flip_cooldown_ticks, int(flip_cooldown_minutes * 60 / tick_seconds))
         self.wrong_way_exit_loss_pct = 0.0035
         self.adverse_move_exit_pct = max(float(getattr(config, "adverse_move_exit_pct", 0.0045)), 0.0)
         self.orphan_order_cleanup_count = 0

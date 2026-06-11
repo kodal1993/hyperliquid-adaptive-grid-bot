@@ -1,5 +1,13 @@
 # Changelog
 
+## Proactive budget watch, flip-churn brake, maker TPs, health telemetry
+
+- **Proactive request-budget monitoring**: the live engine polls the public `userRateLimit` endpoint every `RATE_LIMIT_BUDGET_POLL_SECONDS` (600s) and exposes cumulative volume, requests used/cap, headroom and requests-per-USDC. Below `RATE_LIMIT_HEADROOM_ALERT` (1000) a Telegram alert fires (risk-alert cooldown applies); below `RATE_LIMIT_HEADROOM_FRUGAL` (500) the engine pre-arms the frugal recovery regrid *before* the exchange ever rejects a request. The June deficit was visible in these numbers weeks in advance.
+- **Time-based trend-flip cooldown**: `TREND_FLIP_COOLDOWN_MINUTES` (10) now floors the tick-based cooldown (6 ticks @ 10s was only 60s), stopping the loss-making `Long > Short` / `Short > Long` flip churn observed live minutes apart on June 4–5.
+- **Paired TPs prefer post-only**: take-profits are submitted as `Alo` first to keep the 0.015% maker rate, and only fall back to crossing `Gtc` when the price already moved past the level (`PAIRED_TP_POST_ONLY=true`). Live maker share had eroded from 100% to ~65–70% via taker closes at 3x the fee.
+- **24h health telemetry**: status payload and the Telegram report now carry `trade_health_24h` (fills, maker share, net realized PnL, fees, avg roundtrip net, order ops per fill, ops per traded USDC) plus the polled `rate_limit_budget`, so degradation is visible from the phone instead of post-hoc CSV analysis.
+- **Trickle action spacing**: while in rate-limit recovery/frugal mode, order operations keep `RATE_LIMIT_MIN_ACTION_INTERVAL_SECONDS` (12s) between exchange actions so a borderline-timed action cannot get rejected and re-arm the cooldown.
+
 ## Rate-limit recovery mode: placements before cancels
 
 - Fixed the trickle-budget deadlock that left the bot with no resting orders (and therefore no fills) while the address carries a Hyperliquid cumulative-request deficit. In that state the exchange accepts roughly one action per 10 seconds, but the regrid spent its op budget cancel-first: the accepted slot went to a cancel, the replacement placement was rejected, and the rejection re-armed a 120–900s freeze — every cycle removed an order and placed none, so the grid bled to zero and no volume was ever traded to repay the deficit.

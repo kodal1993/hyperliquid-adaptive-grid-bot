@@ -872,12 +872,23 @@ class LiveExecutionEngine:
         self.rate_limit_max_cooldown_seconds = max(float(kwargs.pop("rate_limit_max_cooldown_seconds", 900.0)), self.rate_limit_cooldown_seconds)
         self.rate_limit_orphan_grace_seconds = max(float(kwargs.pop("rate_limit_orphan_grace_seconds", 600.0)), 0.0)
         self.rate_limit_recovery_window_seconds = max(float(kwargs.pop("rate_limit_recovery_window_seconds", 1800.0)), 0.0)
+        self.rate_limit_budget_poll_seconds = max(float(kwargs.pop("rate_limit_budget_poll_seconds", 600.0)), 0.0)
+        self.rate_limit_headroom_alert = max(float(kwargs.pop("rate_limit_headroom_alert", 1000.0)), 0.0)
+        self.rate_limit_headroom_frugal = max(float(kwargs.pop("rate_limit_headroom_frugal", 500.0)), 0.0)
+        self.rate_limit_min_action_interval_seconds = max(float(kwargs.pop("rate_limit_min_action_interval_seconds", 12.0)), 0.0)
+        self.paired_tp_post_only = bool(kwargs.pop("paired_tp_post_only", True))
         self.max_order_ops_per_cycle = max(int(kwargs.pop("max_order_ops_per_cycle", 2)), 1)
         self.rate_limited_until = 0.0
         self.last_rate_limit_ts = 0.0
         self.last_request_deficit = 0.0
         self.rate_limit_trigger_count = 0
         self.rate_limited_skip_count = 0
+        self.rate_limit_budget: dict = {}
+        self.rate_limit_budget_frugal = False
+        self._last_budget_poll_ts = 0.0
+        self._last_exchange_action_ts = 0.0
+        self.last_submit_error_kind: str | None = None
+        self.fill_health_events: list[dict] = []
         self._seen_fill_ids: set[str] = set()
         self._bot_order_oids: set[int] = set()
         self._load_live_seen_fills()
@@ -940,12 +951,98 @@ class LiveExecutionEngine:
         The deficit only shrinks with traded volume, so it outlives the
         rejection cooldown by a wide margin; the recovery window keeps order
         operations frugal (one per cycle, placements first) after the last
-        observed rate-limit rejection.
+        observed rate-limit rejection. The polled budget can also pre-arm
+        frugal mode before the exchange ever rejects anything.
         """
+        if self.rate_limit_budget_frugal:
+            return True
         if self.last_rate_limit_ts <= 0 or self.rate_limit_recovery_window_seconds <= 0:
             return False
         now = time.time() if now_ts is None else now_ts
         return (now - self.last_rate_limit_ts) <= self.rate_limit_recovery_window_seconds
+
+    def poll_rate_limit_budget(self, now_ts: float | None = None) -> dict | None:
+        """Periodically fetch the address request budget and pre-arm frugal mode.
+
+        Returns the refreshed budget dict on a successful poll, None when the
+        poll is throttled or fails. Never raises: budget telemetry must not
+        break the trading tick.
+        """
+        now = time.time() if now_ts is None else now_ts
+        if self.rate_limit_budget_poll_seconds <= 0:
+            return None
+        if now - self._last_budget_poll_ts < self.rate_limit_budget_poll_seconds:
+            return None
+        self._last_budget_poll_ts = now
+        try:
+            raw = self.client.get_user_rate_limit()
+        except Exception as exc:
+            logger.warning("rate_limit_budget_poll_failed error=%s", exc)
+            return None
+        if not isinstance(raw, dict) or not raw:
+            return None
+        cum_volume = float(raw.get("cumVlm", 0.0) or 0.0)
+        used = float(raw.get("nRequestsUsed", 0.0) or 0.0)
+        cap = float(raw.get("nRequestsCap", 0.0) or 0.0)
+        headroom = cap - used
+        was_frugal = self.rate_limit_budget_frugal
+        self.rate_limit_budget_frugal = headroom < self.rate_limit_headroom_frugal
+        self.rate_limit_budget = {
+            "cum_volume_usd": cum_volume,
+            "requests_used": used,
+            "requests_cap": cap,
+            "headroom": headroom,
+            "requests_per_usdc": (used / cum_volume) if cum_volume > 0 else None,
+            "headroom_alert": headroom < self.rate_limit_headroom_alert,
+            "budget_frugal": self.rate_limit_budget_frugal,
+            "checked_ts": now,
+        }
+        logger.info(
+            "rate_limit_budget headroom=%.0f requests_used=%.0f requests_cap=%.0f cum_volume_usd=%.2f requests_per_usdc=%s budget_frugal=%s",
+            headroom, used, cap, cum_volume,
+            f"{used / cum_volume:.2f}" if cum_volume > 0 else "n/a",
+            self.rate_limit_budget_frugal,
+        )
+        if self.rate_limit_budget_frugal and not was_frugal:
+            logger.warning("rate_limit_budget_frugal_mode_entered headroom=%.0f threshold=%.0f", headroom, self.rate_limit_headroom_frugal)
+        elif was_frugal and not self.rate_limit_budget_frugal:
+            logger.info("rate_limit_budget_frugal_mode_exited headroom=%.0f threshold=%.0f", headroom, self.rate_limit_headroom_frugal)
+        return self.rate_limit_budget
+
+    def _record_fill_health(self, entry: dict) -> None:
+        self.fill_health_events.append({
+            "ts": time.time(),
+            "is_maker": bool(entry.get("is_maker_fill", False)),
+            "realized_pnl_delta": float(entry.get("realized_pnl_delta", 0.0) or 0.0),
+            "fee": float(entry.get("fee", 0.0) or 0.0),
+            "notional": float(entry.get("notional", 0.0) or 0.0),
+            "closing": str(entry.get("exposure_action", "")) in {"decreasing", "flat", "flipping"},
+        })
+        cutoff = time.time() - 24 * 3600
+        self.fill_health_events = [e for e in self.fill_health_events if float(e.get("ts", 0.0) or 0.0) >= cutoff]
+
+    def trade_health_metrics(self) -> dict:
+        """Rolling 24h health snapshot: edge per roundtrip, maker share, op frugality."""
+        now = time.time()
+        cutoff = now - 24 * 3600
+        fills = [e for e in self.fill_health_events if float(e.get("ts", 0.0) or 0.0) >= cutoff]
+        events = [e for e in self.order_events if now - float(e.get("ts", 0.0) or 0.0) <= 86400]
+        ops = sum(1 for e in events if e.get("event") in {"submitted", "cancelled"})
+        fills_n = len(fills)
+        closing = [e for e in fills if e.get("closing")]
+        volume = sum(float(e.get("notional", 0.0) or 0.0) for e in fills)
+        return {
+            "fills_24h": fills_n,
+            "maker_share_24h": (sum(1 for e in fills if e.get("is_maker")) / fills_n) if fills_n else None,
+            "net_realized_24h": sum(float(e.get("realized_pnl_delta", 0.0) or 0.0) for e in fills),
+            "fees_24h": sum(float(e.get("fee", 0.0) or 0.0) for e in fills),
+            "volume_24h": volume,
+            "roundtrips_24h": len(closing),
+            "avg_roundtrip_net_24h": (sum(float(e.get("realized_pnl_delta", 0.0) or 0.0) for e in closing) / len(closing)) if closing else None,
+            "order_ops_24h": ops,
+            "ops_per_fill_24h": (ops / fills_n) if fills_n else None,
+            "ops_per_usdc_24h": (ops / volume) if volume > 0 else None,
+        }
 
     def _require_paper_execution(self, action: str) -> None:
         raise RuntimeError(f"live_execution_forbids_paper_simulation: {action} cannot run in LIVE mode")
@@ -1101,6 +1198,16 @@ class LiveExecutionEngine:
         if plan_center > 0:
             to_place = sorted(to_place, key=lambda lvl: abs(float(lvl.get("price", 0.0) or 0.0) - plan_center))
         in_recovery = self._in_rate_limit_recovery(now_ts)
+        if in_recovery and (now_ts - self._last_exchange_action_ts) < self.rate_limit_min_action_interval_seconds:
+            # The over-limit trickle accepts ~1 action per 10s; keep a safety
+            # margin so a borderline-timed action does not get rejected and
+            # re-arm the cooldown.
+            logger.info(
+                "reprice_decision decision=skip reprice_reason=rate_limit_trickle_spacing seconds_since_last_action=%.1f min_action_interval=%.1f",
+                now_ts - self._last_exchange_action_ts,
+                self.rate_limit_min_action_interval_seconds,
+            )
+            return {"canceled": 0, "placed": 0, "kept": len(kept), "symbol": symbol, "reprice_decision": "skip", "reprice_reason": "rate_limit_trickle_spacing", "rate_limit_recovery_mode": True}
         if in_recovery:
             # The address is repaying a cumulative-request deficit, so the
             # exchange accepts roughly one action per 10s. Only traded volume
@@ -1128,6 +1235,7 @@ class LiveExecutionEngine:
             oid = old.get("oid")
             if oid is None:
                 continue
+            self._last_exchange_action_ts = time.time()
             try:
                 self.client.cancel_order(symbol, int(oid))
             except Exception as exc:
@@ -1164,6 +1272,7 @@ class LiveExecutionEngine:
         return {"canceled": canceled, "placed": placed, "kept": len(kept), "symbol": symbol, "reprice_decision": "replace", "reprice_reason": reprice_reason, "skipped_cancels": skipped_cancels, "skipped_places": skipped_places, "order_op_budget_exhausted": budget_exhausted, "rate_limit_recovery_mode": in_recovery}
 
     def cancel_all_orders(self, symbol: str) -> int:
+        self._last_exchange_action_ts = time.time()
         canceled = self.client.cancel_all_orders(symbol)
         self.sync_open_orders(symbol)
         return canceled
@@ -1288,6 +1397,7 @@ class LiveExecutionEngine:
             entry["bot_daily_realized_pnl"] = self.state.bot_daily_realized_pnl
             entry["bot_daily_fees_paid"] = self.state.bot_daily_fees_paid
             self._record_order_event("filled", symbol=str(entry.get("symbol", symbol or "")), side=str(entry.get("side", "")), price=float(entry.get("price", 0.0) or 0.0), size=float(entry.get("qty", 0.0) or 0.0))
+            self._record_fill_health(entry)
             entry["paired_tp_placed"] = self._maybe_place_paired_take_profit(str(entry.get("symbol") or symbol or ""), entry, raw)
             self.trade_log.append(entry)
             self._append_trade_ledger(entry)
@@ -1347,7 +1457,8 @@ class LiveExecutionEngine:
         self.trade_log.clear()
         return out
 
-    def _submit_live_limit(self, symbol: str, side: str, size: float, price: float, *, reduce_only: bool) -> bool:
+    def _submit_live_limit(self, symbol: str, side: str, size: float, price: float, *, reduce_only: bool, prefer_post_only: bool = False) -> bool:
+        self.last_submit_error_kind = None
         # During an address rate-limit cooldown every extra request only deepens
         # the deficit, so skip new exposure; reduce-only closes stay allowed.
         if not reduce_only and time.time() < self.rate_limited_until:
@@ -1418,9 +1529,11 @@ class LiveExecutionEngine:
             logger.warning("live_order_blocked reason=max_position_notional side=%s price=%s size=%s", side, normalized_price, normalized_size)
             return False
         # Grid entries are post-only (Alo) so they always rest as maker; reduce-only
-        # closes keep Gtc because they may need to cross the book immediately.
-        post_only = self.use_alo_orders and not reduce_only
+        # closes default to Gtc because they may need to cross the book, but
+        # callers (paired TP) can prefer post-only to keep the maker rate.
+        post_only = self.use_alo_orders and (not reduce_only or prefer_post_only)
         logger.info("order_submitted mode=live side=%s price=%s qty=%s notional=%s reduce_only=%s post_only=%s", side, normalized_price, normalized_size, notional, reduce_only, post_only)
+        self._last_exchange_action_ts = time.time()
         try:
             response = self.client.place_limit_order(symbol, side, normalized_size, normalized_price, reduce_only=reduce_only, post_only=post_only)
         except ValueError as exc:
@@ -1431,9 +1544,11 @@ class LiveExecutionEngine:
             if post_only and _is_post_only_reject(error):
                 # The level would have crossed the spread (taker fill); skipping it
                 # is the intended fee protection, the next tick re-plans the grid.
+                self.last_submit_error_kind = "alo_reject"
                 self.alo_rejected_count += 1
                 logger.warning("live_order_alo_rejected side=%s price=%s size=%s alo_rejected_count=%s error=%s", side, normalized_price, normalized_size, self.alo_rejected_count, error)
             elif _is_cumulative_rate_limit_error(error):
+                self.last_submit_error_kind = "rate_limit"
                 self.rate_limit_trigger_count += 1
                 self.last_rate_limit_ts = time.time()
                 self.last_request_deficit = _extract_request_deficit(error)
@@ -1452,6 +1567,7 @@ class LiveExecutionEngine:
                     error,
                 )
             else:
+                self.last_submit_error_kind = "rejected"
                 logger.warning("live_order_rejected side=%s price=%s size=%s reduce_only=%s error=%s", side, normalized_price, normalized_size, reduce_only, error)
             return False
         oid = _extract_order_oid(response)
@@ -1488,7 +1604,13 @@ class LiveExecutionEngine:
         tp_side = "sell" if side == "buy" else "buy"
         tp_price = fill_price * (1.0 + spacing) if side == "buy" else fill_price * (1.0 - spacing)
         try:
-            submitted = self._submit_live_limit(symbol, tp_side, fill_qty, tp_price, reduce_only=True)
+            # Prefer post-only so the TP rests as maker (a third of the taker
+            # fee); only cross the book when the price already moved past the
+            # level, otherwise the roundtrip would stay open.
+            submitted = self._submit_live_limit(symbol, tp_side, fill_qty, tp_price, reduce_only=True, prefer_post_only=self.paired_tp_post_only)
+            if not submitted and self.paired_tp_post_only and self.last_submit_error_kind == "alo_reject":
+                logger.info("paired_tp_post_only_crossed_falling_back_to_gtc tp_side=%s tp_price=%s", tp_side, tp_price)
+                submitted = self._submit_live_limit(symbol, tp_side, fill_qty, tp_price, reduce_only=True)
         except Exception as exc:
             # TP placement must never break fill ingestion; the next tick's
             # position management still covers the open inventory.

@@ -495,6 +495,13 @@ class HyperliquidClient:
             return [o for o in orders if o.get("coin") == symbol]
         return []
 
+    def get_user_rate_limit(self) -> dict[str, Any]:
+        """Fetch the address-level request budget (cumVlm, nRequestsUsed, nRequestsCap)."""
+        if not self.account_address:
+            return {}
+        data = self._post_info({"type": "userRateLimit", "user": self.account_address})
+        return data if isinstance(data, dict) else {}
+
     def get_user_fills(self, symbol: str | None = None) -> list[dict[str, Any]]:
         if self.ws_active and self._ws_fills_snapshot:
             self._ws_fill_calls += 1
