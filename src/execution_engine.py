@@ -140,6 +140,11 @@ def _is_post_only_reject(error: str) -> bool:
     return "post only" in lowered or "alo" in lowered or "immediately match" in lowered
 
 
+def _is_cumulative_rate_limit_error(error: str) -> bool:
+    lowered = error.lower()
+    return "too many cumulative requests" in lowered or "cumulative volume traded" in lowered
+
+
 def classify_exposure_action(position_size: float, side: str, qty: float) -> str:
     side = side.lower()
     qty = abs(qty)
@@ -791,6 +796,12 @@ class LiveExecutionEngine:
         self.paired_tp_spacing_multiplier = max(float(paired_tp_spacing_multiplier), 0.0)
         self.paired_tp_placed_count = 0
         self.last_grid_spacing_pct = 0.003
+        self.rate_limit_cooldown_seconds = max(float(kwargs.pop("rate_limit_cooldown_seconds", 120.0)), 0.0)
+        self.rate_limit_orphan_grace_seconds = max(float(kwargs.pop("rate_limit_orphan_grace_seconds", 600.0)), 0.0)
+        self.rate_limited_until = 0.0
+        self.last_rate_limit_ts = 0.0
+        self.rate_limit_trigger_count = 0
+        self.rate_limited_skip_count = 0
         self._seen_fill_ids: set[str] = set()
         self._load_live_seen_fills()
         self.min_order_lifetime_seconds = max(int(kwargs.pop("min_order_lifetime_seconds", 90)), 0)
@@ -958,6 +969,16 @@ class LiveExecutionEngine:
         if not can_replace:
             logger.info("reprice_decision decision=skip reprice_reason=%s min_order_lifetime_seconds=%s min_reprice_distance_pct=%s", reprice_reason, self.min_order_lifetime_seconds, self.min_reprice_distance_pct)
             return {"canceled": 0, "placed": 0, "symbol": symbol, "reprice_decision": "skip", "reprice_reason": reprice_reason}
+        if time.time() < self.rate_limited_until:
+            # Canceling here would be one-way: the replacement placement is
+            # going to be rejected anyway, so the regrid would only shrink the
+            # surviving grid. Freeze it until the cooldown ends.
+            logger.warning(
+                "reprice_decision decision=skip reprice_reason=rate_limit_cooldown seconds_remaining=%.0f open_orders_kept=%s",
+                self.rate_limited_until - time.time(),
+                len(self.open_orders),
+            )
+            return {"canceled": 0, "placed": 0, "kept": len(self.open_orders), "symbol": symbol, "reprice_decision": "skip", "reprice_reason": "rate_limit_cooldown"}
         active = [o for o in self.open_orders if str(o.get("symbol", symbol)).upper() == symbol.upper() and not bool(o.get("reduce_only", False))]
         desired = [{"side": o.side, "price": o.price, "size": o.size} for o in plan.long_levels + plan.short_levels]
         kept, to_cancel, to_place = _diff_grid_orders(active, desired, self.min_reprice_distance_pct)
@@ -1154,6 +1175,19 @@ class LiveExecutionEngine:
         return out
 
     def _submit_live_limit(self, symbol: str, side: str, size: float, price: float, *, reduce_only: bool) -> bool:
+        # During an address rate-limit cooldown every extra request only deepens
+        # the deficit, so skip new exposure; reduce-only closes stay allowed.
+        if not reduce_only and time.time() < self.rate_limited_until:
+            self.rate_limited_skip_count += 1
+            logger.warning(
+                "live_order_skipped reason=rate_limit_cooldown seconds_remaining=%.0f side=%s price=%s size=%s rate_limited_skip_count=%s",
+                self.rate_limited_until - time.time(),
+                side,
+                price,
+                size,
+                self.rate_limited_skip_count,
+            )
+            return False
         normalized_price = normalize_price(symbol, price)
         normalized_size = normalize_size(symbol, size)
         notional_decimal = abs(Decimal(str(normalized_size)) * Decimal(str(normalized_price)))
@@ -1226,6 +1260,20 @@ class LiveExecutionEngine:
                 # is the intended fee protection, the next tick re-plans the grid.
                 self.alo_rejected_count += 1
                 logger.warning("live_order_alo_rejected side=%s price=%s size=%s alo_rejected_count=%s error=%s", side, normalized_price, normalized_size, self.alo_rejected_count, error)
+            elif _is_cumulative_rate_limit_error(error):
+                self.rate_limit_trigger_count += 1
+                self.last_rate_limit_ts = time.time()
+                if self.rate_limit_cooldown_seconds > 0:
+                    self.rate_limited_until = time.time() + self.rate_limit_cooldown_seconds
+                logger.warning(
+                    "live_order_rate_limited cooldown_seconds=%.0f rate_limit_trigger_count=%s side=%s price=%s size=%s error=%s",
+                    self.rate_limit_cooldown_seconds,
+                    self.rate_limit_trigger_count,
+                    side,
+                    normalized_price,
+                    normalized_size,
+                    error,
+                )
             else:
                 logger.warning("live_order_rejected side=%s price=%s size=%s reduce_only=%s error=%s", side, normalized_price, normalized_size, reduce_only, error)
             return False
