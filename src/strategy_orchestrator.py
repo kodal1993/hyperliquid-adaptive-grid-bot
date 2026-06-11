@@ -721,8 +721,14 @@ class StrategyOrchestrator:
         cleanup_canceled = 0
         state_uncertain_skip_cycle = False
         rate_limited_until = float(getattr(self.execution_engine, "rate_limited_until", 0.0) or 0.0)
+        last_rate_limit_ts = float(getattr(self.execution_engine, "last_rate_limit_ts", 0.0) or 0.0)
+        rate_limit_grace = max(float(getattr(self.execution_engine, "rate_limit_orphan_grace_seconds", 600.0) or 0.0), 0.0)
+        # The cooldown alone is not enough: right after it expires the cleanup
+        # runs before any placement attempt, so it would cancel the surviving
+        # side again. Keep cleanup off for a grace period after the last hit.
+        rate_limit_recently = last_rate_limit_ts > 0 and (time.time() - last_rate_limit_ts) < rate_limit_grace
         orphan_cleanup_skipped_rate_limit = False
-        if cleanup_requested and time.time() < rate_limited_until:
+        if cleanup_requested and (time.time() < rate_limited_until or rate_limit_recently):
             # While the address is over its cumulative request budget, a one-sided
             # grid is expected (placements get rejected). Canceling the surviving
             # side here only burns the trickle budget on cancel/replace loops.

@@ -4136,3 +4136,43 @@ def test_orphan_cleanup_skipped_during_rate_limit_cooldown(tmp_path):
 
     assert orch.orphan_order_cleanup_count == 0
     assert status.get("orphan_cleanup_skipped_rate_limit") is True
+
+
+def test_live_regrid_does_not_cancel_orders_during_rate_limit_cooldown(tmp_path):
+    client = _StatefulLiveClient(orders=[
+        {"coin": "BTC", "side": "B", "limitPx": "99.0", "sz": "1.0", "oid": 1},
+    ])
+    eng = _live_engine(tmp_path, client)
+    eng.rate_limited_until = time.time() + 100
+    plan = GridManager().build_grid(100, 1, 0.02, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    result = eng.cancel_replace_grid("BTC", plan)
+
+    assert result["reprice_decision"] == "skip"
+    assert result["reprice_reason"] == "rate_limit_cooldown"
+    assert client.canceled_oids == []
+    assert client.placed == []
+    assert any(int(o["oid"]) == 1 for o in client.orders)
+
+
+def test_orphan_cleanup_skipped_within_rate_limit_grace_after_cooldown(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.min_order_notional_usd = 1
+    cfg.min_notional_usd = 1
+    cfg.order_notional_usd = 10
+    cfg.max_notional_per_trade_usd = 10
+    cfg.min_order_size = 0
+    cfg.regrid_threshold_pct = 0
+    cfg.min_order_lifetime_seconds = 0
+    cfg.stale_order_max_age_sec = 999999
+    eng = make_test_engine(tmp_path, "rate_limit_grace.json", paper_mode=True, min_order_lifetime_seconds=0)
+    eng.open_orders = [{"symbol": "BTC", "side": "buy", "price": 99.7, "size": 0.1, "created_ts": time.time() - 60}]
+    eng.rate_limited_until = time.time() - 5
+    eng.last_rate_limit_ts = time.time() - 60
+    eng.rate_limit_orphan_grace_seconds = 600.0
+    orch = StrategyOrchestrator(cfg, eng)
+
+    status = orch.on_tick(_candles_for_watchdog(100.0), equity=500, daily_pnl_pct=0, symbol="BTC")
+
+    assert orch.orphan_order_cleanup_count == 0
+    assert status.get("orphan_cleanup_skipped_rate_limit") is True
