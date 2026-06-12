@@ -163,6 +163,7 @@ class BotConfig:
     rate_limit_min_action_interval_seconds: float
     rate_limit_recovery_min_order_lifetime_seconds: float
     rate_limit_recovery_min_reprice_distance_pct: float
+    rate_limit_recovery_max_ops_per_hour: int
     trend_flip_cooldown_minutes: float
     paired_tp_post_only: bool
 
@@ -342,6 +343,7 @@ class BotConfig:
             rate_limit_min_action_interval_seconds=float(os.getenv("RATE_LIMIT_MIN_ACTION_INTERVAL_SECONDS", "12")),
             rate_limit_recovery_min_order_lifetime_seconds=float(os.getenv("RATE_LIMIT_RECOVERY_MIN_ORDER_LIFETIME_SECONDS", "600")),
             rate_limit_recovery_min_reprice_distance_pct=float(os.getenv("RATE_LIMIT_RECOVERY_MIN_REPRICE_DISTANCE_PCT", "0.005")),
+            rate_limit_recovery_max_ops_per_hour=int(os.getenv("RATE_LIMIT_RECOVERY_MAX_OPS_PER_HOUR", "6")),
             trend_flip_cooldown_minutes=float(os.getenv("TREND_FLIP_COOLDOWN_MINUTES", "10")),
             paired_tp_post_only=os.getenv("PAIRED_TP_POST_ONLY", "true").lower() == "true",
         )

@@ -4490,6 +4490,44 @@ def test_live_recovery_missing_levels_bypass_lifetime_gate(tmp_path):
     assert client.canceled_oids == []
 
 
+def test_live_recovery_hourly_op_budget_blocks_reshuffles(tmp_path):
+    client = _StatefulLiveClient(orders=[
+        {"coin": "BTC", "side": "B", "limitPx": "95.0", "sz": "1.0", "oid": 1},
+    ])
+    eng = _live_engine(tmp_path, client, max_order_ops_per_cycle=2, rate_limit_recovery_min_order_lifetime_seconds=0, rate_limit_recovery_max_ops_per_hour=6)
+    eng.last_rate_limit_ts = time.time() - 30
+    # Six actions already spent this hour, the latest comfortably past the
+    # trickle interval.
+    eng._exchange_action_times = [time.time() - 60 * i for i in range(2, 8)]
+    eng._last_exchange_action_ts = max(eng._exchange_action_times)
+    plan = GridManager().build_grid(100, 2, 0.02, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    result = eng.cancel_replace_grid("BTC", plan)
+
+    assert result["reprice_decision"] == "skip"
+    assert result["reprice_reason"] == "rate_limit_hourly_op_budget"
+    assert client.canceled_oids == []
+    assert client.placed == []
+
+    # Actions older than an hour stop counting and the regrid resumes.
+    eng._exchange_action_times = [time.time() - 4000 for _ in range(6)]
+    result = eng.cancel_replace_grid("BTC", plan)
+    assert result["reprice_decision"] == "replace"
+
+
+def test_live_recovery_hourly_op_budget_allows_seeding_empty_book(tmp_path):
+    client = _StatefulLiveClient()
+    eng = _live_engine(tmp_path, client, rate_limit_recovery_max_ops_per_hour=6)
+    eng.last_rate_limit_ts = time.time() - 30
+    eng._exchange_action_times = [time.time() - 60 * i for i in range(2, 12)]
+    plan = GridManager().build_grid(100, 1, 0.02, 0, MarketRegime.RANGE, 1.0, 0, 0, GridMode.NEUTRAL, force_recenter=True)
+
+    result = eng.cancel_replace_grid("BTC", plan)
+
+    # An empty book must always be re-seedable regardless of the hourly budget.
+    assert result["placed"] == 1
+
+
 def test_live_regrid_recovery_mode_expires_after_window(tmp_path):
     client = _StatefulLiveClient()
     eng = _live_engine(tmp_path, client, rate_limit_recovery_window_seconds=100)

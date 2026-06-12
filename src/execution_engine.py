@@ -874,6 +874,7 @@ class LiveExecutionEngine:
         self.rate_limit_recovery_window_seconds = max(float(kwargs.pop("rate_limit_recovery_window_seconds", 1800.0)), 0.0)
         self.rate_limit_recovery_min_order_lifetime_seconds = max(float(kwargs.pop("rate_limit_recovery_min_order_lifetime_seconds", 600.0)), 0.0)
         self.rate_limit_recovery_min_reprice_distance_pct = max(float(kwargs.pop("rate_limit_recovery_min_reprice_distance_pct", 0.005)), 0.0)
+        self.rate_limit_recovery_max_ops_per_hour = max(int(kwargs.pop("rate_limit_recovery_max_ops_per_hour", 6)), 1)
         self.rate_limit_budget_poll_seconds = max(float(kwargs.pop("rate_limit_budget_poll_seconds", 600.0)), 0.0)
         self.rate_limit_headroom_alert = max(float(kwargs.pop("rate_limit_headroom_alert", 1000.0)), 0.0)
         self.rate_limit_headroom_frugal = max(float(kwargs.pop("rate_limit_headroom_frugal", 500.0)), 0.0)
@@ -889,6 +890,7 @@ class LiveExecutionEngine:
         self.rate_limit_budget_frugal = False
         self._last_budget_poll_ts = 0.0
         self._last_exchange_action_ts = 0.0
+        self._exchange_action_times: list[float] = []
         self.last_submit_error_kind: str | None = None
         self.fill_health_events: list[dict] = []
         self._seen_fill_ids: set[str] = set()
@@ -1020,6 +1022,18 @@ class LiveExecutionEngine:
         elif was_frugal and not self.rate_limit_budget_frugal:
             logger.info("rate_limit_budget_frugal_mode_exited headroom=%.0f threshold=%.0f", headroom, self.rate_limit_headroom_frugal)
         return self.rate_limit_budget
+
+    def _record_exchange_action(self) -> None:
+        now = time.time()
+        self._last_exchange_action_ts = now
+        self._exchange_action_times.append(now)
+        cutoff = now - 3600
+        self._exchange_action_times = [t for t in self._exchange_action_times if t >= cutoff]
+
+    def _exchange_actions_last_hour(self, now_ts: float | None = None) -> int:
+        now = time.time() if now_ts is None else now_ts
+        cutoff = now - 3600
+        return sum(1 for t in self._exchange_action_times if t >= cutoff)
 
     def _record_fill_health(self, entry: dict) -> None:
         self.fill_health_events.append({
@@ -1224,6 +1238,20 @@ class LiveExecutionEngine:
                 self.rate_limit_min_action_interval_seconds,
             )
             return {"canceled": 0, "placed": 0, "kept": len(kept), "symbol": symbol, "reprice_decision": "skip", "reprice_reason": "rate_limit_trickle_spacing", "rate_limit_recovery_mode": True}
+        if in_recovery and active and self._exchange_actions_last_hour(now_ts) >= self.rate_limit_recovery_max_ops_per_hour:
+            # Volatile sessions can pass the reprice gates often enough that
+            # legitimate reshuffles still outspend the fill income (observed
+            # live: +16 requests in 30 min with zero volume). While in deficit,
+            # grid maintenance gets a hard hourly action budget; an empty book
+            # may always be re-seeded, and reduce-only TPs are exempt because
+            # they only follow fills that just paid for them.
+            logger.info(
+                "reprice_decision decision=skip reprice_reason=rate_limit_hourly_op_budget ops_last_hour=%s max_ops_per_hour=%s open_orders_kept=%s",
+                self._exchange_actions_last_hour(now_ts),
+                self.rate_limit_recovery_max_ops_per_hour,
+                len(active),
+            )
+            return {"canceled": 0, "placed": 0, "kept": len(kept), "symbol": symbol, "reprice_decision": "skip", "reprice_reason": "rate_limit_hourly_op_budget", "rate_limit_recovery_mode": True}
         if in_recovery:
             # The address is repaying a cumulative-request deficit, so the
             # exchange accepts roughly one action per 10s. Only traded volume
@@ -1251,7 +1279,7 @@ class LiveExecutionEngine:
             oid = old.get("oid")
             if oid is None:
                 continue
-            self._last_exchange_action_ts = time.time()
+            self._record_exchange_action()
             try:
                 self.client.cancel_order(symbol, int(oid))
             except Exception as exc:
@@ -1288,7 +1316,7 @@ class LiveExecutionEngine:
         return {"canceled": canceled, "placed": placed, "kept": len(kept), "symbol": symbol, "reprice_decision": "replace", "reprice_reason": reprice_reason, "skipped_cancels": skipped_cancels, "skipped_places": skipped_places, "order_op_budget_exhausted": budget_exhausted, "rate_limit_recovery_mode": in_recovery}
 
     def cancel_all_orders(self, symbol: str) -> int:
-        self._last_exchange_action_ts = time.time()
+        self._record_exchange_action()
         canceled = self.client.cancel_all_orders(symbol)
         self.sync_open_orders(symbol)
         return canceled
@@ -1549,7 +1577,7 @@ class LiveExecutionEngine:
         # callers (paired TP) can prefer post-only to keep the maker rate.
         post_only = self.use_alo_orders and (not reduce_only or prefer_post_only)
         logger.info("order_submitted mode=live side=%s price=%s qty=%s notional=%s reduce_only=%s post_only=%s", side, normalized_price, normalized_size, notional, reduce_only, post_only)
-        self._last_exchange_action_ts = time.time()
+        self._record_exchange_action()
         try:
             response = self.client.place_limit_order(symbol, side, normalized_size, normalized_price, reduce_only=reduce_only, post_only=post_only)
         except ValueError as exc:
