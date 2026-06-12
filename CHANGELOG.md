@@ -1,5 +1,9 @@
 # Changelog
 
+## Hard hourly action budget while in deficit
+
+- Daytime volatility passed the recovery reprice gates often enough that legitimate reshuffles still outspent the fill income (observed live: +16 requests in 30 minutes with zero volume, headroom −140 → −218 over a morning). While the address is in rate-limit recovery, grid maintenance now has a hard hourly exchange-action budget (`RATE_LIMIT_RECOVERY_MAX_OPS_PER_HOUR`, default 6): reshuffles beyond it are skipped with `rate_limit_hourly_op_budget`. An empty book may always be re-seeded, and reduce-only TPs are exempt because they only follow fills that just paid for themselves.
+
 ## Min-notional floor must round up to the size step
 
 - Live logs showed the sell side never placing for hours: `live_order_skipped reason=min_notional side=sell qty=0.00015 notional=9.44`. The bias-multiplier floor computed the exact minimum size (10 / 62927 = 0.000158913), but the submit-side normalization rounds **down** to the symbol's size step, landing one step below the minimum again. `_floor_size_to_min_order_notional` now rounds up to the size step (`normalize_size_up`), overshooting the minimum by at most one step, so floored levels survive submission. This restores the sell half of the grid (and its fills/volume).
