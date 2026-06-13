@@ -1,5 +1,11 @@
 # Changelog
 
+## Stop discretionary cancel-all churn from bypassing the recovery budget
+
+- Live logs showed the deficit still creeping (~45 requests/hour, frozen volume, headroom −227 → −339 over an afternoon) even with the hourly cap deployed. Root cause: the hourly budget only gated `cancel_replace_grid`, but the discretionary `cancel_all_orders` paths (market-stress one-siding when flat, `neutral_blocked_in_trend`, orphan cleanup) bypassed it entirely. In a trend they emptied the book every cycle; the empty-book re-seed immediately re-placed one order, and the loop burned ~2 requests per round with zero fills.
+- `cancel_all_orders` now takes `force`. Genuine risk cancels (wrong-way exit, adverse-move exit, emergency flat, max-position reduce-only, daily-loss, hard-risk block) pass `force=True` and always execute. Discretionary cancels default to `force=False` and are skipped while in rate-limit recovery and over the hourly action budget, so a resting order survives instead of feeding the cancel/re-seed loop.
+- The no-fill watchdog is also suppressed during recovery: tightening spacing to chase fills is pointless when the regrid is budget-frozen, and it was thrashing the resting order's target price (0.30% ↔ 0.24%).
+
 ## Hard hourly action budget while in deficit
 
 - Daytime volatility passed the recovery reprice gates often enough that legitimate reshuffles still outspent the fill income (observed live: +16 requests in 30 minutes with zero volume, headroom −140 → −218 over a morning). While the address is in rate-limit recovery, grid maintenance now has a hard hourly exchange-action budget (`RATE_LIMIT_RECOVERY_MAX_OPS_PER_HOUR`, default 6): reshuffles beyond it are skipped with `rate_limit_hourly_op_budget`. An empty book may always be re-seeded, and reduce-only TPs are exempt because they only follow fills that just paid for themselves.

@@ -342,7 +342,7 @@ class StrategyOrchestrator:
                 wrong_way_loss_pct = max((price - avg_entry) / avg_entry, 0.0)
 
         if wrong_way_trend_position and wrong_way_loss_pct >= self.wrong_way_exit_loss_pct:
-            canceled = self.execution_engine.cancel_all_orders(symbol)
+            canceled = self.execution_engine.cancel_all_orders(symbol, force=True)
             flattened = self.execution_engine.flatten_position(symbol, price)
             self.trend_flip_cooldown_remaining = max(self.trend_flip_cooldown_remaining, self.trend_flip_cooldown_ticks)
             logger.warning(
@@ -384,7 +384,7 @@ class StrategyOrchestrator:
             and adverse_move_pct > self.adverse_move_exit_pct
             and not mean_reversion_confirmed
         ):
-            canceled = self.execution_engine.cancel_all_orders(symbol)
+            canceled = self.execution_engine.cancel_all_orders(symbol, force=True)
             flattened = self.execution_engine.flatten_position(symbol, price)
             logger.warning(
                 "adverse_move_protection_exit_requested side=%s entry=%s price=%s adverse_move_pct=%.5f threshold=%.5f mean_reversion_confirmed=%s canceled=%s flattened=%s",
@@ -572,7 +572,7 @@ class StrategyOrchestrator:
             market_stress.reason,
         )
         if market_stress.emergency_flat:
-            canceled = self.execution_engine.cancel_all_orders(symbol)
+            canceled = self.execution_engine.cancel_all_orders(symbol, force=True)
             flattened = self.execution_engine.flatten_position(symbol, price)
             logger.warning(
                 "market_stress_emergency_flat symbol=%s position_side=%s position_notional=%.4f canceled=%s flattened=%s reason=%s",
@@ -638,7 +638,7 @@ class StrategyOrchestrator:
             wrong_way_loss_pct,
         )
         if effective_position_notional > self.config.max_position_notional_usd:
-            canceled = self.execution_engine.cancel_all_orders(symbol)
+            canceled = self.execution_engine.cancel_all_orders(symbol, force=True)
             flattened = False
             reduce_only_placed = self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, order_size)
             logger.warning("reduce_only_requested symbol=%s reason=max_position_notional canceled=%s reduce_only_placed=%s", symbol, canceled, reduce_only_placed)
@@ -841,7 +841,7 @@ class StrategyOrchestrator:
         hard_risk_block_active = (not risk_state.can_trade) or regime == MarketRegime.RISK_OFF
         daily_loss_position_management_active = daily_loss_limit_active or risk_state.reason in {"daily_loss", "daily_loss_limit"}
         if daily_loss_position_management_active:
-            canceled = self.execution_engine.cancel_all_orders(symbol) if open_orders else 0
+            canceled = self.execution_engine.cancel_all_orders(symbol, force=True) if open_orders else 0
             reduce_only_placed = 0
             if effective_position_side in {"LONG", "SHORT"}:
                 reduce_only_placed = self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, self._calculate_order_size(price))
@@ -873,7 +873,7 @@ class StrategyOrchestrator:
             }
 
         if hard_risk_block_active:
-            canceled = self.execution_engine.cancel_all_orders(symbol) if open_orders else 0
+            canceled = self.execution_engine.cancel_all_orders(symbol, force=True) if open_orders else 0
             reduce_only_placed = 0
             if effective_position_side in {"LONG", "SHORT"}:
                 reduce_only_placed = self.execution_engine.place_reduce_only_orders(symbol, pos_size, price, self._calculate_order_size(price))
@@ -1066,6 +1066,13 @@ class StrategyOrchestrator:
             pause_reason="none",
             position_notional=effective_position_notional,
         )
+        in_rate_limit_recovery = bool(getattr(self.execution_engine, "_in_rate_limit_recovery", lambda: False)())
+        if in_rate_limit_recovery and no_fill_watchdog_context["no_fill_watchdog_active"]:
+            # The watchdog tightens spacing and forces a recenter to chase
+            # fills, but during deficit repayment we can't afford the regrid;
+            # the tighter spacing only thrashes the resting order's price.
+            no_fill_watchdog_context["no_fill_watchdog_active"] = False
+            no_fill_watchdog_context["no_fill_watchdog_reason"] = "suppressed_rate_limit_recovery"
         if no_fill_watchdog_context["no_fill_watchdog_active"]:
             before_watchdog_spacing = final_spacing_pct
             reduction_pct = min(max(float(getattr(self.config, "no_fill_spacing_reduction_pct", 0.20)), 0.0), 1.0)

@@ -403,7 +403,7 @@ class PaperExecutionEngine:
         logger.info("reprice_decision decision=replace reprice_reason=%s canceled=%s placed=%s kept=%s", reprice_reason, canceled, len(orders), len(kept))
         return {"canceled": canceled, "placed": len(orders), "kept": len(kept), "symbol": symbol, "reprice_decision": "replace", "reprice_reason": reprice_reason}
 
-    def cancel_all_orders(self, symbol: str) -> int:
+    def cancel_all_orders(self, symbol: str, *, force: bool = False) -> int:
         self._require_paper_execution("cancel_all_orders")
         before = len(self.open_orders)
         self.open_orders = [o for o in self.open_orders if o.get("symbol") != symbol]
@@ -1315,7 +1315,21 @@ class LiveExecutionEngine:
         logger.info("reprice_decision decision=replace reprice_reason=%s canceled=%s placed=%s kept=%s skipped_cancels=%s skipped_places=%s max_order_ops_per_cycle=%s rate_limit_recovery_mode=%s", reprice_reason, canceled, placed, len(kept), skipped_cancels, skipped_places, self.max_order_ops_per_cycle, in_recovery)
         return {"canceled": canceled, "placed": placed, "kept": len(kept), "symbol": symbol, "reprice_decision": "replace", "reprice_reason": reprice_reason, "skipped_cancels": skipped_cancels, "skipped_places": skipped_places, "order_op_budget_exhausted": budget_exhausted, "rate_limit_recovery_mode": in_recovery}
 
-    def cancel_all_orders(self, symbol: str) -> int:
+    def cancel_all_orders(self, symbol: str, *, force: bool = False) -> int:
+        # Discretionary cancels (one-siding, recenter, neutral-block) must not
+        # run while repaying the request deficit: they empty the book, the
+        # re-seed re-fills one side, and the loop burns the budget with zero
+        # fills (observed live: ~45 req/h, frozen volume). Genuine risk cancels
+        # (emergency flat, daily loss, max position, hard risk) pass force=True
+        # and always go through.
+        if not force and self._in_rate_limit_recovery() and self._exchange_actions_last_hour() >= self.rate_limit_recovery_max_ops_per_hour:
+            logger.info(
+                "cancel_all_skipped reason=rate_limit_recovery_discretionary ops_last_hour=%s max_ops_per_hour=%s open_orders_kept=%s",
+                self._exchange_actions_last_hour(),
+                self.rate_limit_recovery_max_ops_per_hour,
+                len(self.open_orders),
+            )
+            return 0
         self._record_exchange_action()
         canceled = self.client.cancel_all_orders(symbol)
         self.sync_open_orders(symbol)
