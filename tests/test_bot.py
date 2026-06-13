@@ -2161,7 +2161,7 @@ class FakeLiveStateEngine:
         self.open_orders = [{"symbol": symbol, "side": o.side, "price": o.price, "size": o.size} for o in plan.long_levels + plan.short_levels]
         return {"canceled": 0, "placed": len(self.open_orders), "symbol": symbol}
 
-    def cancel_all_orders(self, symbol):
+    def cancel_all_orders(self, symbol, *, force=False):
         self.open_orders = []
         return 0
 
@@ -2271,7 +2271,7 @@ class DummyLiveClient:
             return [f for f in fills if str(f.get("coin", "")).upper() == symbol.upper()]
         return fills
 
-    def cancel_all_orders(self, symbol):
+    def cancel_all_orders(self, symbol, *, force=False):
         return 0
 
     def place_limit_order(self, symbol, side, size, price, reduce_only=False, post_only=False):
@@ -3854,7 +3854,7 @@ class _StatefulLiveClient:
         self.orders = [o for o in self.orders if int(o["oid"]) != int(oid)]
         return {"status": "ok"}
 
-    def cancel_all_orders(self, symbol):
+    def cancel_all_orders(self, symbol, *, force=False):
         count = len(self.orders)
         self.orders = []
         return count
@@ -4526,6 +4526,36 @@ def test_live_recovery_hourly_op_budget_allows_seeding_empty_book(tmp_path):
 
     # An empty book must always be re-seedable regardless of the hourly budget.
     assert result["placed"] == 1
+
+
+def test_discretionary_cancel_all_skipped_during_recovery_over_budget(tmp_path):
+    client = _StatefulLiveClient(orders=[
+        {"coin": "BTC", "side": "A", "limitPx": "101.0", "sz": "1.0", "oid": 1},
+    ])
+    eng = _live_engine(tmp_path, client, rate_limit_recovery_max_ops_per_hour=6)
+    eng.last_rate_limit_ts = time.time() - 30
+    eng._exchange_action_times = [time.time() - 60 * i for i in range(2, 10)]
+
+    # Discretionary cancel (one-siding / neutral-block / orphan) is skipped so
+    # the resting order survives instead of feeding a cancel/re-seed loop.
+    canceled = eng.cancel_all_orders("BTC")
+    assert canceled == 0
+    assert any(int(o["oid"]) == 1 for o in client.orders)
+
+    # A genuine risk cancel forces through regardless of the budget.
+    forced = eng.cancel_all_orders("BTC", force=True)
+    assert forced == 1
+    assert client.orders == []
+
+
+def test_risk_cancel_all_not_gated_outside_recovery(tmp_path):
+    client = _StatefulLiveClient(orders=[
+        {"coin": "BTC", "side": "A", "limitPx": "101.0", "sz": "1.0", "oid": 1},
+    ])
+    eng = _live_engine(tmp_path, client, rate_limit_recovery_max_ops_per_hour=6)
+    # Not in recovery: discretionary cancels run normally.
+    canceled = eng.cancel_all_orders("BTC")
+    assert canceled == 1
 
 
 def test_live_regrid_recovery_mode_expires_after_window(tmp_path):
