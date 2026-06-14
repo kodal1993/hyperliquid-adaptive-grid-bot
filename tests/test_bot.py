@@ -2010,10 +2010,10 @@ def test_small_equity_safe_missing_env_defaults(tmp_path, monkeypatch):
     monkeypatch.delenv("MAX_ACTIVE_EXPOSURE_USD", raising=False)
     cfg = BotConfig.from_env()
     assert cfg.grid_levels == 3
-    assert cfg.max_position_notional_usd == 50
+    assert cfg.max_position_notional_usd == 90
     assert cfg.stale_order_max_age_sec == 1800
-    assert 8 <= cfg.order_notional_usd <= 15
-    assert 30 <= cfg.max_active_exposure_usd <= 50
+    assert 18 <= cfg.order_notional_usd <= 24
+    assert 90 <= cfg.max_active_exposure_usd <= 120
 
 
 def test_max_active_exposure_caps_grid_notional(tmp_path):

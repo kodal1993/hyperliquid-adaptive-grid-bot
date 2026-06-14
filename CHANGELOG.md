@@ -1,5 +1,9 @@
 # Changelog
 
+## Scale order sizing for ~325 USD equity
+
+- Raised the default order sizing now that equity is ~$325: `ORDER_NOTIONAL_USD` 12 → 20, `MAX_NOTIONAL_PER_TRADE_USD` → 24, `MAX_POSITION_NOTIONAL_USD` 40 → 90 (~28% of equity at 1x, liquidation negligible), `MAX_ACTIVE_EXPOSURE_USD` 50 → 110 so the full 3-level grid builds. `MIN_ORDER_NOTIONAL_USD` stays 12, above the $10 exchange minimum, so bias multipliers (0.75x) now reduce a $20 level to ~$15 instead of being floored away. Larger fills also repay the Hyperliquid request budget faster. Leverage stays 1x. Live deploys still need the same values in `config/live.env`, which overrides these defaults.
+
 ## Survive transient exchange errors instead of crashing
 
 - A Hyperliquid-side `502 Bad Gateway` (their infra hiccup) crashed the whole bot: any unhandled exception in the tick propagated up, wrote `status=crashed`, and exited the process, leaving the grid and any open position unmanaged until a manual restart. The main loop now wraps each tick in a resilient handler: transient errors are logged, the status is written as `degraded` (not `crashed`), a throttled Telegram alert fires after 3 consecutive failures, and the bot keeps retrying with capped backoff (up to 120s) instead of dying. `KeyboardInterrupt` still stops it cleanly. A successful tick resets the failure counter.
