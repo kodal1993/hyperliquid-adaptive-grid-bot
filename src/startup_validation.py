@@ -6,8 +6,11 @@ from .hyperliquid_client import HyperliquidClient
 
 LIVE_EXECUTION_DISABLED = "live_execution_disabled"
 LIVE_EXECUTION_NOT_IMPLEMENTED = "live_execution_not_implemented"
-MICRO_LIVE_MAX_NOTIONAL_PER_TRADE_USD = 12
-MICRO_LIVE_MAX_POSITION_NOTIONAL_USD = 50
+# Sanity ceilings for the live micro account (currently ~325 USD equity). They
+# guard against a config typo risking far more than intended; raise them in step
+# with real equity, not above it.
+MICRO_LIVE_MAX_NOTIONAL_PER_TRADE_USD = 30
+MICRO_LIVE_MAX_POSITION_NOTIONAL_USD = 100
 
 
 def validate_live_execution_gate(config: BotConfig, client: HyperliquidClient | None = None) -> None:
