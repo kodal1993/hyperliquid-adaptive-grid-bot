@@ -1,5 +1,9 @@
 # Changelog
 
+## Survive transient exchange errors instead of crashing
+
+- A Hyperliquid-side `502 Bad Gateway` (their infra hiccup) crashed the whole bot: any unhandled exception in the tick propagated up, wrote `status=crashed`, and exited the process, leaving the grid and any open position unmanaged until a manual restart. The main loop now wraps each tick in a resilient handler: transient errors are logged, the status is written as `degraded` (not `crashed`), a throttled Telegram alert fires after 3 consecutive failures, and the bot keeps retrying with capped backoff (up to 120s) instead of dying. `KeyboardInterrupt` still stops it cleanly. A successful tick resets the failure counter.
+
 ## Stop discretionary cancel-all churn from bypassing the recovery budget
 
 - Live logs showed the deficit still creeping (~45 requests/hour, frozen volume, headroom −227 → −339 over an afternoon) even with the hourly cap deployed. Root cause: the hourly budget only gated `cancel_replace_grid`, but the discretionary `cancel_all_orders` paths (market-stress one-siding when flat, `neutral_blocked_in_trend`, orphan cleanup) bypassed it entirely. In a trend they emptied the book every cycle; the empty-book re-seed immediately re-placed one order, and the loop burned ~2 requests per round with zero fills.
