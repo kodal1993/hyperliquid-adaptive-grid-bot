@@ -286,6 +286,8 @@ def run() -> None:
     last_risk_state_value = ""
     last_hard_risk_alert_ts: dict[str, float] = {}
     last_recovery_alert_ts = 0.0
+    consecutive_tick_errors = 0
+    last_tick_error_alert_ts = 0.0
     grid_diagnostic_report = {
         "cycles": 0,
         "rebuild_count": 0,
@@ -297,515 +299,535 @@ def run() -> None:
     telegram_status = _send_startup_telegram(cfg, tg)
 
     while True:
-        buys: list[dict] = []
-        sells: list[dict] = []
-        candles = to_df(client.get_candles(cfg.default_symbol, lookback=200))
-        latest_close = float(candles["close"].iloc[-1])
-        account_state = _account_metrics(cfg, engine, client, latest_close)
-        unrealized_pnl, equity, position_notional = account_state.unrealized_pnl, account_state.equity, account_state.position_notional
-        now_day = datetime.now(timezone.utc).date()
-        if daily_start_equity <= 0 or not engine.state.current_day:
-            daily_start_equity = equity
-            daily_start_realized_pnl = account_state.realized_pnl
-            daily_start_fees_paid = account_state.fees_paid
-            engine.state.current_day = now_day.isoformat()
-            engine.state.daily_start_equity = daily_start_equity
-            engine.state.daily_start_realized_pnl = daily_start_realized_pnl
-            engine.state.daily_start_fees_paid = daily_start_fees_paid
-            engine.state.bot_daily_realized_pnl = 0.0
-            engine.state.bot_daily_fees_paid = 0.0
-            engine.save_state()
-        if now_day != current_day:
-            current_day = now_day
-            daily_start_equity = equity
-            daily_start_realized_pnl = account_state.realized_pnl
-            daily_start_fees_paid = account_state.fees_paid
+        try:
+            buys: list[dict] = []
+            sells: list[dict] = []
+            candles = to_df(client.get_candles(cfg.default_symbol, lookback=200))
+            latest_close = float(candles["close"].iloc[-1])
+            account_state = _account_metrics(cfg, engine, client, latest_close)
+            unrealized_pnl, equity, position_notional = account_state.unrealized_pnl, account_state.equity, account_state.position_notional
+            now_day = datetime.now(timezone.utc).date()
+            if daily_start_equity <= 0 or not engine.state.current_day:
+                daily_start_equity = equity
+                daily_start_realized_pnl = account_state.realized_pnl
+                daily_start_fees_paid = account_state.fees_paid
+                engine.state.current_day = now_day.isoformat()
+                engine.state.daily_start_equity = daily_start_equity
+                engine.state.daily_start_realized_pnl = daily_start_realized_pnl
+                engine.state.daily_start_fees_paid = daily_start_fees_paid
+                engine.state.bot_daily_realized_pnl = 0.0
+                engine.state.bot_daily_fees_paid = 0.0
+                engine.save_state()
+            if now_day != current_day:
+                current_day = now_day
+                daily_start_equity = equity
+                daily_start_realized_pnl = account_state.realized_pnl
+                daily_start_fees_paid = account_state.fees_paid
+                engine.state.current_day = current_day.isoformat()
+                engine.state.daily_start_equity = daily_start_equity
+                engine.state.daily_start_realized_pnl = daily_start_realized_pnl
+                engine.state.daily_start_fees_paid = daily_start_fees_paid
+                engine.state.bot_daily_realized_pnl = 0.0
+                engine.state.bot_daily_fees_paid = 0.0
+                engine.save_state()
+            daily_metrics = calculate_daily_pnl_metrics(current_equity=equity, daily_start_equity=daily_start_equity, realized_pnl_total=account_state.realized_pnl, daily_start_realized_pnl=daily_start_realized_pnl, unrealized_pnl=unrealized_pnl, fees_paid_total=account_state.fees_paid, daily_start_fees_paid=daily_start_fees_paid)
+            bot_daily_metrics = calculate_bot_daily_pnl_metrics(
+                bot_daily_realized_pnl=float(getattr(engine.state, "bot_daily_realized_pnl", 0.0) or 0.0),
+                bot_daily_fees_paid=float(getattr(engine.state, "bot_daily_fees_paid", 0.0) or 0.0),
+                account_daily_pnl=daily_metrics["daily_pnl"],
+                daily_start_equity=daily_start_equity,
+            )
+            account_daily_pnl_pct = daily_metrics["daily_pnl_pct"]
+            bot_daily_pnl_pct = bot_daily_metrics["bot_daily_pnl_pct"]
+
+            order_book_snapshot = None
+            try:
+                order_book_snapshot = client.get_l2_book(cfg.default_symbol)
+                if isinstance(order_book_snapshot, dict) and "received_ts" not in order_book_snapshot:
+                    order_book_snapshot = {**order_book_snapshot, "received_ts": time.time()}
+            except Exception as exc:
+                logger.warning("orderbook_unavailable symbol=%s reason=fetch_error fallback=existing_strategy error=%s", cfg.default_symbol, exc)
+            status = orchestrator.on_tick(candles, equity=equity, daily_pnl_pct=bot_daily_pnl_pct, symbol=cfg.default_symbol, position_notional=position_notional, order_book_snapshot=order_book_snapshot)
+            risk = status.get("risk")
+            reason = status.get("reason") or (getattr(risk, "reason", "") if risk else "")
+            strategy_status = status.get("status", "unknown")
+            risk_state = _derive_risk_state(strategy_status, reason)
+            mode = status.get("mode", "reduce_only" if reason == "reduce_only_requested" else "neutral")
+
+            latest_candle = candles.iloc[-1].to_dict()
+            latest_candle["symbol"] = cfg.default_symbol
+            fills = engine.on_candle(
+                latest_candle,
+                regime=status.get("regime", "unknown"),
+                mode=mode,
+                risk_state=risk_state,
+                pause_reason=reason,
+                strategy_status=strategy_status,
+                orderbook_classification=status.get("classification", status.get("orderbook_entry_classification", "")),
+                orderbook_imbalance_ratio=status.get("imbalance_ratio"),
+                orderbook_pressure_score=status.get("pressure_score"),
+                prediction_bias=status.get("prediction_bias", ""),
+            )
+            trade_events = engine.consume_trade_log()
+            account_state = _account_metrics(cfg, engine, client, latest_close)
+            unrealized_pnl, equity, position_notional = account_state.unrealized_pnl, account_state.equity, account_state.position_notional
+            daily_metrics = calculate_daily_pnl_metrics(current_equity=equity, daily_start_equity=daily_start_equity, realized_pnl_total=account_state.realized_pnl, daily_start_realized_pnl=daily_start_realized_pnl, unrealized_pnl=unrealized_pnl, fees_paid_total=account_state.fees_paid, daily_start_fees_paid=daily_start_fees_paid)
+            bot_daily_metrics = calculate_bot_daily_pnl_metrics(
+                bot_daily_realized_pnl=float(getattr(engine.state, "bot_daily_realized_pnl", 0.0) or 0.0),
+                bot_daily_fees_paid=float(getattr(engine.state, "bot_daily_fees_paid", 0.0) or 0.0),
+                account_daily_pnl=daily_metrics["daily_pnl"],
+                daily_start_equity=daily_start_equity,
+            )
+            account_daily_pnl_pct = daily_metrics["daily_pnl_pct"]
+            bot_daily_pnl_pct = bot_daily_metrics["bot_daily_pnl_pct"]
+
+            for tr in trade_events:
+                recent_trades.append(tr)
+                logger.info("trade_event side=%s symbol=%s price=%.6f qty=%.8f", tr["side"], tr["symbol"], tr["price"], tr["qty"])
+                if cfg.telegram_send_fills:
+                    msg = tg.format_fill_alert(tr, mode_name="LIVE")
+                    if tg.send(msg):
+                        logger.info("telegram_fill_alert_sent side=%s", str(tr.get("side", "")).upper())
+                    else:
+                        logger.warning("telegram_fill_alert_failed error=send_returned_false side=%s", str(tr.get("side", "")).upper())
+            last_trade_dt = engine.last_real_trade_ts
+
+            hard_risk_reasons = {"emergency_stop", "max_drawdown", "daily_loss", "daily_loss_limit", "max_position_notional", "liquidation_risk", "liq_distance"}
+            now_ts = time.time()
+            if cfg.telegram_send_hard_risk_alerts and risk_state == "BLOCKED" and reason in hard_risk_reasons:
+                prev_ts = last_hard_risk_alert_ts.get(reason, 0.0)
+                if now_ts - prev_ts >= cfg.telegram_risk_alert_cooldown_seconds:
+                    tg.send(f"🛡 HARD RISK BLOCK\nreason: {reason}\nrisk_state: {risk_state}\npause_reason: {reason or 'none'}")
+                    last_hard_risk_alert_ts[reason] = now_ts
+            if last_risk_state_value == "BLOCKED" and risk_state == "OK" and (now_ts - last_recovery_alert_ts) >= cfg.telegram_risk_alert_cooldown_seconds:
+                tg.send("✅ Risk recovered: OK")
+                last_recovery_alert_ts = now_ts
+            last_risk_state_value = risk_state
+            last_pause_reason = reason
+
+            rate_limit_budget = engine.poll_rate_limit_budget() if hasattr(engine, "poll_rate_limit_budget") else None
+            if rate_limit_budget and rate_limit_budget.get("headroom_alert") and (now_ts - last_rate_limit_budget_alert_ts) >= cfg.telegram_risk_alert_cooldown_seconds:
+                tg.send(
+                    "⚠️ Hyperliquid request-keret alacsony\n"
+                    f"headroom: {rate_limit_budget.get('headroom', 0):,.0f} request\n"
+                    f"used/cap: {rate_limit_budget.get('requests_used', 0):,.0f} / {rate_limit_budget.get('requests_cap', 0):,.0f}\n"
+                    f"cum volume: ${rate_limit_budget.get('cum_volume_usd', 0):,.0f}\n"
+                    f"frugal mode: {'AKTÍV' if rate_limit_budget.get('budget_frugal') else 'nem'}"
+                )
+                last_rate_limit_budget_alert_ts = now_ts
+
+            append_csv("logs/equity_curve.csv", [time.time(), equity, account_state.equity, account_state.realized_pnl, unrealized_pnl, account_state.fees_paid], ["ts", "equity", "cash", "realized_pnl", "unrealized_pnl", "fees_paid"])
+
+            status_payload = {
+                "status": strategy_status,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "execution_mode": "live_only",
+                "state_source": account_state.state_source,
+                "symbol": cfg.default_symbol,
+                "price": latest_close,
+                "regime": status.get("regime", "unknown"),
+                "mode": mode,
+                "order_size": status.get("order_size", 0.0),
+                "order_notional": status.get("order_notional", 0.0),
+                "position_size": account_state.position_size,
+                "position_notional": position_notional,
+                "cash": account_state.equity,
+                "realized_pnl": account_state.realized_pnl,
+                "unrealized_pnl": unrealized_pnl,
+                "fees_paid": account_state.fees_paid,
+                "equity": equity,
+                "daily_pnl_pct": account_daily_pnl_pct,
+                "account_daily_pnl_pct": account_daily_pnl_pct,
+                "bot_daily_pnl_pct": bot_daily_pnl_pct,
+                "risk_daily_pnl_pct": bot_daily_pnl_pct,
+                "risk_state": risk_state,
+                "strategy_status": strategy_status,
+                "pause_reason": reason,
+                "last_error": "",
+                "telegram_status": telegram_status,
+            }
+
+            last_trade = analytics_service._read_last_valid_trade(TRADES_CSV)
+            try:
+                analytics_service.write_last_100_real_trades(LAST_100_REAL_TRADES_CSV)
+            except Exception:
+                logger.exception("last_100_real_trades_export_failed")
+            blocked_1h, blocked_by_reason_1h, last_block_reason = analytics_service.risk_block_stats_window(now_ts=time.time())
+            stats_now_ts = time.time()
+            trade_stats_1h = analytics_service.trade_stats_window(now_ts=stats_now_ts)
+            trade_stats_30m = analytics_service.trade_stats_window(now_ts=stats_now_ts, window_seconds=1800)
+            trade_analytics = analytics_service.trade_analytics_report(exclude_dust=cfg.exclude_dust_from_performance_stats)
+            position_side = "FLAT"
+            if account_state.position_size > 0:
+                position_side = "LONG"
+            elif account_state.position_size < 0:
+                position_side = "SHORT"
+            effective_position_side = status.get("effective_position_side", position_side)
+            is_dust_position = bool(status.get("is_dust_position", False))
+            dust_threshold_usd = float(status.get("dust_threshold_usd", 1.0))
+            status_payload.update(
+                {
+                    "position_side": position_side,
+                    "effective_position_side": effective_position_side,
+                    "is_dust_position": is_dust_position,
+                    "dust_threshold_usd": dust_threshold_usd,
+                    "position_notional_raw": status.get("position_notional_raw", position_notional),
+                    "effective_position_notional": status.get("effective_position_notional", position_notional),
+                    "last_recenter_ts": status.get("last_recenter_ts"),
+                    "seconds_since_recenter": status.get("seconds_since_recenter"),
+                    "recenter_cooldown_seconds": status.get("recenter_cooldown_seconds"),
+                    "recenter_requested": bool(status.get("recenter_requested", False)),
+                    "recenter_blocked_by_cooldown": bool(status.get("recenter_blocked_by_cooldown", False)),
+                    "force_recenter": bool(status.get("force_recenter", False)),
+                    "in_position_for_recenter": bool(status.get("in_position_for_recenter", False)),
+                    "forced_rebuild": bool(status.get("forced_rebuild", False)),
+                    "rebuild_reason": status.get("rebuild_reason"),
+                    "grid_spacing_pct": status.get("grid_spacing_pct"),
+                    "spacing_source": status.get("spacing_source"),
+                    "atr_pct": status.get("atr_pct"),
+                    "grid_levels": status.get("grid_levels"),
+                    "configured_levels": status.get("configured_levels", cfg.grid_levels),
+                    "volatility_grid_levels": status.get("volatility_grid_levels"),
+                    "risk_adjusted_levels": status.get("risk_adjusted_levels"),
+                    "final_effective_levels": status.get("final_effective_levels", status.get("grid_levels")),
+                    "reduction_reason": status.get("grid_level_reduction_reason", status.get("reduction_reason")),
+                    "grid_level_reduction_reason": status.get("grid_level_reduction_reason"),
+                    "no_grid_orders_generated_reason": status.get("no_grid_orders_generated_reason"),
+                    "regime_confidence": status.get("regime_confidence"),
+                    "trend_bias": status.get("trend_bias"),
+                    "trend_transition_score": status.get("trend_transition_score"),
+                    "transition_direction": status.get("transition_direction"),
+                    "transition_confidence": status.get("transition_confidence"),
+                    "trend_transition_delta": status.get("trend_transition_delta"),
+                    "higher_high_sequence_score": status.get("higher_high_sequence_score"),
+                    "higher_low_sequence_score": status.get("higher_low_sequence_score"),
+                    "ema_slope_acceleration_score": status.get("ema_slope_acceleration_score"),
+                    "momentum_acceleration_score": status.get("momentum_acceleration_score"),
+                    "market_stress_enabled": status.get("market_stress_enabled"),
+                    "volatility_mode": status.get("volatility_mode"),
+                    "market_stress_score": status.get("market_stress_score"),
+                    "trend_strength_score": status.get("trend_strength_score"),
+                    "opportunity_mode": status.get("opportunity_mode"),
+                    "btc_5m_return_pct": status.get("btc_5m_return_pct"),
+                    "btc_1h_return_pct": status.get("btc_1h_return_pct"),
+                    "market_stress_reason": status.get("market_stress_reason"),
+                    "orderbook_filter_enabled": status.get("orderbook_filter_enabled"),
+                    "orderbook_soft_mode": status.get("orderbook_soft_mode"),
+                    "orderbook_available": status.get("orderbook_available"),
+                    "orderbook_ready": status.get("ready"),
+                    "orderbook_stale": status.get("stale", status.get("orderbook_stale")),
+                    "orderbook_bid_volume_top10": status.get("bid_volume_top10"),
+                    "orderbook_ask_volume_top10": status.get("ask_volume_top10"),
+                    "orderbook_imbalance_ratio": status.get("imbalance_ratio"),
+                    "orderbook_pressure_score": status.get("pressure_score"),
+                    "orderbook_classification": status.get("classification"),
+                    "orderbook_long_multiplier": status.get("long_size_multiplier"),
+                    "orderbook_short_multiplier": status.get("short_size_multiplier"),
+                    "orderbook_imbalance_ema": status.get("orderbook_imbalance_ema"),
+                    "orderbook_decision": status.get("orderbook_decision", status.get("decision")),
+                    "prediction_layer": status.get("prediction_layer"),
+                    "directional_score": status.get("directional_score"),
+                    "bullish_probability": status.get("bullish_probability"),
+                    "bearish_probability": status.get("bearish_probability"),
+                    "neutral_probability": status.get("neutral_probability"),
+                    "confidence_score": status.get("confidence_score"),
+                    "prediction_bias": status.get("prediction_bias"),
+                    "contributing_signals": status.get("contributing_signals"),
+                    "orderbook_bullish_entries": status.get("orderbook_bullish_entries", trade_analytics.get("orderbook_bullish_entries", 0)),
+                    "orderbook_bearish_entries": status.get("orderbook_bearish_entries", trade_analytics.get("orderbook_bearish_entries", 0)),
+                    "orderbook_filtered_entries": status.get("orderbook_filtered_entries", trade_analytics.get("orderbook_filtered_entries", 0)),
+                    "avg_pnl_bullish_entries": trade_analytics.get("avg_pnl_bullish_entries", 0.0),
+                    "avg_pnl_bearish_entries": trade_analytics.get("avg_pnl_bearish_entries", 0.0),
+                    "mark_price": latest_close,
+                    "last_trade_price": _safe_float(last_trade.get("price")),
+                    "last_trade_qty": _safe_float(last_trade.get("qty")),
+                    "last_trade_notional": _safe_float(last_trade.get("notional")),
+                    "last_trade_fee": _safe_float(last_trade.get("fee")),
+                    "last_trade_realized_pnl": _safe_float(last_trade.get("realized_pnl_delta")),
+                    "last_trade_reason": last_trade.get("reason", ""),
+                    "last_trade_side": last_trade.get("side", ""),
+                    "blocked_risk_decisions_1h": blocked_1h,
+                    "blocked_risk_decisions_by_reason_1h": blocked_by_reason_1h,
+                    "blocked_risk_decisions_30m": blocked_1h,
+                    "blocked_risk_decisions_by_reason": blocked_by_reason_1h,
+                    "last_block_reason": last_block_reason,
+                    "allowed_to_trade": bool(status.get("allowed_to_trade", risk_state == "OK")),
+                    "allowed_to_reduce": bool(status.get("allowed_to_reduce", abs(account_state.position_size) > 1e-12)),
+                    "position_management_action": status.get("position_management_action", "none"),
+                    "total_pnl": account_state.realized_pnl + unrealized_pnl,
+                    "total_pnl_pct": ((account_state.realized_pnl + unrealized_pnl) / daily_start_equity) if daily_start_equity > 0 else None,
+                    "account_equity": daily_metrics["account_equity"],
+                    "daily_start_equity": daily_metrics["daily_start_equity"],
+                    "daily_realized_pnl": daily_metrics["daily_realized_pnl"],
+                    "daily_unrealized_pnl": daily_metrics["daily_unrealized_pnl"],
+                    "daily_fees": daily_metrics["daily_fees"],
+                    "net_daily_pnl": daily_metrics["net_daily_pnl"],
+                    "daily_pnl": daily_metrics["daily_pnl"],
+                    "daily_pnl_pct": daily_metrics["daily_pnl_pct"],
+                    "account_daily_pnl": daily_metrics["daily_pnl"],
+                    "account_daily_pnl_pct": daily_metrics["daily_pnl_pct"],
+                    "bot_daily_realized_pnl": bot_daily_metrics["bot_daily_realized_pnl"],
+                    "bot_daily_fees": bot_daily_metrics["bot_daily_fees"],
+                    "bot_daily_pnl": bot_daily_metrics["bot_daily_pnl"],
+                    "bot_daily_pnl_pct": bot_daily_metrics["bot_daily_pnl_pct"],
+                    "risk_daily_pnl_pct": bot_daily_metrics["bot_daily_pnl_pct"],
+                    "manual_external_pnl_estimate": bot_daily_metrics["manual_external_pnl_estimate"],
+                    "bot_position_size": float(getattr(engine.state, "bot_position_size", 0.0) or 0.0),
+                    "open_bot_orders": sum(1 for o in getattr(engine, "open_orders", []) if bool(o.get("is_bot_order", True))),
+                    "unrealized_pnl_pct": ((unrealized_pnl / abs(account_state.avg_entry * account_state.position_size)) if abs(account_state.avg_entry * account_state.position_size) > 1e-9 else 0.0),
+                    "exposure_pct": (position_notional / equity) if equity > 1e-9 else 0.0,
+                    "avg_entry": account_state.avg_entry,
+                    "trades_1h": trade_stats_1h["trades_count"],
+                    "buy_count_1h": trade_stats_1h["buy_count"],
+                    "sell_count_1h": trade_stats_1h["sell_count"],
+                    "volume_usd_1h": trade_stats_1h["volume_usd"],
+                    "fees_1h": trade_stats_1h["fees"],
+                    "realized_pnl_delta_1h": trade_stats_1h["realized_pnl_delta"],
+                    "maker_trades_1h": trade_stats_1h["maker_trades"],
+                    "taker_trades_1h": trade_stats_1h["taker_trades"],
+                    "maker_fee_total_1h": trade_stats_1h["maker_fee_total"],
+                    "taker_fee_total_1h": trade_stats_1h["taker_fee_total"],
+                    "dust_trade_count_1h": trade_stats_1h["dust_trade_count"],
+                    "dust_volume_1h": trade_stats_1h["dust_volume"],
+                    "trades_30m": trade_stats_30m["trades_count"],
+                    "buy_count_30m": trade_stats_30m["buy_count"],
+                    "sell_count_30m": trade_stats_30m["sell_count"],
+                    "volume_usd_30m": trade_stats_30m["volume_usd"],
+                    "fees_30m": trade_stats_30m["fees"],
+                    "realized_pnl_delta_30m": trade_stats_30m["realized_pnl_delta"],
+                    "no_fill_cycles": engine.no_fill_cycles,
+                    "avg_profit_per_trade": trade_analytics["avg_profit_per_trade"],
+                    "avg_profit_per_winner": trade_analytics["avg_profit_per_winner"],
+                    "avg_loss_per_loser": trade_analytics["avg_loss_per_loser"],
+                    "trades_per_day": trade_analytics["trades_per_day"],
+                    "avg_winner": trade_analytics["avg_winner"],
+                    "avg_loser": trade_analytics["avg_loser"],
+                    "profit_factor": trade_analytics["profit_factor"],
+                    "expectancy": trade_analytics["expectancy"],
+                    "fee_gross_profit_ratio": trade_analytics["fee_gross_profit_ratio"],
+                    "average_holding_time_seconds": trade_analytics["average_holding_time_seconds"],
+                    "pnl_by_regime": trade_analytics["pnl_by_regime"],
+                    "trades_by_regime": trade_analytics["trades_by_regime"],
+                    "winrate_by_regime": trade_analytics["winrate_by_regime"],
+                    "profit_factor_by_regime": trade_analytics["profit_factor_by_regime"],
+                    "regime_performance": trade_analytics["regime_performance"],
+                    "pnl_by_trade_category": trade_analytics["pnl_by_trade_category"],
+                    "flip_trade_count": trade_analytics["flip_trade_count"],
+                    "flip_trade_pnl": trade_analytics["flip_trade_pnl"],
+                    "pnl_long_trades": trade_analytics["pnl_long_trades"],
+                    "pnl_short_trades": trade_analytics["pnl_short_trades"],
+                    "long_trades": trade_analytics["long_trades"],
+                    "short_trades": trade_analytics["short_trades"],
+                    "long_winrate_pct": trade_analytics["long_winrate_pct"],
+                    "short_winrate_pct": trade_analytics["short_winrate_pct"],
+                    "maker_trades": trade_analytics["maker_trades"],
+                    "taker_trades": trade_analytics["taker_trades"],
+                    "maker_fee_total": trade_analytics["maker_fee_total"],
+                    "taker_fee_total": trade_analytics["taker_fee_total"],
+                    "maker_ratio_pct": trade_analytics["maker_ratio_pct"],
+                    "taker_ratio_pct": trade_analytics["taker_ratio_pct"],
+                    "dust_trade_count": trade_analytics["dust_trade_count"],
+                    "dust_volume": trade_analytics["dust_volume"],
+                    "exclude_dust_from_performance_stats": trade_analytics["exclude_dust_from_performance_stats"],
+                    "avg_winner_before": trade_analytics["avg_winner_before"],
+                    "avg_winner_after": trade_analytics["avg_winner_after"],
+                    "gross_pnl_before_fees": trade_analytics["gross_pnl_before_fees"],
+                    "total_fees": trade_analytics["total_fees"],
+                    "net_pnl": trade_analytics["net_pnl"],
+                    "fee_to_gross_profit_ratio": trade_analytics["fee_to_gross_profit_ratio"],
+                    "avg_net_profit_per_closed_trade": trade_analytics["avg_net_profit_per_closed_trade"],
+                    "avg_fee_per_trade": trade_analytics["avg_fee_per_trade"],
+                    "profit_factor_after_fees": trade_analytics["profit_factor_after_fees"],
+                    "net_pnl_after_fees": trade_analytics["net_pnl_after_fees"],
+                    "average_winner": trade_analytics["average_winner"],
+                    "average_loser": trade_analytics["average_loser"],
+                    "win_loss_ratio": trade_analytics["win_loss_ratio"],
+                    "expectancy_per_trade": trade_analytics["expectancy_per_trade"],
+                    "long_trade_count": trade_analytics["long_trade_count"],
+                    "short_trade_count": trade_analytics["short_trade_count"],
+                    "long_pnl": trade_analytics["long_pnl"],
+                    "short_pnl": trade_analytics["short_pnl"],
+                    "long_profit_factor": trade_analytics["long_profit_factor"],
+                    "short_profit_factor": trade_analytics["short_profit_factor"],
+                    "avg_expected_profit": trade_analytics["avg_expected_profit"] or (status.get("expected_net_edge") or 0.0),
+                    "avg_realized_profit": trade_analytics["avg_realized_profit"],
+                    "avg_realized_loss": trade_analytics["avg_realized_loss"],
+                    "fills_under_10_usd": trade_analytics["fills_under_10_usd"],
+                    "fills_under_5_usd": trade_analytics["fills_under_5_usd"],
+                    "dust_cleanup_count": max(int(trade_analytics.get("dust_cleanup_count", 0) or 0), int(status.get("dust_cleanup_count", 0) or 0)),
+                    "sub_10_fill_sources": trade_analytics["sub_10_fill_sources"],
+                    "sub_5_fill_sources": trade_analytics["sub_5_fill_sources"],
+                    "bullish_entry_pnl": trade_analytics["bullish_entry_pnl"],
+                    "bearish_entry_pnl": trade_analytics["bearish_entry_pnl"],
+                    "pnl_when_prediction_long": trade_analytics["pnl_when_prediction_long"],
+                    "pnl_when_prediction_short": trade_analytics["pnl_when_prediction_short"],
+                    "pnl_when_prediction_neutral": trade_analytics["pnl_when_prediction_neutral"],
+                    "trades_when_prediction_long": trade_analytics["trades_when_prediction_long"],
+                    "trades_when_prediction_short": trade_analytics["trades_when_prediction_short"],
+                    "trades_when_prediction_neutral": trade_analytics["trades_when_prediction_neutral"],
+                    "min_notional_blocked_count": max(int(status.get("min_notional_blocked_count", 0) or 0), int(getattr(engine, "min_notional_blocked_count", 0) or 0)),
+                    "anti_chop_trigger_count": status.get("anti_chop_trigger_count", 0),
+                    "anti_chop_cooldown_active": status.get("anti_chop_cooldown_active", False),
+                    "anti_chop_cooldown_until": status.get("anti_chop_cooldown_until", ""),
+                    "edge_filter_skipped_orders": status.get("edge_filter_skipped_orders", 0),
+                    "edge_filter_skipped_by_reason": status.get("edge_filter_skipped_by_reason", {}),
+                    "expected_move_pct": status.get("expected_move_pct"),
+                    "expected_gross_pnl": status.get("expected_gross_pnl"),
+                    "expected_fee_cost": status.get("expected_fee_cost"),
+                    "expected_net_edge": status.get("expected_net_edge"),
+                    "expected_net_edge_pct": status.get("expected_net_edge_pct"),
+                    "expected_rr_ratio": status.get("expected_rr_ratio"),
+                    "orphan_order_cleanup_count": status.get("orphan_order_cleanup_count", 0),
+                    "stale_order_cleanup_count": status.get("stale_order_cleanup_count", 0),
+                    "orphan_order_detected": bool(status.get("orphan_order_detected", False)),
+                    "stale_order_detected": bool(status.get("stale_order_detected", False)),
+                    "cleanup_canceled_orders": status.get("cleanup_canceled_orders", 0),
+                    "state_uncertain_skip_cycle": bool(status.get("state_uncertain_skip_cycle", False)),
+                    "no_fill_watchdog_active": bool(status.get("no_fill_watchdog_active", False)),
+                    "no_fill_watchdog_enabled": bool(status.get("no_fill_watchdog_enabled", False)),
+                    "no_fill_minutes": status.get("no_fill_minutes"),
+                    "no_fill_max_minutes": status.get("no_fill_max_minutes"),
+                    "no_fill_spacing_reduction_pct": status.get("no_fill_spacing_reduction_pct"),
+                    "no_fill_min_spacing_pct": status.get("no_fill_min_spacing_pct"),
+                }
+            )
+            last_trade_ts = _resolve_last_real_trade_ts(cfg.default_symbol, fallback=(engine.last_real_trade_ts.isoformat() if engine.last_real_trade_ts else ""))
+            last_trade_dt = _parse_iso_utc(str(last_trade_ts))
+            last_trade_age_hours = ((datetime.now(timezone.utc) - last_trade_dt).total_seconds() / 3600) if last_trade_dt else None
+            mark_price = latest_close
+            buys = sorted([o for o in engine.open_orders if str(o.get("symbol", "")).upper() == cfg.default_symbol.upper() and str(o.get("side", "")).lower() == "buy"], key=lambda x: float(x.get("price", 0.0)), reverse=True)
+            sells = sorted([o for o in engine.open_orders if str(o.get("symbol", "")).upper() == cfg.default_symbol.upper() and str(o.get("side", "")).lower() == "sell"], key=lambda x: float(x.get("price", 0.0)))
+            no_grid_orders_generated = not buys and not sells
+            if no_grid_orders_generated:
+                logger.info(
+                    "no_grid_orders_generated reason=%s status=%s pause_reason=%s configured_levels=%s volatility_grid_levels=%s risk_adjusted_levels=%s final_effective_levels=%s reduction_reason=%s allowed_to_trade=%s force_recenter=%s rebuild_reason=%s state_uncertain_skip_cycle=%s",
+                    status_payload.get("no_grid_orders_generated_reason") or "no_active_exchange_orders",
+                    strategy_status,
+                    reason or "none",
+                    status_payload.get("configured_levels"),
+                    status_payload.get("volatility_grid_levels"),
+                    status_payload.get("risk_adjusted_levels"),
+                    status_payload.get("final_effective_levels"),
+                    status_payload.get("reduction_reason"),
+                    status_payload.get("allowed_to_trade"),
+                    status_payload.get("force_recenter"),
+                    status_payload.get("rebuild_reason"),
+                    status_payload.get("state_uncertain_skip_cycle"),
+                )
+            grid_diagnostic_report = _update_grid_diagnostic_report(grid_diagnostic_report, status_payload, no_grid_orders_generated=no_grid_orders_generated)
+            status_payload["grid_diagnostic_report"] = dict(grid_diagnostic_report)
+            next_order = None
+            if buys:
+                next_order = {"side": "buy", "price": float(buys[0]["price"])}
+            if sells and (next_order is None or abs(float(sells[0]["price"]) - mark_price) < abs(next_order["price"] - mark_price)):
+                next_order = {"side": "sell", "price": float(sells[0]["price"])}
+            next_exit_side = None
+            next_exit_price = None
+            if account_state.position_size > 0 and sells:
+                next_exit_side = "sell"
+                next_exit_price = float(sells[0]["price"])
+            elif account_state.position_size < 0 and buys:
+                next_exit_side = "buy"
+                next_exit_price = float(buys[0]["price"])
+
+            status_payload.update({"last_real_trade_ts": last_trade_ts, "last_real_trade_age_hours": last_trade_age_hours, "next_order_side": next_order["side"] if next_order else None, "next_order_price": next_order["price"] if next_order else None, "next_exit_side": next_exit_side, "next_exit_price": next_exit_price, "take_profit_price": next_exit_price, "stop_price": None, "trailing_stop_price": None})
+            nearest_buy = float(buys[0]["price"]) if buys else None
+            nearest_sell = float(sells[0]["price"]) if sells else None
+            fill_rate_metrics = engine.fill_rate_metrics(mark_price, symbol=cfg.default_symbol) if hasattr(engine, "fill_rate_metrics") else {}
+            time_since_last_fill_minutes = _time_since_last_fill_minutes(fill_rate_metrics, engine, cfg.tick_seconds)
+            if isinstance(fill_rate_metrics, dict):
+                fill_rate_metrics["time_since_last_fill_minutes"] = time_since_last_fill_minutes
+            _log_low_fill_rate_warning(time_since_last_fill_minutes)
+            one_hour_fill_rate = fill_rate_metrics.get("1h", {}) if isinstance(fill_rate_metrics.get("1h", {}), dict) else {}
+            logger.info(
+                "fill_rate_state orders_submitted=%s orders_cancelled=%s orders_filled=%s cancel_to_fill_ratio=%s nearest_buy_distance_pct=%s nearest_sell_distance_pct=%s time_since_last_fill_minutes=%s avg_order_lifetime_seconds=%s avg_order_distance_to_mid_pct=%s spacing_pct=%s reprice_decision=%s reprice_reason=%s no_fill_watchdog_active=%s",
+                one_hour_fill_rate.get("orders_submitted", 0),
+                one_hour_fill_rate.get("orders_cancelled", 0),
+                one_hour_fill_rate.get("orders_filled", 0),
+                one_hour_fill_rate.get("cancel_to_fill_ratio", 0.0),
+                fill_rate_metrics.get("nearest_buy_distance_pct"),
+                fill_rate_metrics.get("nearest_sell_distance_pct"),
+                time_since_last_fill_minutes,
+                one_hour_fill_rate.get("avg_order_lifetime_seconds", one_hour_fill_rate.get("average_order_lifetime_seconds", 0.0)),
+                fill_rate_metrics.get("average_distance_to_mid_pct"),
+                status_payload.get("grid_spacing_pct"),
+                (status.get("orders", {}) or {}).get("reprice_decision") if isinstance(status.get("orders", {}), dict) else None,
+                (status.get("orders", {}) or {}).get("reprice_reason") if isinstance(status.get("orders", {}), dict) else None,
+                status.get("no_fill_watchdog_active", False),
+            )
+            status_payload.update(
+                {
+                    "nearest_buy_price": nearest_buy,
+                    "nearest_sell_price": nearest_sell,
+                    "distance_to_buy_pct": ((mark_price - nearest_buy) / mark_price) if nearest_buy else None,
+                    "distance_to_sell_pct": ((nearest_sell - mark_price) / mark_price) if nearest_sell else None,
+                    "fill_rate": fill_rate_metrics,
+                    "fill_rate_1h": one_hour_fill_rate,
+                    "fill_rate_6h": fill_rate_metrics.get("6h", {}),
+                    "fill_rate_24h": fill_rate_metrics.get("24h", {}),
+                    "average_distance_to_mid_pct": fill_rate_metrics.get("average_distance_to_mid_pct"),
+                    "nearest_buy_distance_pct": fill_rate_metrics.get("nearest_buy_distance_pct"),
+                    "nearest_sell_distance_pct": fill_rate_metrics.get("nearest_sell_distance_pct"),
+                    "time_since_last_fill_minutes": time_since_last_fill_minutes,
+                    "active_buy_orders": len(buys),
+                    "active_sell_orders": len(sells),
+                    "one_sided_grid_due_to_dust": bool(is_dust_position and ((len(buys) == 0) ^ (len(sells) == 0)) and (len(buys) + len(sells) > 0)),
+                    "open_orders": len(engine.open_orders),
+                    "rate_limit_budget": getattr(engine, "rate_limit_budget", {}) or {},
+                    "trade_health_24h": engine.trade_health_metrics() if hasattr(engine, "trade_health_metrics") else {},
+                }
+            )
+            _write_status(status_payload)
+            if cfg.telegram_enable_commands:
+                for update in tg.fetch_commands():
+                    text = str(update.get("message", {}).get("text", "")).strip()
+                    if not text.startswith("/"):
+                        continue
+                    if text.startswith("/help"):
+                        tg.send("/status - aktuális státusz\n/risk - risk állapot\n/trades - utolsó 5 trade\n/help - parancsok")
+                    elif text.startswith("/status"):
+                        tg.send(tg.format_status_report({**status_payload, "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")}))
+                    elif text.startswith("/risk"):
+                        tg.send(f"risk_state: {status_payload.get('risk_state')}\npause_reason: {status_payload.get('pause_reason') or 'none'}\nlast_block_reason: {status_payload.get('last_block_reason') or 'none'}\nblocked_risk_decisions_1h: {status_payload.get('blocked_risk_decisions_1h', 0)}\nallowed_to_trade: {status_payload.get('allowed_to_trade')}")
+                    elif text.startswith("/trades"):
+                        lines = ["Utolsó trades:"]
+                        for r in list(recent_trades)[-5:]:
+                            lines.append(
+                                f"{r.get('timestamp','')} | {r.get('side','').upper()} "
+                                f"{r.get('qty','')} @ {r.get('price','')} | pnlΔ {r.get('realized_pnl_delta','0')}"
+                            )
+                        tg.send("\n".join(lines) if len(lines) > 1 else "Még nincs trade ebben a sessionben.")
+
+            now_ts = time.time()
+            if cfg.telegram_send_periodic_status and (now_ts - last_telegram_report_ts) >= cfg.telegram_report_interval_seconds:
+                tg.send_status_report({**status_payload, "status": status.get("status", "unknown"), "network": cfg.hl_network, "mode_name": "LIVE", "grid_mode": mode, "risk_reason": reason or "none", "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")})
+                last_telegram_report_ts = now_ts
+
             engine.state.current_day = current_day.isoformat()
             engine.state.daily_start_equity = daily_start_equity
             engine.state.daily_start_realized_pnl = daily_start_realized_pnl
             engine.state.daily_start_fees_paid = daily_start_fees_paid
-            engine.state.bot_daily_realized_pnl = 0.0
-            engine.state.bot_daily_fees_paid = 0.0
             engine.save_state()
-        daily_metrics = calculate_daily_pnl_metrics(current_equity=equity, daily_start_equity=daily_start_equity, realized_pnl_total=account_state.realized_pnl, daily_start_realized_pnl=daily_start_realized_pnl, unrealized_pnl=unrealized_pnl, fees_paid_total=account_state.fees_paid, daily_start_fees_paid=daily_start_fees_paid)
-        bot_daily_metrics = calculate_bot_daily_pnl_metrics(
-            bot_daily_realized_pnl=float(getattr(engine.state, "bot_daily_realized_pnl", 0.0) or 0.0),
-            bot_daily_fees_paid=float(getattr(engine.state, "bot_daily_fees_paid", 0.0) or 0.0),
-            account_daily_pnl=daily_metrics["daily_pnl"],
-            daily_start_equity=daily_start_equity,
-        )
-        account_daily_pnl_pct = daily_metrics["daily_pnl_pct"]
-        bot_daily_pnl_pct = bot_daily_metrics["bot_daily_pnl_pct"]
-
-        order_book_snapshot = None
-        try:
-            order_book_snapshot = client.get_l2_book(cfg.default_symbol)
-            if isinstance(order_book_snapshot, dict) and "received_ts" not in order_book_snapshot:
-                order_book_snapshot = {**order_book_snapshot, "received_ts": time.time()}
+            time.sleep(cfg.tick_seconds)
+            consecutive_tick_errors = 0
+        except KeyboardInterrupt:
+            raise
         except Exception as exc:
-            logger.warning("orderbook_unavailable symbol=%s reason=fetch_error fallback=existing_strategy error=%s", cfg.default_symbol, exc)
-        status = orchestrator.on_tick(candles, equity=equity, daily_pnl_pct=bot_daily_pnl_pct, symbol=cfg.default_symbol, position_notional=position_notional, order_book_snapshot=order_book_snapshot)
-        risk = status.get("risk")
-        reason = status.get("reason") or (getattr(risk, "reason", "") if risk else "")
-        strategy_status = status.get("status", "unknown")
-        risk_state = _derive_risk_state(strategy_status, reason)
-        mode = status.get("mode", "reduce_only" if reason == "reduce_only_requested" else "neutral")
-
-        latest_candle = candles.iloc[-1].to_dict()
-        latest_candle["symbol"] = cfg.default_symbol
-        fills = engine.on_candle(
-            latest_candle,
-            regime=status.get("regime", "unknown"),
-            mode=mode,
-            risk_state=risk_state,
-            pause_reason=reason,
-            strategy_status=strategy_status,
-            orderbook_classification=status.get("classification", status.get("orderbook_entry_classification", "")),
-            orderbook_imbalance_ratio=status.get("imbalance_ratio"),
-            orderbook_pressure_score=status.get("pressure_score"),
-            prediction_bias=status.get("prediction_bias", ""),
-        )
-        trade_events = engine.consume_trade_log()
-        account_state = _account_metrics(cfg, engine, client, latest_close)
-        unrealized_pnl, equity, position_notional = account_state.unrealized_pnl, account_state.equity, account_state.position_notional
-        daily_metrics = calculate_daily_pnl_metrics(current_equity=equity, daily_start_equity=daily_start_equity, realized_pnl_total=account_state.realized_pnl, daily_start_realized_pnl=daily_start_realized_pnl, unrealized_pnl=unrealized_pnl, fees_paid_total=account_state.fees_paid, daily_start_fees_paid=daily_start_fees_paid)
-        bot_daily_metrics = calculate_bot_daily_pnl_metrics(
-            bot_daily_realized_pnl=float(getattr(engine.state, "bot_daily_realized_pnl", 0.0) or 0.0),
-            bot_daily_fees_paid=float(getattr(engine.state, "bot_daily_fees_paid", 0.0) or 0.0),
-            account_daily_pnl=daily_metrics["daily_pnl"],
-            daily_start_equity=daily_start_equity,
-        )
-        account_daily_pnl_pct = daily_metrics["daily_pnl_pct"]
-        bot_daily_pnl_pct = bot_daily_metrics["bot_daily_pnl_pct"]
-
-        for tr in trade_events:
-            recent_trades.append(tr)
-            logger.info("trade_event side=%s symbol=%s price=%.6f qty=%.8f", tr["side"], tr["symbol"], tr["price"], tr["qty"])
-            if cfg.telegram_send_fills:
-                msg = tg.format_fill_alert(tr, mode_name="LIVE")
-                if tg.send(msg):
-                    logger.info("telegram_fill_alert_sent side=%s", str(tr.get("side", "")).upper())
-                else:
-                    logger.warning("telegram_fill_alert_failed error=send_returned_false side=%s", str(tr.get("side", "")).upper())
-        last_trade_dt = engine.last_real_trade_ts
-
-        hard_risk_reasons = {"emergency_stop", "max_drawdown", "daily_loss", "daily_loss_limit", "max_position_notional", "liquidation_risk", "liq_distance"}
-        now_ts = time.time()
-        if cfg.telegram_send_hard_risk_alerts and risk_state == "BLOCKED" and reason in hard_risk_reasons:
-            prev_ts = last_hard_risk_alert_ts.get(reason, 0.0)
-            if now_ts - prev_ts >= cfg.telegram_risk_alert_cooldown_seconds:
-                tg.send(f"🛡 HARD RISK BLOCK\nreason: {reason}\nrisk_state: {risk_state}\npause_reason: {reason or 'none'}")
-                last_hard_risk_alert_ts[reason] = now_ts
-        if last_risk_state_value == "BLOCKED" and risk_state == "OK" and (now_ts - last_recovery_alert_ts) >= cfg.telegram_risk_alert_cooldown_seconds:
-            tg.send("✅ Risk recovered: OK")
-            last_recovery_alert_ts = now_ts
-        last_risk_state_value = risk_state
-        last_pause_reason = reason
-
-        rate_limit_budget = engine.poll_rate_limit_budget() if hasattr(engine, "poll_rate_limit_budget") else None
-        if rate_limit_budget and rate_limit_budget.get("headroom_alert") and (now_ts - last_rate_limit_budget_alert_ts) >= cfg.telegram_risk_alert_cooldown_seconds:
-            tg.send(
-                "⚠️ Hyperliquid request-keret alacsony\n"
-                f"headroom: {rate_limit_budget.get('headroom', 0):,.0f} request\n"
-                f"used/cap: {rate_limit_budget.get('requests_used', 0):,.0f} / {rate_limit_budget.get('requests_cap', 0):,.0f}\n"
-                f"cum volume: ${rate_limit_budget.get('cum_volume_usd', 0):,.0f}\n"
-                f"frugal mode: {'AKTÍV' if rate_limit_budget.get('budget_frugal') else 'nem'}"
-            )
-            last_rate_limit_budget_alert_ts = now_ts
-
-        append_csv("logs/equity_curve.csv", [time.time(), equity, account_state.equity, account_state.realized_pnl, unrealized_pnl, account_state.fees_paid], ["ts", "equity", "cash", "realized_pnl", "unrealized_pnl", "fees_paid"])
-
-        status_payload = {
-            "status": strategy_status,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "execution_mode": "live_only",
-            "state_source": account_state.state_source,
-            "symbol": cfg.default_symbol,
-            "price": latest_close,
-            "regime": status.get("regime", "unknown"),
-            "mode": mode,
-            "order_size": status.get("order_size", 0.0),
-            "order_notional": status.get("order_notional", 0.0),
-            "position_size": account_state.position_size,
-            "position_notional": position_notional,
-            "cash": account_state.equity,
-            "realized_pnl": account_state.realized_pnl,
-            "unrealized_pnl": unrealized_pnl,
-            "fees_paid": account_state.fees_paid,
-            "equity": equity,
-            "daily_pnl_pct": account_daily_pnl_pct,
-            "account_daily_pnl_pct": account_daily_pnl_pct,
-            "bot_daily_pnl_pct": bot_daily_pnl_pct,
-            "risk_daily_pnl_pct": bot_daily_pnl_pct,
-            "risk_state": risk_state,
-            "strategy_status": strategy_status,
-            "pause_reason": reason,
-            "last_error": "",
-            "telegram_status": telegram_status,
-        }
-
-        last_trade = analytics_service._read_last_valid_trade(TRADES_CSV)
-        try:
-            analytics_service.write_last_100_real_trades(LAST_100_REAL_TRADES_CSV)
-        except Exception:
-            logger.exception("last_100_real_trades_export_failed")
-        blocked_1h, blocked_by_reason_1h, last_block_reason = analytics_service.risk_block_stats_window(now_ts=time.time())
-        stats_now_ts = time.time()
-        trade_stats_1h = analytics_service.trade_stats_window(now_ts=stats_now_ts)
-        trade_stats_30m = analytics_service.trade_stats_window(now_ts=stats_now_ts, window_seconds=1800)
-        trade_analytics = analytics_service.trade_analytics_report(exclude_dust=cfg.exclude_dust_from_performance_stats)
-        position_side = "FLAT"
-        if account_state.position_size > 0:
-            position_side = "LONG"
-        elif account_state.position_size < 0:
-            position_side = "SHORT"
-        effective_position_side = status.get("effective_position_side", position_side)
-        is_dust_position = bool(status.get("is_dust_position", False))
-        dust_threshold_usd = float(status.get("dust_threshold_usd", 1.0))
-        status_payload.update(
-            {
-                "position_side": position_side,
-                "effective_position_side": effective_position_side,
-                "is_dust_position": is_dust_position,
-                "dust_threshold_usd": dust_threshold_usd,
-                "position_notional_raw": status.get("position_notional_raw", position_notional),
-                "effective_position_notional": status.get("effective_position_notional", position_notional),
-                "last_recenter_ts": status.get("last_recenter_ts"),
-                "seconds_since_recenter": status.get("seconds_since_recenter"),
-                "recenter_cooldown_seconds": status.get("recenter_cooldown_seconds"),
-                "recenter_requested": bool(status.get("recenter_requested", False)),
-                "recenter_blocked_by_cooldown": bool(status.get("recenter_blocked_by_cooldown", False)),
-                "force_recenter": bool(status.get("force_recenter", False)),
-                "in_position_for_recenter": bool(status.get("in_position_for_recenter", False)),
-                "forced_rebuild": bool(status.get("forced_rebuild", False)),
-                "rebuild_reason": status.get("rebuild_reason"),
-                "grid_spacing_pct": status.get("grid_spacing_pct"),
-                "spacing_source": status.get("spacing_source"),
-                "atr_pct": status.get("atr_pct"),
-                "grid_levels": status.get("grid_levels"),
-                "configured_levels": status.get("configured_levels", cfg.grid_levels),
-                "volatility_grid_levels": status.get("volatility_grid_levels"),
-                "risk_adjusted_levels": status.get("risk_adjusted_levels"),
-                "final_effective_levels": status.get("final_effective_levels", status.get("grid_levels")),
-                "reduction_reason": status.get("grid_level_reduction_reason", status.get("reduction_reason")),
-                "grid_level_reduction_reason": status.get("grid_level_reduction_reason"),
-                "no_grid_orders_generated_reason": status.get("no_grid_orders_generated_reason"),
-                "regime_confidence": status.get("regime_confidence"),
-                "trend_bias": status.get("trend_bias"),
-                "trend_transition_score": status.get("trend_transition_score"),
-                "transition_direction": status.get("transition_direction"),
-                "transition_confidence": status.get("transition_confidence"),
-                "trend_transition_delta": status.get("trend_transition_delta"),
-                "higher_high_sequence_score": status.get("higher_high_sequence_score"),
-                "higher_low_sequence_score": status.get("higher_low_sequence_score"),
-                "ema_slope_acceleration_score": status.get("ema_slope_acceleration_score"),
-                "momentum_acceleration_score": status.get("momentum_acceleration_score"),
-                "market_stress_enabled": status.get("market_stress_enabled"),
-                "volatility_mode": status.get("volatility_mode"),
-                "market_stress_score": status.get("market_stress_score"),
-                "trend_strength_score": status.get("trend_strength_score"),
-                "opportunity_mode": status.get("opportunity_mode"),
-                "btc_5m_return_pct": status.get("btc_5m_return_pct"),
-                "btc_1h_return_pct": status.get("btc_1h_return_pct"),
-                "market_stress_reason": status.get("market_stress_reason"),
-                "orderbook_filter_enabled": status.get("orderbook_filter_enabled"),
-                "orderbook_soft_mode": status.get("orderbook_soft_mode"),
-                "orderbook_available": status.get("orderbook_available"),
-                "orderbook_ready": status.get("ready"),
-                "orderbook_stale": status.get("stale", status.get("orderbook_stale")),
-                "orderbook_bid_volume_top10": status.get("bid_volume_top10"),
-                "orderbook_ask_volume_top10": status.get("ask_volume_top10"),
-                "orderbook_imbalance_ratio": status.get("imbalance_ratio"),
-                "orderbook_pressure_score": status.get("pressure_score"),
-                "orderbook_classification": status.get("classification"),
-                "orderbook_long_multiplier": status.get("long_size_multiplier"),
-                "orderbook_short_multiplier": status.get("short_size_multiplier"),
-                "orderbook_imbalance_ema": status.get("orderbook_imbalance_ema"),
-                "orderbook_decision": status.get("orderbook_decision", status.get("decision")),
-                "prediction_layer": status.get("prediction_layer"),
-                "directional_score": status.get("directional_score"),
-                "bullish_probability": status.get("bullish_probability"),
-                "bearish_probability": status.get("bearish_probability"),
-                "neutral_probability": status.get("neutral_probability"),
-                "confidence_score": status.get("confidence_score"),
-                "prediction_bias": status.get("prediction_bias"),
-                "contributing_signals": status.get("contributing_signals"),
-                "orderbook_bullish_entries": status.get("orderbook_bullish_entries", trade_analytics.get("orderbook_bullish_entries", 0)),
-                "orderbook_bearish_entries": status.get("orderbook_bearish_entries", trade_analytics.get("orderbook_bearish_entries", 0)),
-                "orderbook_filtered_entries": status.get("orderbook_filtered_entries", trade_analytics.get("orderbook_filtered_entries", 0)),
-                "avg_pnl_bullish_entries": trade_analytics.get("avg_pnl_bullish_entries", 0.0),
-                "avg_pnl_bearish_entries": trade_analytics.get("avg_pnl_bearish_entries", 0.0),
-                "mark_price": latest_close,
-                "last_trade_price": _safe_float(last_trade.get("price")),
-                "last_trade_qty": _safe_float(last_trade.get("qty")),
-                "last_trade_notional": _safe_float(last_trade.get("notional")),
-                "last_trade_fee": _safe_float(last_trade.get("fee")),
-                "last_trade_realized_pnl": _safe_float(last_trade.get("realized_pnl_delta")),
-                "last_trade_reason": last_trade.get("reason", ""),
-                "last_trade_side": last_trade.get("side", ""),
-                "blocked_risk_decisions_1h": blocked_1h,
-                "blocked_risk_decisions_by_reason_1h": blocked_by_reason_1h,
-                "blocked_risk_decisions_30m": blocked_1h,
-                "blocked_risk_decisions_by_reason": blocked_by_reason_1h,
-                "last_block_reason": last_block_reason,
-                "allowed_to_trade": bool(status.get("allowed_to_trade", risk_state == "OK")),
-                "allowed_to_reduce": bool(status.get("allowed_to_reduce", abs(account_state.position_size) > 1e-12)),
-                "position_management_action": status.get("position_management_action", "none"),
-                "total_pnl": account_state.realized_pnl + unrealized_pnl,
-                "total_pnl_pct": ((account_state.realized_pnl + unrealized_pnl) / daily_start_equity) if daily_start_equity > 0 else None,
-                "account_equity": daily_metrics["account_equity"],
-                "daily_start_equity": daily_metrics["daily_start_equity"],
-                "daily_realized_pnl": daily_metrics["daily_realized_pnl"],
-                "daily_unrealized_pnl": daily_metrics["daily_unrealized_pnl"],
-                "daily_fees": daily_metrics["daily_fees"],
-                "net_daily_pnl": daily_metrics["net_daily_pnl"],
-                "daily_pnl": daily_metrics["daily_pnl"],
-                "daily_pnl_pct": daily_metrics["daily_pnl_pct"],
-                "account_daily_pnl": daily_metrics["daily_pnl"],
-                "account_daily_pnl_pct": daily_metrics["daily_pnl_pct"],
-                "bot_daily_realized_pnl": bot_daily_metrics["bot_daily_realized_pnl"],
-                "bot_daily_fees": bot_daily_metrics["bot_daily_fees"],
-                "bot_daily_pnl": bot_daily_metrics["bot_daily_pnl"],
-                "bot_daily_pnl_pct": bot_daily_metrics["bot_daily_pnl_pct"],
-                "risk_daily_pnl_pct": bot_daily_metrics["bot_daily_pnl_pct"],
-                "manual_external_pnl_estimate": bot_daily_metrics["manual_external_pnl_estimate"],
-                "bot_position_size": float(getattr(engine.state, "bot_position_size", 0.0) or 0.0),
-                "open_bot_orders": sum(1 for o in getattr(engine, "open_orders", []) if bool(o.get("is_bot_order", True))),
-                "unrealized_pnl_pct": ((unrealized_pnl / abs(account_state.avg_entry * account_state.position_size)) if abs(account_state.avg_entry * account_state.position_size) > 1e-9 else 0.0),
-                "exposure_pct": (position_notional / equity) if equity > 1e-9 else 0.0,
-                "avg_entry": account_state.avg_entry,
-                "trades_1h": trade_stats_1h["trades_count"],
-                "buy_count_1h": trade_stats_1h["buy_count"],
-                "sell_count_1h": trade_stats_1h["sell_count"],
-                "volume_usd_1h": trade_stats_1h["volume_usd"],
-                "fees_1h": trade_stats_1h["fees"],
-                "realized_pnl_delta_1h": trade_stats_1h["realized_pnl_delta"],
-                "maker_trades_1h": trade_stats_1h["maker_trades"],
-                "taker_trades_1h": trade_stats_1h["taker_trades"],
-                "maker_fee_total_1h": trade_stats_1h["maker_fee_total"],
-                "taker_fee_total_1h": trade_stats_1h["taker_fee_total"],
-                "dust_trade_count_1h": trade_stats_1h["dust_trade_count"],
-                "dust_volume_1h": trade_stats_1h["dust_volume"],
-                "trades_30m": trade_stats_30m["trades_count"],
-                "buy_count_30m": trade_stats_30m["buy_count"],
-                "sell_count_30m": trade_stats_30m["sell_count"],
-                "volume_usd_30m": trade_stats_30m["volume_usd"],
-                "fees_30m": trade_stats_30m["fees"],
-                "realized_pnl_delta_30m": trade_stats_30m["realized_pnl_delta"],
-                "no_fill_cycles": engine.no_fill_cycles,
-                "avg_profit_per_trade": trade_analytics["avg_profit_per_trade"],
-                "avg_profit_per_winner": trade_analytics["avg_profit_per_winner"],
-                "avg_loss_per_loser": trade_analytics["avg_loss_per_loser"],
-                "trades_per_day": trade_analytics["trades_per_day"],
-                "avg_winner": trade_analytics["avg_winner"],
-                "avg_loser": trade_analytics["avg_loser"],
-                "profit_factor": trade_analytics["profit_factor"],
-                "expectancy": trade_analytics["expectancy"],
-                "fee_gross_profit_ratio": trade_analytics["fee_gross_profit_ratio"],
-                "average_holding_time_seconds": trade_analytics["average_holding_time_seconds"],
-                "pnl_by_regime": trade_analytics["pnl_by_regime"],
-                "trades_by_regime": trade_analytics["trades_by_regime"],
-                "winrate_by_regime": trade_analytics["winrate_by_regime"],
-                "profit_factor_by_regime": trade_analytics["profit_factor_by_regime"],
-                "regime_performance": trade_analytics["regime_performance"],
-                "pnl_by_trade_category": trade_analytics["pnl_by_trade_category"],
-                "flip_trade_count": trade_analytics["flip_trade_count"],
-                "flip_trade_pnl": trade_analytics["flip_trade_pnl"],
-                "pnl_long_trades": trade_analytics["pnl_long_trades"],
-                "pnl_short_trades": trade_analytics["pnl_short_trades"],
-                "long_trades": trade_analytics["long_trades"],
-                "short_trades": trade_analytics["short_trades"],
-                "long_winrate_pct": trade_analytics["long_winrate_pct"],
-                "short_winrate_pct": trade_analytics["short_winrate_pct"],
-                "maker_trades": trade_analytics["maker_trades"],
-                "taker_trades": trade_analytics["taker_trades"],
-                "maker_fee_total": trade_analytics["maker_fee_total"],
-                "taker_fee_total": trade_analytics["taker_fee_total"],
-                "maker_ratio_pct": trade_analytics["maker_ratio_pct"],
-                "taker_ratio_pct": trade_analytics["taker_ratio_pct"],
-                "dust_trade_count": trade_analytics["dust_trade_count"],
-                "dust_volume": trade_analytics["dust_volume"],
-                "exclude_dust_from_performance_stats": trade_analytics["exclude_dust_from_performance_stats"],
-                "avg_winner_before": trade_analytics["avg_winner_before"],
-                "avg_winner_after": trade_analytics["avg_winner_after"],
-                "gross_pnl_before_fees": trade_analytics["gross_pnl_before_fees"],
-                "total_fees": trade_analytics["total_fees"],
-                "net_pnl": trade_analytics["net_pnl"],
-                "fee_to_gross_profit_ratio": trade_analytics["fee_to_gross_profit_ratio"],
-                "avg_net_profit_per_closed_trade": trade_analytics["avg_net_profit_per_closed_trade"],
-                "avg_fee_per_trade": trade_analytics["avg_fee_per_trade"],
-                "profit_factor_after_fees": trade_analytics["profit_factor_after_fees"],
-                "net_pnl_after_fees": trade_analytics["net_pnl_after_fees"],
-                "average_winner": trade_analytics["average_winner"],
-                "average_loser": trade_analytics["average_loser"],
-                "win_loss_ratio": trade_analytics["win_loss_ratio"],
-                "expectancy_per_trade": trade_analytics["expectancy_per_trade"],
-                "long_trade_count": trade_analytics["long_trade_count"],
-                "short_trade_count": trade_analytics["short_trade_count"],
-                "long_pnl": trade_analytics["long_pnl"],
-                "short_pnl": trade_analytics["short_pnl"],
-                "long_profit_factor": trade_analytics["long_profit_factor"],
-                "short_profit_factor": trade_analytics["short_profit_factor"],
-                "avg_expected_profit": trade_analytics["avg_expected_profit"] or (status.get("expected_net_edge") or 0.0),
-                "avg_realized_profit": trade_analytics["avg_realized_profit"],
-                "avg_realized_loss": trade_analytics["avg_realized_loss"],
-                "fills_under_10_usd": trade_analytics["fills_under_10_usd"],
-                "fills_under_5_usd": trade_analytics["fills_under_5_usd"],
-                "dust_cleanup_count": max(int(trade_analytics.get("dust_cleanup_count", 0) or 0), int(status.get("dust_cleanup_count", 0) or 0)),
-                "sub_10_fill_sources": trade_analytics["sub_10_fill_sources"],
-                "sub_5_fill_sources": trade_analytics["sub_5_fill_sources"],
-                "bullish_entry_pnl": trade_analytics["bullish_entry_pnl"],
-                "bearish_entry_pnl": trade_analytics["bearish_entry_pnl"],
-                "pnl_when_prediction_long": trade_analytics["pnl_when_prediction_long"],
-                "pnl_when_prediction_short": trade_analytics["pnl_when_prediction_short"],
-                "pnl_when_prediction_neutral": trade_analytics["pnl_when_prediction_neutral"],
-                "trades_when_prediction_long": trade_analytics["trades_when_prediction_long"],
-                "trades_when_prediction_short": trade_analytics["trades_when_prediction_short"],
-                "trades_when_prediction_neutral": trade_analytics["trades_when_prediction_neutral"],
-                "min_notional_blocked_count": max(int(status.get("min_notional_blocked_count", 0) or 0), int(getattr(engine, "min_notional_blocked_count", 0) or 0)),
-                "anti_chop_trigger_count": status.get("anti_chop_trigger_count", 0),
-                "anti_chop_cooldown_active": status.get("anti_chop_cooldown_active", False),
-                "anti_chop_cooldown_until": status.get("anti_chop_cooldown_until", ""),
-                "edge_filter_skipped_orders": status.get("edge_filter_skipped_orders", 0),
-                "edge_filter_skipped_by_reason": status.get("edge_filter_skipped_by_reason", {}),
-                "expected_move_pct": status.get("expected_move_pct"),
-                "expected_gross_pnl": status.get("expected_gross_pnl"),
-                "expected_fee_cost": status.get("expected_fee_cost"),
-                "expected_net_edge": status.get("expected_net_edge"),
-                "expected_net_edge_pct": status.get("expected_net_edge_pct"),
-                "expected_rr_ratio": status.get("expected_rr_ratio"),
-                "orphan_order_cleanup_count": status.get("orphan_order_cleanup_count", 0),
-                "stale_order_cleanup_count": status.get("stale_order_cleanup_count", 0),
-                "orphan_order_detected": bool(status.get("orphan_order_detected", False)),
-                "stale_order_detected": bool(status.get("stale_order_detected", False)),
-                "cleanup_canceled_orders": status.get("cleanup_canceled_orders", 0),
-                "state_uncertain_skip_cycle": bool(status.get("state_uncertain_skip_cycle", False)),
-                "no_fill_watchdog_active": bool(status.get("no_fill_watchdog_active", False)),
-                "no_fill_watchdog_enabled": bool(status.get("no_fill_watchdog_enabled", False)),
-                "no_fill_minutes": status.get("no_fill_minutes"),
-                "no_fill_max_minutes": status.get("no_fill_max_minutes"),
-                "no_fill_spacing_reduction_pct": status.get("no_fill_spacing_reduction_pct"),
-                "no_fill_min_spacing_pct": status.get("no_fill_min_spacing_pct"),
-            }
-        )
-        last_trade_ts = _resolve_last_real_trade_ts(cfg.default_symbol, fallback=(engine.last_real_trade_ts.isoformat() if engine.last_real_trade_ts else ""))
-        last_trade_dt = _parse_iso_utc(str(last_trade_ts))
-        last_trade_age_hours = ((datetime.now(timezone.utc) - last_trade_dt).total_seconds() / 3600) if last_trade_dt else None
-        mark_price = latest_close
-        buys = sorted([o for o in engine.open_orders if str(o.get("symbol", "")).upper() == cfg.default_symbol.upper() and str(o.get("side", "")).lower() == "buy"], key=lambda x: float(x.get("price", 0.0)), reverse=True)
-        sells = sorted([o for o in engine.open_orders if str(o.get("symbol", "")).upper() == cfg.default_symbol.upper() and str(o.get("side", "")).lower() == "sell"], key=lambda x: float(x.get("price", 0.0)))
-        no_grid_orders_generated = not buys and not sells
-        if no_grid_orders_generated:
-            logger.info(
-                "no_grid_orders_generated reason=%s status=%s pause_reason=%s configured_levels=%s volatility_grid_levels=%s risk_adjusted_levels=%s final_effective_levels=%s reduction_reason=%s allowed_to_trade=%s force_recenter=%s rebuild_reason=%s state_uncertain_skip_cycle=%s",
-                status_payload.get("no_grid_orders_generated_reason") or "no_active_exchange_orders",
-                strategy_status,
-                reason or "none",
-                status_payload.get("configured_levels"),
-                status_payload.get("volatility_grid_levels"),
-                status_payload.get("risk_adjusted_levels"),
-                status_payload.get("final_effective_levels"),
-                status_payload.get("reduction_reason"),
-                status_payload.get("allowed_to_trade"),
-                status_payload.get("force_recenter"),
-                status_payload.get("rebuild_reason"),
-                status_payload.get("state_uncertain_skip_cycle"),
-            )
-        grid_diagnostic_report = _update_grid_diagnostic_report(grid_diagnostic_report, status_payload, no_grid_orders_generated=no_grid_orders_generated)
-        status_payload["grid_diagnostic_report"] = dict(grid_diagnostic_report)
-        next_order = None
-        if buys:
-            next_order = {"side": "buy", "price": float(buys[0]["price"])}
-        if sells and (next_order is None or abs(float(sells[0]["price"]) - mark_price) < abs(next_order["price"] - mark_price)):
-            next_order = {"side": "sell", "price": float(sells[0]["price"])}
-        next_exit_side = None
-        next_exit_price = None
-        if account_state.position_size > 0 and sells:
-            next_exit_side = "sell"
-            next_exit_price = float(sells[0]["price"])
-        elif account_state.position_size < 0 and buys:
-            next_exit_side = "buy"
-            next_exit_price = float(buys[0]["price"])
-
-        status_payload.update({"last_real_trade_ts": last_trade_ts, "last_real_trade_age_hours": last_trade_age_hours, "next_order_side": next_order["side"] if next_order else None, "next_order_price": next_order["price"] if next_order else None, "next_exit_side": next_exit_side, "next_exit_price": next_exit_price, "take_profit_price": next_exit_price, "stop_price": None, "trailing_stop_price": None})
-        nearest_buy = float(buys[0]["price"]) if buys else None
-        nearest_sell = float(sells[0]["price"]) if sells else None
-        fill_rate_metrics = engine.fill_rate_metrics(mark_price, symbol=cfg.default_symbol) if hasattr(engine, "fill_rate_metrics") else {}
-        time_since_last_fill_minutes = _time_since_last_fill_minutes(fill_rate_metrics, engine, cfg.tick_seconds)
-        if isinstance(fill_rate_metrics, dict):
-            fill_rate_metrics["time_since_last_fill_minutes"] = time_since_last_fill_minutes
-        _log_low_fill_rate_warning(time_since_last_fill_minutes)
-        one_hour_fill_rate = fill_rate_metrics.get("1h", {}) if isinstance(fill_rate_metrics.get("1h", {}), dict) else {}
-        logger.info(
-            "fill_rate_state orders_submitted=%s orders_cancelled=%s orders_filled=%s cancel_to_fill_ratio=%s nearest_buy_distance_pct=%s nearest_sell_distance_pct=%s time_since_last_fill_minutes=%s avg_order_lifetime_seconds=%s avg_order_distance_to_mid_pct=%s spacing_pct=%s reprice_decision=%s reprice_reason=%s no_fill_watchdog_active=%s",
-            one_hour_fill_rate.get("orders_submitted", 0),
-            one_hour_fill_rate.get("orders_cancelled", 0),
-            one_hour_fill_rate.get("orders_filled", 0),
-            one_hour_fill_rate.get("cancel_to_fill_ratio", 0.0),
-            fill_rate_metrics.get("nearest_buy_distance_pct"),
-            fill_rate_metrics.get("nearest_sell_distance_pct"),
-            time_since_last_fill_minutes,
-            one_hour_fill_rate.get("avg_order_lifetime_seconds", one_hour_fill_rate.get("average_order_lifetime_seconds", 0.0)),
-            fill_rate_metrics.get("average_distance_to_mid_pct"),
-            status_payload.get("grid_spacing_pct"),
-            (status.get("orders", {}) or {}).get("reprice_decision") if isinstance(status.get("orders", {}), dict) else None,
-            (status.get("orders", {}) or {}).get("reprice_reason") if isinstance(status.get("orders", {}), dict) else None,
-            status.get("no_fill_watchdog_active", False),
-        )
-        status_payload.update(
-            {
-                "nearest_buy_price": nearest_buy,
-                "nearest_sell_price": nearest_sell,
-                "distance_to_buy_pct": ((mark_price - nearest_buy) / mark_price) if nearest_buy else None,
-                "distance_to_sell_pct": ((nearest_sell - mark_price) / mark_price) if nearest_sell else None,
-                "fill_rate": fill_rate_metrics,
-                "fill_rate_1h": one_hour_fill_rate,
-                "fill_rate_6h": fill_rate_metrics.get("6h", {}),
-                "fill_rate_24h": fill_rate_metrics.get("24h", {}),
-                "average_distance_to_mid_pct": fill_rate_metrics.get("average_distance_to_mid_pct"),
-                "nearest_buy_distance_pct": fill_rate_metrics.get("nearest_buy_distance_pct"),
-                "nearest_sell_distance_pct": fill_rate_metrics.get("nearest_sell_distance_pct"),
-                "time_since_last_fill_minutes": time_since_last_fill_minutes,
-                "active_buy_orders": len(buys),
-                "active_sell_orders": len(sells),
-                "one_sided_grid_due_to_dust": bool(is_dust_position and ((len(buys) == 0) ^ (len(sells) == 0)) and (len(buys) + len(sells) > 0)),
-                "open_orders": len(engine.open_orders),
-                "rate_limit_budget": getattr(engine, "rate_limit_budget", {}) or {},
-                "trade_health_24h": engine.trade_health_metrics() if hasattr(engine, "trade_health_metrics") else {},
-            }
-        )
-        _write_status(status_payload)
-        if cfg.telegram_enable_commands:
-            for update in tg.fetch_commands():
-                text = str(update.get("message", {}).get("text", "")).strip()
-                if not text.startswith("/"):
-                    continue
-                if text.startswith("/help"):
-                    tg.send("/status - aktuális státusz\n/risk - risk állapot\n/trades - utolsó 5 trade\n/help - parancsok")
-                elif text.startswith("/status"):
-                    tg.send(tg.format_status_report({**status_payload, "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")}))
-                elif text.startswith("/risk"):
-                    tg.send(f"risk_state: {status_payload.get('risk_state')}\npause_reason: {status_payload.get('pause_reason') or 'none'}\nlast_block_reason: {status_payload.get('last_block_reason') or 'none'}\nblocked_risk_decisions_1h: {status_payload.get('blocked_risk_decisions_1h', 0)}\nallowed_to_trade: {status_payload.get('allowed_to_trade')}")
-                elif text.startswith("/trades"):
-                    lines = ["Utolsó trades:"]
-                    for r in list(recent_trades)[-5:]:
-                        lines.append(
-                            f"{r.get('timestamp','')} | {r.get('side','').upper()} "
-                            f"{r.get('qty','')} @ {r.get('price','')} | pnlΔ {r.get('realized_pnl_delta','0')}"
-                        )
-                    tg.send("\n".join(lines) if len(lines) > 1 else "Még nincs trade ebben a sessionben.")
-
-        now_ts = time.time()
-        if cfg.telegram_send_periodic_status and (now_ts - last_telegram_report_ts) >= cfg.telegram_report_interval_seconds:
-            tg.send_status_report({**status_payload, "status": status.get("status", "unknown"), "network": cfg.hl_network, "mode_name": "LIVE", "grid_mode": mode, "risk_reason": reason or "none", "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")})
-            last_telegram_report_ts = now_ts
-
-        engine.state.current_day = current_day.isoformat()
-        engine.state.daily_start_equity = daily_start_equity
-        engine.state.daily_start_realized_pnl = daily_start_realized_pnl
-        engine.state.daily_start_fees_paid = daily_start_fees_paid
-        engine.save_state()
-        time.sleep(cfg.tick_seconds)
+            consecutive_tick_errors += 1
+            logger.exception("tick_failed consecutive_errors=%s", consecutive_tick_errors)
+            try:
+                _write_status({"status": "degraded", "timestamp": datetime.now(timezone.utc).isoformat(), "last_error": type(exc).__name__, "last_error_detail": str(exc)[:300], "consecutive_tick_errors": consecutive_tick_errors})
+            except Exception:
+                logger.exception("degraded_status_write_failed")
+            now_err = time.time()
+            if consecutive_tick_errors >= 3 and (now_err - last_tick_error_alert_ts) >= cfg.telegram_risk_alert_cooldown_seconds:
+                try:
+                    tg.send(f"⚠️ Bot átmeneti hiba, automatikus újrapróbálkozás fut\nhiba: {type(exc).__name__}\negymás utáni hibák: {consecutive_tick_errors}")
+                except Exception:
+                    logger.exception("degraded_alert_send_failed")
+                last_tick_error_alert_ts = now_err
+            time.sleep(min(float(cfg.tick_seconds) * consecutive_tick_errors, 120.0))
+            continue
 
 
 if __name__ == "__main__":
