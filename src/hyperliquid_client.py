@@ -18,19 +18,8 @@ _RETRYABLE_HTTP_STATUSES = {500, 502, 503}
 _DEFAULT_RETRY_DELAYS_SECONDS = (1, 2, 5, 10)
 _R = TypeVar("_R")
 
-# Size-decimals (szDecimals) per coin. Seeded with known mainnet perp values
-# and refreshed from the exchange meta at connect() so any traded symbol gets
-# correct size rounding (a wrong value silently mis-sizes or gets rejected,
-# exactly the class of bug seen live on the BTC sell side).
-_SIZE_DECIMALS_BY_SYMBOL = {"BTC": 5, "ETH": 4}
+_SIZE_DECIMALS_BY_SYMBOL = {"BTC": 5}
 _DEFAULT_SIZE_DECIMALS = 8
-
-
-def set_size_decimals(coin: str, decimals: int) -> None:
-    if coin and decimals >= 0:
-        _SIZE_DECIMALS_BY_SYMBOL[coin.upper()] = int(decimals)
-
-
 _MAX_PRICE_SIGNIFICANT_FIGURES = 5
 _MAX_PERP_PRICE_DECIMALS = 6
 
@@ -166,7 +155,6 @@ class HyperliquidClient:
                     self.info = None
                     logger.warning("SDK info REST fallback init failed, using HTTP fallback: %s", rest_exc)
         self._start_ws_subscriptions()
-        self._refresh_size_decimals_from_meta()
         if self.private_key:
             try:
                 wallet = Account.from_key(self.private_key)
@@ -183,27 +171,6 @@ class HyperliquidClient:
             except Exception as exc:
                 self.exchange = None
                 logger.error("Hyperliquid SDK Exchange init failed: %s", exc)
-
-    def _refresh_size_decimals_from_meta(self) -> None:
-        """Populate per-coin szDecimals from the exchange meta (best effort)."""
-        if self.info is None:
-            return
-        try:
-            meta = self._retry_hyperliquid_api("Info.meta", self.info.meta)
-        except Exception as exc:
-            logger.warning("size_decimals_meta_refresh_failed error=%s (using seeded defaults)", exc)
-            return
-        universe = meta.get("universe", []) if isinstance(meta, dict) else []
-        updated = 0
-        for asset in universe:
-            if not isinstance(asset, dict):
-                continue
-            name = asset.get("name")
-            sz = asset.get("szDecimals")
-            if name is not None and sz is not None:
-                set_size_decimals(str(name), int(sz))
-                updated += 1
-        logger.info("size_decimals_refreshed_from_meta coins=%s", updated)
 
     # ------------------------------------------------------------------
     # WebSocket market-data layer. Every getter keeps a REST fallback, so a
