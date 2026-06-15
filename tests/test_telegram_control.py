@@ -43,6 +43,44 @@ def test_load_instances_multi(monkeypatch):
     assert eth.symbol == "ETH"
     assert str(eth.status_file).endswith("hyperliquid-adaptive-grid-bot-eth/data/status.json")
     assert str(eth.trades_file).endswith("hyperliquid-adaptive-grid-bot-eth/logs/trades.jsonl")
+    assert str(eth.workdir) == "/root/hyperliquid-adaptive-grid-bot-eth"
+
+
+def test_run_pull_restart_all_updates_each_instance(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_CONTROL_INSTANCES", "BTC:svc-btc:/a:BTC,ETH:svc-eth:/b:ETH")
+    calls = []
+
+    def fake_run_cmd(args, timeout=30):
+        calls.append(list(args))
+        return (0, "Already up to date.") if args[0] == "git" else (0, "active")
+
+    monkeypatch.setattr(tcb, "run_cmd", fake_run_cmd)
+    monkeypatch.setattr(tcb.time, "sleep", lambda *_a, **_k: None)
+
+    out = tcb.run_pull_restart_all(tcb.load_instances(_cfg()))
+
+    assert "BTC" in out and "ETH" in out
+    assert ["git", "-C", "/a", "pull", "--ff-only"] in calls
+    assert ["git", "-C", "/b", "pull", "--ff-only"] in calls
+    assert ["systemctl", "restart", "svc-btc"] in calls
+    assert ["systemctl", "restart", "svc-eth"] in calls
+
+
+def test_run_pull_restart_all_skips_restart_on_pull_failure(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_CONTROL_INSTANCES", "BTC:svc-btc:/a:BTC")
+    calls = []
+
+    def fake_run_cmd(args, timeout=30):
+        calls.append(list(args))
+        return (1, "merge conflict") if args[0] == "git" else (0, "active")
+
+    monkeypatch.setattr(tcb, "run_cmd", fake_run_cmd)
+    monkeypatch.setattr(tcb.time, "sleep", lambda *_a, **_k: None)
+
+    out = tcb.run_pull_restart_all(tcb.load_instances(_cfg()))
+
+    assert "NEM lett újraindítva" in out
+    assert ["systemctl", "restart", "svc-btc"] not in calls
 
 
 def test_resolve_targets(monkeypatch):

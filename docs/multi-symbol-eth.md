@@ -73,6 +73,11 @@ Cancel/Close buttons. Text commands accept an optional symbol, e.g.
 `/stopbot eth` (no argument = all instances). With `TELEGRAM_CONTROL_INSTANCES`
 unset the controller behaves exactly as before (single instance).
 
+`/pull` (or `/update`) updates **every** instance: it runs `git pull --ff-only`
+in each instance's working dir (and `pip install` if `requirements.txt`
+changed), then restarts that instance's service — reported per instance. A
+failed pull skips that instance's restart (no half-updated restart).
+
 ## Monitoring
 
 Watch the shared `headroom` from the budget alerts — if it trends down, lower

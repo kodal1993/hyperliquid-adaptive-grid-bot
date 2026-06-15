@@ -63,6 +63,7 @@ class Instance:
     status_file: Path
     trades_file: Path
     symbol: str
+    workdir: Path
 
 
 def load_instances(cfg: BotConfig) -> list[Instance]:
@@ -74,18 +75,20 @@ def load_instances(cfg: BotConfig) -> list[Instance]:
     """
     raw = os.getenv("TELEGRAM_CONTROL_INSTANCES", "").strip()
     default_symbol = cfg.default_symbol or "BTC"
+    default = Instance(default_symbol, SERVICE_NAME, STATUS_FILE, TRADES_FILE, default_symbol, PROJECT_ROOT)
     if not raw:
-        return [Instance(default_symbol, SERVICE_NAME, STATUS_FILE, TRADES_FILE, default_symbol)]
+        return [default]
     instances: list[Instance] = []
     for part in raw.split(","):
         fields = [f.strip() for f in part.split(":")]
         if len(fields) < 4 or not all(fields[:4]):
             continue
         label, service, workdir, symbol = fields[0], fields[1], fields[2], fields[3]
+        wd = Path(workdir)
         instances.append(
-            Instance(label, service, Path(workdir) / "data" / "status.json", Path(workdir) / "logs" / "trades.jsonl", symbol)
+            Instance(label, service, wd / "data" / "status.json", wd / "logs" / "trades.jsonl", symbol, wd)
         )
-    return instances or [Instance(default_symbol, SERVICE_NAME, STATUS_FILE, TRADES_FILE, default_symbol)]
+    return instances or [default]
 
 
 def _activate(cfg: BotConfig, inst: Instance) -> None:
@@ -273,6 +276,41 @@ def run_pull_restart_script() -> tuple[int, str]:
         return completed.returncode, "✅ Git pull kész, LIVE bot újraindítva."
     return completed.returncode, f"❌ Git pull / restart hiba (rc={completed.returncode}).\n{summary}"
 
+
+def _pull_and_restart_instance(inst: Instance) -> str:
+    """git pull (+ pip if requirements changed) + restart for one instance."""
+    lines = [f"━━━━━ {inst.label} ━━━━━"]
+    rc_pull, out_pull = run_cmd(["git", "-C", str(inst.workdir), "pull", "--ff-only"], timeout=60)
+    lines.append(f"git pull: rc={rc_pull}")
+    pull_summary = summarize_command_output(out_pull, "", max_chars=400)
+    if pull_summary:
+        lines.append(pull_summary)
+    if rc_pull != 0:
+        lines.append("⚠️ git pull sikertelen — service NEM lett újraindítva.")
+        return "\n".join(lines)
+    if "requirements.txt" in out_pull:
+        pip = inst.workdir / ".venv" / "bin" / "pip"
+        if pip.exists():
+            rc_pip, _ = run_cmd([str(pip), "install", "-q", "-r", str(inst.workdir / "requirements.txt")], timeout=180)
+            lines.append(f"pip install (requirements változott): rc={rc_pip}")
+    rc_r, out_r = run_cmd(["systemctl", "restart", inst.service], timeout=30)
+    time.sleep(2)
+    active, _ = service_state(inst.service)
+    lines.append(f"restart {inst.service}: rc={rc_r} active={active}")
+    return "\n".join(lines)
+
+
+def run_pull_restart_all(instances: list[Instance]) -> str:
+    """One /pull updates and restarts every instance, reported per instance."""
+    logger.info("Telegram /pull (all instances) starting count=%s", len(instances))
+    blocks = ["⬇️ GIT PULL + RESTART (MIND)", "Execution: LIVE", ""]
+    for inst in instances:
+        try:
+            blocks.append(_pull_and_restart_instance(inst))
+        except Exception as exc:
+            blocks.append(f"━━━━━ {inst.label} ━━━━━\n❌ {type(exc).__name__}: {redact_sensitive_output(str(exc))}")
+    return "\n\n".join(blocks)
+
 def fmt_money(value: Any, digits: int = 2) -> str:
     try:
         return f"${float(value):,.{digits}f}"
@@ -310,9 +348,10 @@ def short_side_icon(side: str) -> str:
     return "⚪ N/A"
 
 
-def service_state() -> tuple[str, str]:
-    active_rc, active = run_cmd(["systemctl", "is-active", SERVICE_NAME], timeout=10)
-    enabled_rc, enabled = run_cmd(["systemctl", "is-enabled", SERVICE_NAME], timeout=10)
+def service_state(svc: str | None = None) -> tuple[str, str]:
+    service = svc or SERVICE_NAME
+    active_rc, active = run_cmd(["systemctl", "is-active", service], timeout=10)
+    enabled_rc, enabled = run_cmd(["systemctl", "is-enabled", service], timeout=10)
     return active if active_rc == 0 else active or "unknown", enabled if enabled_rc == 0 else enabled or "unknown"
 
 
@@ -865,12 +904,13 @@ def poll_loop() -> None:
                             send_message(cfg.telegram_bot_token, cfg.telegram_chat_id, f"⚠️ Jogosulatlan Telegram /pull próbálkozás chat_id={chat_id}")
                         continue
 
+                    instances = load_instances(cfg)
                     send_message(
                         cfg.telegram_bot_token,
                         chat_id,
-                        f"⏳ Git pull + LIVE bot újraindítás indul. Timeout: {PULL_RESTART_TIMEOUT_SECONDS}s.\nExecution: LIVE",
+                        f"⏳ Git pull + újraindítás indul minden instance-ra: {', '.join(i.label for i in instances)}.\nExecution: LIVE",
                     )
-                    _, reply = run_pull_restart_script()
+                    reply = run_pull_restart_all(instances)
                     send_message(cfg.telegram_bot_token, chat_id, reply)
                     continue
 

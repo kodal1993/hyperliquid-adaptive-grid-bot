@@ -1,5 +1,9 @@
 # Changelog
 
+## One /pull updates and restarts every instance
+
+- `/pull` (and `/update`) in the Telegram controller now updates **all** configured instances in one command: `git pull --ff-only` in each instance's working dir, `pip install` only if `requirements.txt` changed, then `systemctl restart` of that instance's service — reported per instance with active state. A failed pull skips that instance's restart so a half-updated process is never bounced. With a single instance configured it behaves as before.
+
 ## One Telegram controller for multiple instances (BTC + ETH)
 
 - The control bot (`scripts/telegram_control_bot.py`) can now manage several trading instances on one account from a single Telegram bot/token, configured via `TELEGRAM_CONTROL_INSTANCES` (`label:service:workdir:symbol`, comma-separated). Read-only views (`/status`, `/orders`, `/position`, `/trades`, `/performance`) aggregate every instance in labeled sections; control actions target one symbol (`/stopbot eth`) or all instances (no argument), and the inline menu renders per-symbol Stop/Start/Cancel/Close buttons. With the env unset it behaves exactly as before (single instance). The two trading services run with `TELEGRAM_ENABLE_COMMANDS=false` so only the controller consumes Telegram commands (no `getUpdates` conflict on the shared token). Documented in `docs/multi-symbol-eth.md`.
