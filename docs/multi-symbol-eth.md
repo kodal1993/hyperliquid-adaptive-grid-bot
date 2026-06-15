@@ -61,11 +61,22 @@ the control bot is the sole command consumer.
 1. On both trading instances set `TELEGRAM_ENABLE_COMMANDS=false` (they still
    send fills/status). This avoids two processes fighting over Telegram
    `getUpdates` with the same token.
-2. Point the control bot at both instances via env:
+2. Run the controller itself as its own long-lived systemd service — see
+   `deploy/systemd/hyperliquid-telegram-control.service`:
+   ```bash
+   sudo cp deploy/systemd/hyperliquid-telegram-control.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now hyperliquid-telegram-control
+   ```
+3. Point the control bot at both instances via env (in the controller's
+   working dir `.env`, e.g. the BTC instance's):
    ```
    TELEGRAM_CONTROL_INSTANCES=BTC:hyperliquid-grid-bot-live:/root/hyperliquid-adaptive-grid-bot-live:BTC,ETH:hyperliquid-grid-bot-eth:/root/hyperliquid-adaptive-grid-bot-eth:ETH
    ```
    Format per instance: `label:systemd-service:working-dir:symbol`.
+4. Also set `TELEGRAM_CONTROL_SELF_SERVICE=hyperliquid-telegram-control` (or
+   whatever you named the unit in step 2) so `/pull` restarts the controller
+   process itself, not just the trading bots.
 
 Then `/status`, `/orders`, `/position`, `/trades`, `/performance` aggregate both
 symbols (labeled sections), and the inline menu shows per-symbol Stop/Start/
@@ -76,7 +87,12 @@ unset the controller behaves exactly as before (single instance).
 `/pull` (or `/update`) updates **every** instance: it runs `git pull --ff-only`
 in each instance's working dir (and `pip install` if `requirements.txt`
 changed), then restarts that instance's service — reported per instance. A
-failed pull skips that instance's restart (no half-updated restart).
+failed pull skips that instance's restart (no half-updated restart). Finally,
+if `TELEGRAM_CONTROL_SELF_SERVICE` is set, it restarts the controller's own
+service so the controller process (which holds `scripts/telegram_control_bot.py`
+in memory) picks up the pulled code too — without this, `/pull` updates the
+trading bots but the controller keeps running its old code (e.g. it won't
+show a newly added ETH instance in `/status` until it's restarted manually).
 
 ## Monitoring
 

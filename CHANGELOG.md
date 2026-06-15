@@ -1,5 +1,9 @@
 # Changelog
 
+## /pull now restarts the Telegram controller process itself
+
+- `/pull` updated the trading instances' code and services, but the long-running `scripts/telegram_control_bot.py` controller process kept the old code in memory until it was manually restarted — so newly added behavior (e.g. a new `TELEGRAM_CONTROL_INSTANCES` entry for ETH, new `/status` sections) silently never showed up after an update. `/pull` now also restarts the controller's own systemd service when `TELEGRAM_CONTROL_SELF_SERVICE` is set (via `systemctl restart --no-block`, so the request completes even though it kills the requesting process). Added `deploy/systemd/hyperliquid-telegram-control.service` and documented the setup in `docs/multi-symbol-eth.md` and `config/live.env.example`.
+
 ## One /pull updates and restarts every instance
 
 - `/pull` (and `/update`) in the Telegram controller now updates **all** configured instances in one command: `git pull --ff-only` in each instance's working dir, `pip install` only if `requirements.txt` changed, then `systemctl restart` of that instance's service — reported per instance with active state. A failed pull skips that instance's restart so a half-updated process is never bounced. With a single instance configured it behaves as before.

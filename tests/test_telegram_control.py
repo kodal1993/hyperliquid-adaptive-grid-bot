@@ -83,6 +83,41 @@ def test_run_pull_restart_all_skips_restart_on_pull_failure(monkeypatch):
     assert ["systemctl", "restart", "svc-btc"] not in calls
 
 
+def test_restart_controller_self_noop_when_unset(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_CONTROL_SELF_SERVICE", raising=False)
+    assert tcb.restart_controller_self() is None
+
+
+def test_restart_controller_self_restarts_configured_service(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_CONTROL_SELF_SERVICE", "hyperliquid-telegram-control")
+    calls = []
+
+    def fake_run_cmd(args, timeout=30):
+        calls.append(list(args))
+        return (0, "")
+
+    monkeypatch.setattr(tcb, "run_cmd", fake_run_cmd)
+
+    out = tcb.restart_controller_self()
+
+    assert calls == [["systemctl", "restart", "--no-block", "hyperliquid-telegram-control"]]
+    assert "hyperliquid-telegram-control" in out
+
+
+def test_restart_controller_self_reports_failure(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_CONTROL_SELF_SERVICE", "hyperliquid-telegram-control")
+
+    def fake_run_cmd(args, timeout=30):
+        return (1, "Unit not found.")
+
+    monkeypatch.setattr(tcb, "run_cmd", fake_run_cmd)
+
+    out = tcb.restart_controller_self()
+
+    assert "sikertelen" in out
+    assert "Unit not found." in out
+
+
 def test_resolve_targets(monkeypatch):
     monkeypatch.setenv(
         "TELEGRAM_CONTROL_INSTANCES",

@@ -311,6 +311,25 @@ def run_pull_restart_all(instances: list[Instance]) -> str:
             blocks.append(f"━━━━━ {inst.label} ━━━━━\n❌ {type(exc).__name__}: {redact_sensitive_output(str(exc))}")
     return "\n\n".join(blocks)
 
+
+def restart_controller_self() -> str | None:
+    """If TELEGRAM_CONTROL_SELF_SERVICE is set, restart the controller's own
+    systemd service after /pull so this long-running process picks up the
+    freshly pulled scripts/telegram_control_bot.py (a git pull alone does not
+    reload code in a running Python process).
+
+    Uses --no-block so the job is handed off to systemd and completes even
+    after this process is killed by the restart it just requested.
+    """
+    service = os.getenv("TELEGRAM_CONTROL_SELF_SERVICE", "").strip()
+    if not service:
+        return None
+    logger.info("Telegram /pull restarting controller self service=%s", service)
+    rc, out = run_cmd(["systemctl", "restart", "--no-block", service], timeout=15)
+    if rc == 0:
+        return f"🔄 Telegram controller ({service}) frissítve, újraindul."
+    return f"⚠️ Telegram controller ({service}) újraindítása sikertelen (rc={rc}).\n{summarize_command_output(out, '', max_chars=400)}"
+
 def fmt_money(value: Any, digits: int = 2) -> str:
     try:
         return f"${float(value):,.{digits}f}"
@@ -912,6 +931,9 @@ def poll_loop() -> None:
                     )
                     reply = run_pull_restart_all(instances)
                     send_message(cfg.telegram_bot_token, chat_id, reply)
+                    self_restart_msg = restart_controller_self()
+                    if self_restart_msg:
+                        send_message(cfg.telegram_bot_token, chat_id, self_restart_msg)
                     continue
 
                 if chat_id not in allowed:
