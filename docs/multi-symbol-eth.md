@@ -52,10 +52,30 @@ sudo systemctl enable --now hyperliquid-grid-bot-eth
 Combined max exposure ~$100 (~31% of $326 at 1x). ETH uses a higher directional
 pct (0.60) so the $20 order clears the exposure cap at the smaller $40 ceiling.
 
+## One Telegram controller for both symbols
+
+Run a **single** control bot that manages BTC and ETH (one token, one chat).
+The two trading services only **send** fills/status (no command polling), and
+the control bot is the sole command consumer.
+
+1. On both trading instances set `TELEGRAM_ENABLE_COMMANDS=false` (they still
+   send fills/status). This avoids two processes fighting over Telegram
+   `getUpdates` with the same token.
+2. Point the control bot at both instances via env:
+   ```
+   TELEGRAM_CONTROL_INSTANCES=BTC:hyperliquid-grid-bot-live:/root/hyperliquid-adaptive-grid-bot-live:BTC,ETH:hyperliquid-grid-bot-eth:/root/hyperliquid-adaptive-grid-bot-eth:ETH
+   ```
+   Format per instance: `label:systemd-service:working-dir:symbol`.
+
+Then `/status`, `/orders`, `/position`, `/trades`, `/performance` aggregate both
+symbols (labeled sections), and the inline menu shows per-symbol Stop/Start/
+Cancel/Close buttons. Text commands accept an optional symbol, e.g.
+`/stopbot eth` (no argument = all instances). With `TELEGRAM_CONTROL_INSTANCES`
+unset the controller behaves exactly as before (single instance).
+
 ## Monitoring
 
-Each service has its own Telegram control bot config / status. Watch the shared
-`headroom` from either instance's budget alerts — if it trends down, lower the
-order sizes or the per-process op budgets. Stop ETH independently with
-`sudo systemctl stop hyperliquid-grid-bot-eth` (the `state/STOP_LIVE_ETH` file
-also halts it).
+Watch the shared `headroom` from the budget alerts — if it trends down, lower
+the order sizes or the per-process op budgets. Stop ETH independently with
+`sudo systemctl stop hyperliquid-grid-bot-eth` (or `/stopbot eth`); the
+`state/STOP_LIVE_ETH` file also halts it.

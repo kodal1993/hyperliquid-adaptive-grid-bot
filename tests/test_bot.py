@@ -1655,11 +1655,14 @@ def test_hyperliquid_retry_skips_non_retryable_http_status(monkeypatch):
 
 def load_telegram_control_bot_module():
     import importlib.util
+    import sys as _sys
 
     module_path = Path(__file__).resolve().parents[1] / "scripts" / "telegram_control_bot.py"
     spec = importlib.util.spec_from_file_location("telegram_control_bot", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
+    # Register before exec so @dataclass can resolve string annotations.
+    _sys.modules["telegram_control_bot"] = module
     spec.loader.exec_module(module)
     return module
 
