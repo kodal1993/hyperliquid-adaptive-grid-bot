@@ -95,7 +95,7 @@ def test_fill_execution_defaults_are_loosened(monkeypatch, tmp_path):
     assert cfg.no_fill_spacing_reduction_pct == pytest.approx(0.20)
     assert cfg.no_fill_min_spacing_pct == pytest.approx(0.0022)
     assert cfg.min_order_lifetime_seconds == 90
-    assert cfg.min_reprice_distance_pct == pytest.approx(0.003)
+    assert cfg.min_reprice_distance_pct == pytest.approx(0.0015)
 
 
 def test_low_fill_rate_warning_logs_after_180_minutes(caplog):
@@ -1655,14 +1655,11 @@ def test_hyperliquid_retry_skips_non_retryable_http_status(monkeypatch):
 
 def load_telegram_control_bot_module():
     import importlib.util
-    import sys as _sys
 
     module_path = Path(__file__).resolve().parents[1] / "scripts" / "telegram_control_bot.py"
     spec = importlib.util.spec_from_file_location("telegram_control_bot", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
-    # Register before exec so @dataclass can resolve string annotations.
-    _sys.modules["telegram_control_bot"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -4241,21 +4238,6 @@ def test_size_floor_helper_keeps_orders_above_min_notional(tmp_path):
     assert orch._floor_size_to_min_order_notional(100.0, 0.09) == pytest.approx(0.10)
     assert orch._floor_size_to_min_order_notional(100.0, 0.11) == pytest.approx(0.11)
     assert orch._floor_size_to_min_order_notional(100.0, 0.0) == 0.0
-
-
-def test_eth_size_decimals_and_meta_refresh():
-    from src.hyperliquid_client import normalize_size, set_size_decimals, _SIZE_DECIMALS_BY_SYMBOL
-
-    # ETH is seeded at 4 decimals (BTC stays 5); a wrong value mis-sizes orders.
-    assert normalize_size("ETH", 0.123456) == pytest.approx(0.1234)
-    assert normalize_size("BTC", 0.123456) == pytest.approx(0.12345)
-
-    # An unknown symbol can be populated from the exchange meta at runtime.
-    try:
-        set_size_decimals("SOL", 2)
-        assert normalize_size("SOL", 1.2399) == pytest.approx(1.23)
-    finally:
-        _SIZE_DECIMALS_BY_SYMBOL.pop("SOL", None)
 
 
 def test_size_floor_survives_submit_side_round_down(tmp_path):

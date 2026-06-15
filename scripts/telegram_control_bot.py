@@ -8,9 +8,8 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -50,76 +49,6 @@ BOT_COMMANDS = [
 ]
 
 
-@dataclass
-class Instance:
-    """One trading bot instance the controller manages (BTC, ETH, ...).
-
-    All instances run on the same Hyperliquid account, so a single exchange
-    client serves every symbol; only the systemd service and the local
-    status/trades files differ per instance.
-    """
-    label: str
-    service: str
-    status_file: Path
-    trades_file: Path
-    symbol: str
-    workdir: Path
-
-
-def load_instances(cfg: BotConfig) -> list[Instance]:
-    """Parse TELEGRAM_CONTROL_INSTANCES, else fall back to the single instance.
-
-    Format: comma-separated `label:service:workdir:symbol`, e.g.
-    `BTC:hyperliquid-grid-bot-live:/root/hyperliquid-adaptive-grid-bot-live:BTC,
-     ETH:hyperliquid-grid-bot-eth:/root/hyperliquid-adaptive-grid-bot-eth:ETH`
-    """
-    raw = os.getenv("TELEGRAM_CONTROL_INSTANCES", "").strip()
-    default_symbol = cfg.default_symbol or "BTC"
-    default = Instance(default_symbol, SERVICE_NAME, STATUS_FILE, TRADES_FILE, default_symbol, PROJECT_ROOT)
-    if not raw:
-        return [default]
-    instances: list[Instance] = []
-    for part in raw.split(","):
-        fields = [f.strip() for f in part.split(":")]
-        if len(fields) < 4 or not all(fields[:4]):
-            continue
-        label, service, workdir, symbol = fields[0], fields[1], fields[2], fields[3]
-        wd = Path(workdir)
-        instances.append(
-            Instance(label, service, wd / "data" / "status.json", wd / "logs" / "trades.jsonl", symbol, wd)
-        )
-    return instances or [default]
-
-
-def _activate(cfg: BotConfig, inst: Instance) -> None:
-    """Point the module-level file/service globals (and cfg symbol) at one
-    instance so the existing single-instance renderers operate on it."""
-    global SERVICE_NAME, STATUS_FILE, TRADES_FILE
-    SERVICE_NAME = inst.service
-    STATUS_FILE = inst.status_file
-    TRADES_FILE = inst.trades_file
-    cfg.default_symbol = inst.symbol
-
-
-def _run_on(cfg: BotConfig, instances: list[Instance], fn: "Callable[[BotConfig], str]") -> str:
-    """Render fn for each instance, prefixed with a labeled separator."""
-    blocks: list[str] = []
-    for inst in instances:
-        _activate(cfg, inst)
-        blocks.append(f"━━━━━ {inst.label} ━━━━━\n{fn(cfg)}")
-    return "\n\n".join(blocks)
-
-
-def _resolve_targets(cfg: BotConfig, instances: list[Instance], arg: str) -> list[Instance]:
-    """A command argument may name one instance (e.g. `/stopbot eth`); with no
-    arg, the action applies to all instances."""
-    if arg:
-        match = [i for i in instances if i.label.lower() == arg.lower() or i.symbol.lower() == arg.lower()]
-        if match:
-            return match
-    return instances
-
-
 def load_config() -> BotConfig:
     return BotConfig.from_env()
 
@@ -137,21 +66,18 @@ def register_bot_commands(token: str) -> None:
     requests.post(telegram_api(token, "setMyCommands"), json={"commands": BOT_COMMANDS}, timeout=15).raise_for_status()
 
 
-def main_menu_keyboard(instances: list[Instance] | None = None) -> dict[str, Any]:
-    rows: list[list[dict[str, str]]] = [
-        [
-            {"text": "📊 Status", "callback_data": "cmd:status"},
-            {"text": "📌 Position", "callback_data": "cmd:position"},
-        ],
-        [
-            {"text": "📋 Orders", "callback_data": "cmd:orders"},
-            {"text": "📈 Trades", "callback_data": "cmd:trades"},
-        ],
-        [{"text": "📉 Performance", "callback_data": "cmd:performance"}],
-    ]
-    insts = instances or []
-    if len(insts) <= 1:
-        rows.extend([
+def main_menu_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📊 Status", "callback_data": "cmd:status"},
+                {"text": "📌 Position", "callback_data": "cmd:position"},
+            ],
+            [
+                {"text": "📋 Orders", "callback_data": "cmd:orders"},
+                {"text": "📈 Trades", "callback_data": "cmd:trades"},
+            ],
+            [{"text": "📉 Performance", "callback_data": "cmd:performance"}],
             [
                 {"text": "🛑 Stop bot", "callback_data": "confirm:stopbot"},
                 {"text": "▶️ Start bot", "callback_data": "cmd:startbot"},
@@ -160,22 +86,9 @@ def main_menu_keyboard(instances: list[Instance] | None = None) -> dict[str, Any
                 {"text": "❌ Cancel orders", "callback_data": "confirm:cancelall"},
                 {"text": "🚪 Close position", "callback_data": "confirm:closeposition"},
             ],
-        ])
-    else:
-        # Per-instance control rows so each symbol is started/stopped/flattened
-        # independently from one bot.
-        for inst in insts:
-            lbl = inst.label
-            rows.append([
-                {"text": f"🛑 Stop {lbl}", "callback_data": f"confirm:stopbot:{lbl}"},
-                {"text": f"▶️ Start {lbl}", "callback_data": f"cmd:startbot:{lbl}"},
-            ])
-            rows.append([
-                {"text": f"❌ Cancel {lbl}", "callback_data": f"confirm:cancelall:{lbl}"},
-                {"text": f"🚪 Close {lbl}", "callback_data": f"confirm:closeposition:{lbl}"},
-            ])
-    rows.append([{"text": "🔄 Refresh", "callback_data": "cmd:menu"}])
-    return {"inline_keyboard": rows}
+            [{"text": "🔄 Refresh", "callback_data": "cmd:menu"}],
+        ]
+    }
 
 
 def confirm_keyboard(action: str) -> dict[str, Any]:
@@ -276,60 +189,6 @@ def run_pull_restart_script() -> tuple[int, str]:
         return completed.returncode, "✅ Git pull kész, LIVE bot újraindítva."
     return completed.returncode, f"❌ Git pull / restart hiba (rc={completed.returncode}).\n{summary}"
 
-
-def _pull_and_restart_instance(inst: Instance) -> str:
-    """git pull (+ pip if requirements changed) + restart for one instance."""
-    lines = [f"━━━━━ {inst.label} ━━━━━"]
-    rc_pull, out_pull = run_cmd(["git", "-C", str(inst.workdir), "pull", "--ff-only"], timeout=60)
-    lines.append(f"git pull: rc={rc_pull}")
-    pull_summary = summarize_command_output(out_pull, "", max_chars=400)
-    if pull_summary:
-        lines.append(pull_summary)
-    if rc_pull != 0:
-        lines.append("⚠️ git pull sikertelen — service NEM lett újraindítva.")
-        return "\n".join(lines)
-    if "requirements.txt" in out_pull:
-        pip = inst.workdir / ".venv" / "bin" / "pip"
-        if pip.exists():
-            rc_pip, _ = run_cmd([str(pip), "install", "-q", "-r", str(inst.workdir / "requirements.txt")], timeout=180)
-            lines.append(f"pip install (requirements változott): rc={rc_pip}")
-    rc_r, out_r = run_cmd(["systemctl", "restart", inst.service], timeout=30)
-    time.sleep(2)
-    active, _ = service_state(inst.service)
-    lines.append(f"restart {inst.service}: rc={rc_r} active={active}")
-    return "\n".join(lines)
-
-
-def run_pull_restart_all(instances: list[Instance]) -> str:
-    """One /pull updates and restarts every instance, reported per instance."""
-    logger.info("Telegram /pull (all instances) starting count=%s", len(instances))
-    blocks = ["⬇️ GIT PULL + RESTART (MIND)", "Execution: LIVE", ""]
-    for inst in instances:
-        try:
-            blocks.append(_pull_and_restart_instance(inst))
-        except Exception as exc:
-            blocks.append(f"━━━━━ {inst.label} ━━━━━\n❌ {type(exc).__name__}: {redact_sensitive_output(str(exc))}")
-    return "\n\n".join(blocks)
-
-
-def restart_controller_self() -> str | None:
-    """If TELEGRAM_CONTROL_SELF_SERVICE is set, restart the controller's own
-    systemd service after /pull so this long-running process picks up the
-    freshly pulled scripts/telegram_control_bot.py (a git pull alone does not
-    reload code in a running Python process).
-
-    Uses --no-block so the job is handed off to systemd and completes even
-    after this process is killed by the restart it just requested.
-    """
-    service = os.getenv("TELEGRAM_CONTROL_SELF_SERVICE", "").strip()
-    if not service:
-        return None
-    logger.info("Telegram /pull restarting controller self service=%s", service)
-    rc, out = run_cmd(["systemctl", "restart", "--no-block", service], timeout=15)
-    if rc == 0:
-        return f"🔄 Telegram controller ({service}) frissítve, újraindul."
-    return f"⚠️ Telegram controller ({service}) újraindítása sikertelen (rc={rc}).\n{summarize_command_output(out, '', max_chars=400)}"
-
 def fmt_money(value: Any, digits: int = 2) -> str:
     try:
         return f"${float(value):,.{digits}f}"
@@ -367,10 +226,9 @@ def short_side_icon(side: str) -> str:
     return "⚪ N/A"
 
 
-def service_state(svc: str | None = None) -> tuple[str, str]:
-    service = svc or SERVICE_NAME
-    active_rc, active = run_cmd(["systemctl", "is-active", service], timeout=10)
-    enabled_rc, enabled = run_cmd(["systemctl", "is-enabled", service], timeout=10)
+def service_state() -> tuple[str, str]:
+    active_rc, active = run_cmd(["systemctl", "is-active", SERVICE_NAME], timeout=10)
+    enabled_rc, enabled = run_cmd(["systemctl", "is-enabled", SERVICE_NAME], timeout=10)
     return active if active_rc == 0 else active or "unknown", enabled if enabled_rc == 0 else enabled or "unknown"
 
 
@@ -711,130 +569,98 @@ def panic(cfg: BotConfig) -> str:
     return "\n\n".join(parts)
 
 
-def help_text(instances: list[Instance] | None = None) -> str:
-    instances = instances or []
-    inst_line = ", ".join(i.label for i in instances) or "n/a"
-    multi = len(instances) > 1
-    target_hint = (
-        f"\nCélzás: a vezérlő parancsokhoz adhatsz szimbólumot, pl. `/stopbot {instances[1].label.lower()}` "
-        "— argumentum nélkül MINDEGYIKRE vonatkozik.\n" if multi else "\n"
-    )
-    return f"""🤖 HYPERLIQUID LIVE BOT VEZÉRLÉS
+def help_text() -> str:
+    return """🤖 HYPERLIQUID LIVE BOT VEZÉRLÉS
 Execution: LIVE
-Instances: {inst_line}
-{target_hint}
+
 🧭 /menu - inline gombos vezérlő menü
-📊 /status - bot + exchange státusz (minden instance)
-📋 /orders - nyitott orderek
+📊 /status - szép bot + exchange státusz
+📋 /orders - nyitott orderek designos nézetben
 📌 /position - aktuális pozíció
-📈 /trades - utolsó trade-ek
-📉 /performance - statisztika
-▶️ /startbot [szimbólum] - service indítása
-⏸ /stopbot [szimbólum] - service leállítása
-🔄 /restartbot [szimbólum] - service újraindítása
-⬇️ /pull vagy /update - git pull + újraindítás
-🧹 /cancelall [szimbólum] - stop + open orderek törlése
-🚪 /closeposition [szimbólum] - pozíció zárása
-🚨 /panic [szimbólum] - vészstop: stop + cancel + snapshot
+📈 /trades - utolsó trade-ek logs/trades.jsonl alapján
+📉 /performance - statisztika logs/trades.jsonl alapján
+▶️ /startbot - live service indítása
+⏸ /stopbot - live service leállítása
+🔄 /restartbot - live service újraindítása
+⬇️ /pull vagy /update - fix git pull + LIVE bot újraindító script futtatása
+🧹 /cancelall - stop + összes open order törlése
+🚪 /closeposition - aktuális pozíció zárása
+🚨 /panic - vészstop: stop + cancel + snapshot
 ❓ /help - parancslista
 
 Biztonság:
 - Csak whitelistelt Telegram chat ID használhatja.
-- /cancelall és /panic először leállítja a service-t.
+- /cancelall és /panic először leállítja a service-t, hogy ne rakja vissza az ordereket.
 - A veszélyes gombos műveletek külön megerősítést kérnek.
 """
 
 
-def _orders_block(cfg: BotConfig) -> str:
-    _, orders, _ = get_exchange_data(cfg)
-    return format_orders(orders, cfg.default_symbol)
-
-
-def _position_block(cfg: BotConfig) -> str:
-    state, _, pos = get_exchange_data(cfg)
-    return format_position(pos, cfg.default_symbol) + "\n\n" + format_account(state)
-
-
 def handle_command(cfg: BotConfig, text: str) -> str:
-    parts = text.strip().split()
-    command = parts[0].split("@")[0].lower()
-    arg = parts[1] if len(parts) > 1 else ""
-    instances = load_instances(cfg)
-    targets = _resolve_targets(cfg, instances, arg)
+    command = text.strip().split()[0].split("@")[0].lower()
 
     if command in {"/help", "/start"}:
-        return help_text(instances)
+        return help_text()
     if command == "/menu":
         return menu_text()
+    if command == "/status":
+        return compact_status() + "\n\n" + exchange_snapshot(cfg)
+    if command == "/startbot":
+        return start_service()
+    if command == "/stopbot":
+        return stop_service()
+    if command == "/restartbot":
+        return restart_service()
     if command in {"/pull", "/update"}:
         return "Use the Telegram poll loop for /pull or /update so progress messages can be sent safely."
-
-    # Read-only views aggregate across every instance.
-    if command == "/status":
-        return _run_on(cfg, instances, lambda c: compact_status() + "\n\n" + exchange_snapshot(c))
-    if command == "/orders":
-        return _run_on(cfg, targets, _orders_block)
-    if command == "/position":
-        return _run_on(cfg, targets, _position_block)
-    if command == "/trades":
-        return _run_on(cfg, targets, lambda c: format_trades())
-    if command == "/performance":
-        return _run_on(cfg, targets, lambda c: format_performance())
-
-    # Control actions target one instance (with an arg) or all of them.
-    if command == "/startbot":
-        return _run_on(cfg, targets, lambda c: start_service())
-    if command == "/stopbot":
-        return _run_on(cfg, targets, lambda c: stop_service())
-    if command == "/restartbot":
-        return _run_on(cfg, targets, lambda c: restart_service())
     if command == "/cancelall":
-        return _run_on(cfg, targets, lambda c: stop_service() + "\n\n" + cancel_all_orders(c))
+        return stop_service() + "\n\n" + cancel_all_orders(cfg)
     if command == "/panic":
-        return _run_on(cfg, targets, panic)
+        return panic(cfg)
+    if command == "/orders":
+        _, orders, _ = get_exchange_data(cfg)
+        return format_orders(orders, cfg.default_symbol)
+    if command == "/position":
+        state, _, pos = get_exchange_data(cfg)
+        return format_position(pos, cfg.default_symbol) + "\n\n" + format_account(state)
+    if command == "/trades":
+        return format_trades()
+    if command == "/performance":
+        return format_performance()
     if command == "/closeposition":
-        return _run_on(cfg, targets, close_position)
+        return close_position(cfg)
     return "Ismeretlen parancs. /help\nExecution: LIVE"
 
 
-def _callback_to_command(rest: str) -> str:
-    """`startbot` -> `/startbot`; `startbot:ETH` -> `/startbot ETH`."""
-    action, _, label = rest.partition(":")
-    return f"/{action}" + (f" {label}" if label else "")
-
-
 def handle_callback(cfg: BotConfig, data: str) -> tuple[str, dict[str, Any] | None]:
-    instances = load_instances(cfg)
-    menu = main_menu_keyboard(instances)
     if data == "cmd:menu":
-        return menu_text(), menu
+        return menu_text(), main_menu_keyboard()
     if data.startswith("cmd:"):
-        return handle_command(cfg, _callback_to_command(data.split(":", 1)[1])), menu
+        action = data.split(":", 1)[1]
+        return handle_command(cfg, f"/{action}"), main_menu_keyboard()
     if data.startswith("confirm:"):
-        rest = data.split(":", 1)[1]                  # e.g. "stopbot" or "stopbot:ETH"
-        action, _, label = rest.partition(":")
+        action = data.split(":", 1)[1]
         labels = {
             "stopbot": "🛑 Stop bot",
             "cancelall": "❌ Cancel all open orders",
             "closeposition": "🚪 Close current position",
         }
-        target = f" [{label}]" if label else " [MIND]"
         return (
             "\n".join(
                 [
                     "⚠️ CONFIRM ACTION",
                     "Execution: LIVE",
                     "",
-                    labels.get(action, action) + target,
+                    labels.get(action, action),
                     "",
                     "This action affects the live bot/account.",
                 ]
             ),
-            confirm_keyboard(rest),
+            confirm_keyboard(action),
         )
     if data.startswith("do:"):
-        return handle_command(cfg, _callback_to_command(data.split(":", 1)[1])), menu
-    return "Unknown button. Use /menu.\nExecution: LIVE", menu
+        action = data.split(":", 1)[1]
+        return handle_command(cfg, f"/{action}"), main_menu_keyboard()
+    return "Unknown button. Use /menu.\nExecution: LIVE", main_menu_keyboard()
 
 
 def read_offset() -> int | None:
@@ -862,12 +688,11 @@ def poll_loop() -> None:
         register_bot_commands(cfg.telegram_bot_token)
     except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
         pass
-    instance_labels = ", ".join(i.label for i in load_instances(cfg))
     send_message(
         cfg.telegram_bot_token,
         cfg.telegram_chat_id,
-        f"✅ Telegram live control started.\nExecution: LIVE\nInstances: {instance_labels}\n\nUse /menu for buttons.",
-        main_menu_keyboard(load_instances(cfg)),
+        "✅ Telegram live control started.\nExecution: LIVE\n\nUse /menu for buttons.",
+        main_menu_keyboard(),
     )
 
     while True:
@@ -902,7 +727,7 @@ def poll_loop() -> None:
                         cfg = load_config()
                         reply, markup = handle_callback(cfg, data_value)
                     except Exception as exc:
-                        reply, markup = f"❌ Button error\nExecution: LIVE\n{type(exc).__name__}: {exc}", main_menu_keyboard(load_instances(cfg))
+                        reply, markup = f"❌ Button error\nExecution: LIVE\n{type(exc).__name__}: {exc}", main_menu_keyboard()
                     send_message(cfg.telegram_bot_token, chat_id, reply, markup)
                     continue
 
@@ -923,17 +748,13 @@ def poll_loop() -> None:
                             send_message(cfg.telegram_bot_token, cfg.telegram_chat_id, f"⚠️ Jogosulatlan Telegram /pull próbálkozás chat_id={chat_id}")
                         continue
 
-                    instances = load_instances(cfg)
                     send_message(
                         cfg.telegram_bot_token,
                         chat_id,
-                        f"⏳ Git pull + újraindítás indul minden instance-ra: {', '.join(i.label for i in instances)}.\nExecution: LIVE",
+                        f"⏳ Git pull + LIVE bot újraindítás indul. Timeout: {PULL_RESTART_TIMEOUT_SECONDS}s.\nExecution: LIVE",
                     )
-                    reply = run_pull_restart_all(instances)
+                    _, reply = run_pull_restart_script()
                     send_message(cfg.telegram_bot_token, chat_id, reply)
-                    self_restart_msg = restart_controller_self()
-                    if self_restart_msg:
-                        send_message(cfg.telegram_bot_token, chat_id, self_restart_msg)
                     continue
 
                 if chat_id not in allowed:
@@ -946,7 +767,7 @@ def poll_loop() -> None:
                     reply = handle_command(cfg, text)
                 except Exception as exc:
                     reply = f"❌ Command error\nExecution: LIVE\n{type(exc).__name__}: {exc}"
-                markup = main_menu_keyboard(load_instances(cfg)) if command in {"/start", "/help", "/menu"} else None
+                markup = main_menu_keyboard() if command in {"/start", "/help", "/menu"} else None
                 send_message(cfg.telegram_bot_token, chat_id, reply, markup)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
             time.sleep(POLL_SLEEP_SECONDS)

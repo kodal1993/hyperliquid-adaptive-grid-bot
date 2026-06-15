@@ -1,27 +1,5 @@
 # Changelog
 
-## /pull now restarts the Telegram controller process itself
-
-- `/pull` updated the trading instances' code and services, but the long-running `scripts/telegram_control_bot.py` controller process kept the old code in memory until it was manually restarted — so newly added behavior (e.g. a new `TELEGRAM_CONTROL_INSTANCES` entry for ETH, new `/status` sections) silently never showed up after an update. `/pull` now also restarts the controller's own systemd service when `TELEGRAM_CONTROL_SELF_SERVICE` is set (via `systemctl restart --no-block`, so the request completes even though it kills the requesting process). Added `deploy/systemd/hyperliquid-telegram-control.service` and documented the setup in `docs/multi-symbol-eth.md` and `config/live.env.example`.
-
-## One /pull updates and restarts every instance
-
-- `/pull` (and `/update`) in the Telegram controller now updates **all** configured instances in one command: `git pull --ff-only` in each instance's working dir, `pip install` only if `requirements.txt` changed, then `systemctl restart` of that instance's service — reported per instance with active state. A failed pull skips that instance's restart so a half-updated process is never bounced. With a single instance configured it behaves as before.
-
-## One Telegram controller for multiple instances (BTC + ETH)
-
-- The control bot (`scripts/telegram_control_bot.py`) can now manage several trading instances on one account from a single Telegram bot/token, configured via `TELEGRAM_CONTROL_INSTANCES` (`label:service:workdir:symbol`, comma-separated). Read-only views (`/status`, `/orders`, `/position`, `/trades`, `/performance`) aggregate every instance in labeled sections; control actions target one symbol (`/stopbot eth`) or all instances (no argument), and the inline menu renders per-symbol Stop/Start/Cancel/Close buttons. With the env unset it behaves exactly as before (single instance). The two trading services run with `TELEGRAM_ENABLE_COMMANDS=false` so only the controller consumes Telegram commands (no `getUpdates` conflict on the shared token). Documented in `docs/multi-symbol-eth.md`.
-
-## Less grid chasing: wider regrid threshold and reprice distance
-
-- Live order history showed the grid recentering and chasing price every ~90s during a slow drift (buy levels trailing a rising market without filling), burning request budget and producing ~6h of no fills in a 0.9% range. Raised `REGRID_THRESHOLD_PCT` 0.003 → 0.006 and `MIN_REPRICE_DISTANCE_PCT` 0.0015 → 0.003 so the grid holds its levels through larger moves, letting price oscillate into resting orders (more fills) and cutting cancel/replace churn (less budget burn). The regime detector and market-stress layer still handle genuine trends; the grid itself benefits from holding levels. Applied to defaults and both env templates.
-
-## BTC + ETH on one account (parallel ETH service)
-
-- Added support for running ETH alongside BTC on the **same Hyperliquid account** as a second, independent service — without touching the proven single-symbol BTC bot. Two processes on one address share the per-address request budget and coordinate through the budget poll (both see the same headroom and enter frugal/recovery together); the recovery hourly op budget is meant to be lowered to 3 per process so the combined consumption matches the single-symbol cap.
-- `szDecimals` (order size rounding) is now seeded with known values (`BTC=5`, `ETH=4`) and refreshed from the exchange `meta` at `connect()`, so any traded symbol gets correct size steps instead of the BTC-hardcoded value — preventing the size-rounding rejection class of bug on ETH.
-- Added `config/live-eth.env.example` (ETH risk caps: $20 order, $40 max position, 0.60 directional pct so the order clears the exposure cap at the smaller ceiling; separate state/lock files), `deploy/systemd/hyperliquid-grid-bot-eth.service`, and `docs/multi-symbol-eth.md` with the deploy steps. Risk split is BTC-weighted 60/40 (BTC $60 / ETH $40 max position, ~31% combined exposure at 1x).
-
 ## Scale order sizing for ~325 USD equity
 
 - Raised the default order sizing now that equity is ~$325: `ORDER_NOTIONAL_USD` 12 → 20, `MAX_NOTIONAL_PER_TRADE_USD` → 24, `MAX_POSITION_NOTIONAL_USD` 40 → 90 (~28% of equity at 1x, liquidation negligible), `MAX_ACTIVE_EXPOSURE_USD` 50 → 110 so the full 3-level grid builds. `MIN_ORDER_NOTIONAL_USD` stays 12, above the $10 exchange minimum, so bias multipliers (0.75x) now reduce a $20 level to ~$15 instead of being floored away. Larger fills also repay the Hyperliquid request budget faster. Leverage stays 1x. Live deploys still need the same values in `config/live.env`, which overrides these defaults.
