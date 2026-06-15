@@ -1,5 +1,11 @@
 # Changelog
 
+## Max out order sizing within the micro-live safety gate
+
+- Live trade-history review (18 days, 540 fills) confirmed the bot itself is healthy: BTC fills (≤$30) ran a positive gross edge (+$0.60) with a 57% close win-rate, near-breakeven net after fees. The large net loss in the raw exchange CSV came from manual ~$160 taker round-trips and a one-off SOL→USDC capital conversion, none of which the bot can produce (its per-trade cap is well below $30). The bot is therefore cleared to scale.
+- Raised sizing to the micro-live gate ceiling: `ORDER_NOTIONAL_USD` 20 → 30, `MAX_NOTIONAL_PER_TRADE_USD` 24 → 30 (gate max), `MAX_POSITION_NOTIONAL_USD` 90 → 100 (gate max, ~31% of ~$325 equity at 1x). `MAX_ACTIVE_EXPOSURE_USD` stays 110 (a full 3-level one-sided grid rests at 3×$30=$90, under the $100 position cap). Leverage stays fixed at 1x — the safety gate hard-rejects anything else, so a leverage increase would require relaxing the gate and is intentionally not done at this equity.
+- Live deploys still need the same values mirrored into `config/live.env` on the VPS (the example file is only a template; the server's env overrides it).
+
 ## Scale order sizing for ~325 USD equity
 
 - Raised the default order sizing now that equity is ~$325: `ORDER_NOTIONAL_USD` 12 → 20, `MAX_NOTIONAL_PER_TRADE_USD` → 24, `MAX_POSITION_NOTIONAL_USD` 40 → 90 (~28% of equity at 1x, liquidation negligible), `MAX_ACTIVE_EXPOSURE_USD` 50 → 110 so the full 3-level grid builds. `MIN_ORDER_NOTIONAL_USD` stays 12, above the $10 exchange minimum, so bias multipliers (0.75x) now reduce a $20 level to ~$15 instead of being floored away. Larger fills also repay the Hyperliquid request budget faster. Leverage stays 1x. Live deploys still need the same values in `config/live.env`, which overrides these defaults.
