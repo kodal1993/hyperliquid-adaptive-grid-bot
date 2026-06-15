@@ -1,5 +1,9 @@
 # Changelog
 
+## Less grid chasing: wider regrid threshold and reprice distance
+
+- Live order history showed the grid recentering and chasing price every ~90s during a slow drift (buy levels trailing a rising market without filling), burning request budget and producing ~6h of no fills in a 0.9% range. Raised `REGRID_THRESHOLD_PCT` 0.003 → 0.006 and `MIN_REPRICE_DISTANCE_PCT` 0.0015 → 0.003 so the grid holds its levels through larger moves, letting price oscillate into resting orders (more fills) and cutting cancel/replace churn (less budget burn). The regime detector and market-stress layer still handle genuine trends; the grid itself benefits from holding levels. Applied to defaults and both env templates.
+
 ## BTC + ETH on one account (parallel ETH service)
 
 - Added support for running ETH alongside BTC on the **same Hyperliquid account** as a second, independent service — without touching the proven single-symbol BTC bot. Two processes on one address share the per-address request budget and coordinate through the budget poll (both see the same headroom and enter frugal/recovery together); the recovery hourly op budget is meant to be lowered to 3 per process so the combined consumption matches the single-symbol cap.

@@ -95,7 +95,7 @@ def test_fill_execution_defaults_are_loosened(monkeypatch, tmp_path):
     assert cfg.no_fill_spacing_reduction_pct == pytest.approx(0.20)
     assert cfg.no_fill_min_spacing_pct == pytest.approx(0.0022)
     assert cfg.min_order_lifetime_seconds == 90
-    assert cfg.min_reprice_distance_pct == pytest.approx(0.0015)
+    assert cfg.min_reprice_distance_pct == pytest.approx(0.003)
 
 
 def test_low_fill_rate_warning_logs_after_180_minutes(caplog):
