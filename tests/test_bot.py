@@ -4240,6 +4240,21 @@ def test_size_floor_helper_keeps_orders_above_min_notional(tmp_path):
     assert orch._floor_size_to_min_order_notional(100.0, 0.0) == 0.0
 
 
+def test_eth_size_decimals_and_meta_refresh():
+    from src.hyperliquid_client import normalize_size, set_size_decimals, _SIZE_DECIMALS_BY_SYMBOL
+
+    # ETH is seeded at 4 decimals (BTC stays 5); a wrong value mis-sizes orders.
+    assert normalize_size("ETH", 0.123456) == pytest.approx(0.1234)
+    assert normalize_size("BTC", 0.123456) == pytest.approx(0.12345)
+
+    # An unknown symbol can be populated from the exchange meta at runtime.
+    try:
+        set_size_decimals("SOL", 2)
+        assert normalize_size("SOL", 1.2399) == pytest.approx(1.23)
+    finally:
+        _SIZE_DECIMALS_BY_SYMBOL.pop("SOL", None)
+
+
 def test_size_floor_survives_submit_side_round_down(tmp_path):
     # 10 / 62927 = 0.000158913: the exact fraction truncates to 0.00015 at the
     # submit-side ROUND_DOWN normalization ($9.44 < $10, observed live as the

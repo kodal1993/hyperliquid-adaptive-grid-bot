@@ -1,5 +1,11 @@
 # Changelog
 
+## BTC + ETH on one account (parallel ETH service)
+
+- Added support for running ETH alongside BTC on the **same Hyperliquid account** as a second, independent service — without touching the proven single-symbol BTC bot. Two processes on one address share the per-address request budget and coordinate through the budget poll (both see the same headroom and enter frugal/recovery together); the recovery hourly op budget is meant to be lowered to 3 per process so the combined consumption matches the single-symbol cap.
+- `szDecimals` (order size rounding) is now seeded with known values (`BTC=5`, `ETH=4`) and refreshed from the exchange `meta` at `connect()`, so any traded symbol gets correct size steps instead of the BTC-hardcoded value — preventing the size-rounding rejection class of bug on ETH.
+- Added `config/live-eth.env.example` (ETH risk caps: $20 order, $40 max position, 0.60 directional pct so the order clears the exposure cap at the smaller ceiling; separate state/lock files), `deploy/systemd/hyperliquid-grid-bot-eth.service`, and `docs/multi-symbol-eth.md` with the deploy steps. Risk split is BTC-weighted 60/40 (BTC $60 / ETH $40 max position, ~31% combined exposure at 1x).
+
 ## Scale order sizing for ~325 USD equity
 
 - Raised the default order sizing now that equity is ~$325: `ORDER_NOTIONAL_USD` 12 → 20, `MAX_NOTIONAL_PER_TRADE_USD` → 24, `MAX_POSITION_NOTIONAL_USD` 40 → 90 (~28% of equity at 1x, liquidation negligible), `MAX_ACTIVE_EXPOSURE_USD` 50 → 110 so the full 3-level grid builds. `MIN_ORDER_NOTIONAL_USD` stays 12, above the $10 exchange minimum, so bias multipliers (0.75x) now reduce a $20 level to ~$15 instead of being floored away. Larger fills also repay the Hyperliquid request budget faster. Leverage stays 1x. Live deploys still need the same values in `config/live.env`, which overrides these defaults.
