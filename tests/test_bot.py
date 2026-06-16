@@ -4665,6 +4665,44 @@ def test_paired_tp_post_only_succeeds_without_fallback(tmp_path):
     assert client.placed[0]["price"] == pytest.approx(99.0)
 
 
+def test_paired_tp_covers_flip_residual_only(tmp_path):
+    # Short>Long flip: a 0.00044 buy closes a 0.00033 short and opens a 0.00011
+    # long residual. The TP must cover the 0.00011 residual (position_after),
+    # not the whole 0.00044, and rest as a reduce-only sell above the fill.
+    client = _StatefulLiveClient()
+    eng = _live_engine(tmp_path, client, paired_take_profit_enabled=True, paired_tp_post_only=True)
+    eng.last_grid_spacing_pct = 0.003
+    entry = {
+        "symbol": "BTC", "side": "buy", "price": 66613.0, "qty": 0.00044,
+        "exposure_action": "flipping", "is_flip_trade": True, "position_after": 0.00011,
+    }
+
+    submitted = eng._maybe_place_paired_take_profit("BTC", entry, {"dir": "Short > Long"})
+
+    assert submitted is True
+    assert len(client.placed) == 1
+    tp = client.placed[0]
+    assert tp["reduce_only"] is True
+    assert tp["side"] == "sell"
+    assert tp["size"] == pytest.approx(0.00011)          # residual, not 0.00044
+    assert tp["price"] == pytest.approx(66613.0 * 1.003, rel=1e-3)
+    assert tp["price"] > 66613.0
+
+
+def test_paired_tp_skips_flip_with_no_residual(tmp_path):
+    # An exact flip (closes the short, opens nothing) leaves no residual -> no TP.
+    client = _StatefulLiveClient()
+    eng = _live_engine(tmp_path, client, paired_take_profit_enabled=True)
+    eng.last_grid_spacing_pct = 0.003
+    entry = {
+        "symbol": "BTC", "side": "buy", "price": 66600.0, "qty": 0.0003,
+        "exposure_action": "flipping", "is_flip_trade": True, "position_after": 0.0,
+    }
+
+    assert eng._maybe_place_paired_take_profit("BTC", entry, {"dir": "Short > Long"}) is False
+    assert client.placed == []
+
+
 def test_trade_health_metrics_rolling_window(tmp_path):
     client = _StatefulLiveClient()
     eng = _live_engine(tmp_path, client)

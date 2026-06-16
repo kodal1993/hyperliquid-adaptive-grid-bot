@@ -1642,21 +1642,36 @@ class LiveExecutionEngine:
             return direction.startswith("open")
         return entry.get("exposure_action") == "increasing"
 
+    def _new_exposure_qty(self, entry: dict, fill_qty: float) -> float:
+        """Quantity of NEW exposure this fill opened, for TP sizing.
+
+        A flip (Short>Long / Long>Short) closes the old side and opens a small
+        residual in the new direction; only that residual (position_after) needs
+        a take-profit, not the whole flip size. A plain opening/increasing fill
+        opened its full quantity.
+        """
+        if entry.get("is_flip_trade") or entry.get("exposure_action") == "flipping":
+            return abs(float(entry.get("position_after", 0.0) or 0.0))
+        return fill_qty
+
     def _maybe_place_paired_take_profit(self, symbol: str, entry: dict, raw: dict) -> bool:
-        """Pair an opening grid fill with a reduce-only take-profit one spacing away.
+        """Pair a fill that opened new exposure with a reduce-only take-profit.
 
         This realizes the grid roundtrip immediately instead of waiting for a
-        regime flip or recenter to close inventory. The TP is reduce-only and
-        Gtc so it can cross the book if price has already moved past it.
+        regime flip or recenter to close inventory. Covers plain opening fills
+        AND the residual a flip leaves behind, so a flip never strands an
+        un-managed position without a close order (observed live: a $7 long left
+        by a Short>Long flip lingered with no TP).
         """
         if not self.paired_take_profit_enabled or not symbol:
             return False
-        if not self._is_opening_fill(raw, entry):
+        is_flip = bool(entry.get("is_flip_trade")) or entry.get("exposure_action") == "flipping"
+        if not is_flip and not self._is_opening_fill(raw, entry):
             return False
         fill_price = float(entry.get("price", 0.0) or 0.0)
-        fill_qty = float(entry.get("qty", 0.0) or 0.0)
+        tp_qty = self._new_exposure_qty(entry, float(entry.get("qty", 0.0) or 0.0))
         spacing = max(float(self.last_grid_spacing_pct), 0.0) * self.paired_tp_spacing_multiplier
-        if fill_price <= 0 or fill_qty <= 0 or spacing <= 0:
+        if fill_price <= 0 or tp_qty <= 0 or spacing <= 0:
             return False
         side = str(entry.get("side", "")).lower()
         tp_side = "sell" if side == "buy" else "buy"
@@ -1665,10 +1680,10 @@ class LiveExecutionEngine:
             # Prefer post-only so the TP rests as maker (a third of the taker
             # fee); only cross the book when the price already moved past the
             # level, otherwise the roundtrip would stay open.
-            submitted = self._submit_live_limit(symbol, tp_side, fill_qty, tp_price, reduce_only=True, prefer_post_only=self.paired_tp_post_only)
+            submitted = self._submit_live_limit(symbol, tp_side, tp_qty, tp_price, reduce_only=True, prefer_post_only=self.paired_tp_post_only)
             if not submitted and self.paired_tp_post_only and self.last_submit_error_kind == "alo_reject":
                 logger.info("paired_tp_post_only_crossed_falling_back_to_gtc tp_side=%s tp_price=%s", tp_side, tp_price)
-                submitted = self._submit_live_limit(symbol, tp_side, fill_qty, tp_price, reduce_only=True)
+                submitted = self._submit_live_limit(symbol, tp_side, tp_qty, tp_price, reduce_only=True)
         except Exception as exc:
             # TP placement must never break fill ingestion; the next tick's
             # position management still covers the open inventory.
@@ -1677,13 +1692,13 @@ class LiveExecutionEngine:
         if submitted:
             self.paired_tp_placed_count += 1
             logger.info(
-                "paired_tp_submitted entry_side=%s entry_price=%s qty=%s tp_side=%s tp_price=%s spacing_pct=%s paired_tp_placed_count=%s",
-                side, fill_price, fill_qty, tp_side, tp_price, spacing, self.paired_tp_placed_count,
+                "paired_tp_submitted entry_side=%s entry_price=%s qty=%s tp_side=%s tp_price=%s spacing_pct=%s is_flip=%s paired_tp_placed_count=%s",
+                side, fill_price, tp_qty, tp_side, tp_price, spacing, is_flip, self.paired_tp_placed_count,
             )
         else:
             logger.warning(
                 "paired_tp_skipped entry_side=%s entry_price=%s qty=%s tp_side=%s tp_price=%s spacing_pct=%s reason=submit_failed",
-                side, fill_price, fill_qty, tp_side, tp_price, spacing,
+                side, fill_price, tp_qty, tp_side, tp_price, spacing,
             )
         return submitted
 
