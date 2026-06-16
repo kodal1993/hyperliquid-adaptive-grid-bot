@@ -1,5 +1,13 @@
 # Changelog
 
+## Pair a take-profit with the residual a flip leaves behind
+
+- A regime flip (`Short>Long` / `Long>Short`) closes the old side and opens a small residual in the new direction (observed live: a 0.00044 buy closing a 0.00033 short left a ~$7 long). That residual got no paired take-profit (only plain opening fills did), so it lingered with no close order and tended to be flattened later as a taker loss. `_maybe_place_paired_take_profit` now also handles flip fills, sizing the reduce-only TP to the residual (`position_after`), not the whole flip size. Plain opening/increasing fills are unchanged.
+
+## Widen the adverse-move exit so the grid stops whipsawing
+
+- Live data showed the maker take-profits earning roughly +$0.90 while the defensive taker exits gave back about −$0.79 (net ~breakeven). The adverse-move exit at 0.45% (~1.5x the grid spacing) fired on normal oscillation and realized taker losses on positions that would have mean-reverted into their maker TP. Raised `ADVERSE_MOVE_EXIT_PCT` 0.0045 → 0.008 (~3x grid spacing): the grid holds through normal chop and only taker-exits a genuinely larger adverse move. At a $90 max position a 0.8% exit is ~$0.72 (≈0.2% of $325 equity), well inside the 1.5% daily limit; the real trend backstop remains the max-position cap plus the market-stress layer.
+
 ## Scale order sizing for ~325 USD equity
 
 - Raised the default order sizing now that equity is ~$325: `ORDER_NOTIONAL_USD` 12 → 20, `MAX_NOTIONAL_PER_TRADE_USD` → 24, `MAX_POSITION_NOTIONAL_USD` 40 → 90 (~28% of equity at 1x, liquidation negligible), `MAX_ACTIVE_EXPOSURE_USD` 50 → 110 so the full 3-level grid builds. `MIN_ORDER_NOTIONAL_USD` stays 12, above the $10 exchange minimum, so bias multipliers (0.75x) now reduce a $20 level to ~$15 instead of being floored away. Larger fills also repay the Hyperliquid request budget faster. Leverage stays 1x. Live deploys still need the same values in `config/live.env`, which overrides these defaults.
