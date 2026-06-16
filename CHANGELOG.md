@@ -1,5 +1,9 @@
 # Changelog
 
+## /performance edge breakdown: maker vs taker and by regime
+
+- `/performance` now appends an EDGE BONTÁS section so it is visible from the phone where the edge comes from and where it leaks: net PnL (realized − fee) split by maker vs taker liquidity, the maker share (target ≥90%), per-regime net (RANGE / TREND_*), and a rolling 24h net. This turns the "is the strategy actually profitable" question into a glanceable answer (the maker-profit vs taker-loss split that previously needed manual CSV analysis) — the gate before any scaling decision.
+
 ## Pair a take-profit with the residual a flip leaves behind
 
 - A regime flip (`Short>Long` / `Long>Short`) closes the old side and opens a small residual in the new direction (observed live: a 0.00044 buy closing a 0.00033 short left a ~$7 long). That residual got no paired take-profit (only plain opening fills did), so it lingered with no close order and tended to be flattened later as a taker loss. `_maybe_place_paired_take_profit` now also handles flip fills, sizing the reduce-only TP to the residual (`position_after`), not the whole flip size. Plain opening/increasing fills are unchanged.

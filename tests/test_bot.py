@@ -1664,6 +1664,22 @@ def load_telegram_control_bot_module():
     return module
 
 
+def test_edge_breakdown_splits_maker_taker_and_regime():
+    telegram_bot = load_telegram_control_bot_module()
+    trades = [
+        {"fill_liquidity": "maker", "realized_pnl_delta": 0.0, "fee": 0.0015, "regime": "RANGE"},
+        {"fill_liquidity": "maker", "realized_pnl_delta": 0.09, "fee": 0.0015, "regime": "RANGE"},
+        {"fill_liquidity": "taker", "realized_pnl_delta": -0.11, "fee": 0.011, "regime": "TREND_UP"},
+    ]
+    text = "\n".join(telegram_bot._edge_breakdown(trades))
+    # maker net = (0 - 0.0015) + (0.09 - 0.0015) = 0.087; taker net = -0.11 - 0.011 = -0.121
+    assert "Maker net: $0.0870 (2 fill)" in text
+    assert "Taker net: $-0.1210 (1 fill)" in text
+    assert "Maker arány: 66.7%" in text
+    assert "TREND_UP: $-0.1210" in text
+    assert "RANGE: $0.0870" in text
+
+
 def test_pull_restart_script_uses_fixed_command_and_timeout(monkeypatch):
     telegram_bot = load_telegram_control_bot_module()
     calls = []

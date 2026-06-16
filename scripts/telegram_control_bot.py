@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -388,6 +389,56 @@ def format_trades(limit: int = 10) -> str:
     return "\n".join(lines).strip()
 
 
+def _is_maker_fill(trade: dict[str, Any]) -> bool:
+    fl = str(trade.get("fill_liquidity", "")).lower()
+    if fl in {"maker", "taker"}:
+        return fl == "maker"
+    return str(trade.get("is_maker_fill", "")).lower() in {"true", "1"}
+
+
+def _trade_ts(trade: dict[str, Any]) -> datetime | None:
+    raw = str(trade.get("timestamp", "") or "")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _edge_breakdown(trades: list[dict[str, Any]]) -> list[str]:
+    """Where the edge comes from / leaks: net PnL (realized - fee) split by
+    maker vs taker liquidity and by regime, plus a rolling 24h net."""
+    def net(t: dict[str, Any]) -> float:
+        return _trade_float(t, "realized_pnl_delta") - abs(_trade_float(t, "fee"))
+
+    maker = [t for t in trades if _is_maker_fill(t)]
+    taker = [t for t in trades if not _is_maker_fill(t)]
+    maker_share = len(maker) / len(trades) if trades else 0.0
+
+    by_regime: dict[str, list[float]] = {}
+    for t in trades:
+        by_regime.setdefault(str(t.get("regime") or "unknown"), []).append(net(t))
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    last24 = [t for t in trades if (_trade_ts(t) or now) >= cutoff]
+
+    lines = [
+        "",
+        "🔬 EDGE BONTÁS",
+        f"Maker net: {fmt_money(sum(net(t) for t in maker), 4)} ({len(maker)} fill)",
+        f"Taker net: {fmt_money(sum(net(t) for t in taker), 4)} ({len(taker)} fill)",
+        f"Maker arány: {fmt_pct(maker_share, 1)}  (cél: ≥90%)",
+        "Rezsim szerinti nettó:",
+    ]
+    for regime in sorted(by_regime, key=lambda r: sum(by_regime[r])):
+        vals = by_regime[regime]
+        lines.append(f"  {regime}: {fmt_money(sum(vals), 4)} ({len(vals)} fill)")
+    lines.append(f"Utolsó 24h nettó: {fmt_money(sum(net(t) for t in last24), 4)} ({len(last24)} fill)")
+    return lines
+
+
 def format_performance() -> str:
     trades = read_trades()
     lines = ["📉 PERFORMANCE", "Execution: LIVE", f"Source: {TRADES_FILE}", ""]
@@ -437,6 +488,7 @@ def format_performance() -> str:
             f"Last trade: {last_ts}",
         ]
     )
+    lines.extend(_edge_breakdown(trades))
     return "\n".join(lines)
 
 
