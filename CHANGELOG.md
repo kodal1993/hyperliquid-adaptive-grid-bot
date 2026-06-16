@@ -1,5 +1,9 @@
 # Changelog
 
+## systemd unit for the Telegram control bot
+
+- Added `deploy/systemd/hyperliquid-telegram-control.service` so the Telegram controller runs as a managed service instead of a manual background process. Previously it was launched by hand and never restarted, so it kept serving stale code after a `git pull` (the `/performance` output lagged the deployed version) and would not survive a reboot. As a service it auto-restarts on failure/reboot; after a code update, `systemctl restart hyperliquid-telegram-control` reloads it.
+
 ## /performance edge breakdown: maker vs taker and by regime
 
 - `/performance` now appends an EDGE BONTÁS section so it is visible from the phone where the edge comes from and where it leaks: net PnL (realized − fee) split by maker vs taker liquidity, the maker share (target ≥90%), per-regime net (RANGE / TREND_*), and a rolling 24h net. This turns the "is the strategy actually profitable" question into a glanceable answer (the maker-profit vs taker-loss split that previously needed manual CSV analysis) — the gate before any scaling decision.
