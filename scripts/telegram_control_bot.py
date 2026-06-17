@@ -390,6 +390,13 @@ def format_trades(limit: int = 10) -> str:
 
 
 def _is_maker_fill(trade: dict[str, Any]) -> bool:
+    # Ground truth first: the exchange fee rate (maker ~0.015%, taker ~0.045%).
+    # Older ledger rows predate the fill_liquidity field, so relying on it alone
+    # mislabeled them as taker and understated the maker share.
+    notional = abs(_trade_float(trade, "notional"))
+    fee = abs(_trade_float(trade, "fee"))
+    if notional > 0 and fee > 0:
+        return (fee / notional) <= 0.0003  # midpoint between maker and taker rate
     fl = str(trade.get("fill_liquidity", "")).lower()
     if fl in {"maker", "taker"}:
         return fl == "maker"
