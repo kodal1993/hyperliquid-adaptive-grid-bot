@@ -1664,6 +1664,17 @@ def load_telegram_control_bot_module():
     return module
 
 
+def test_edge_maker_classification_uses_fee_rate():
+    telegram_bot = load_telegram_control_bot_module()
+    # Fee rate is ground truth: maker ~0.015%, taker ~0.045% of notional.
+    maker = {"notional": 20.0, "fee": 0.003}          # 0.015% -> maker
+    taker = {"notional": 20.0, "fee": 0.009}           # 0.045% -> taker
+    assert telegram_bot._is_maker_fill(maker) is True
+    assert telegram_bot._is_maker_fill(taker) is False
+    # Old rows without fee/notional fall back to the liquidity field.
+    assert telegram_bot._is_maker_fill({"fill_liquidity": "maker"}) is True
+
+
 def test_edge_breakdown_splits_maker_taker_and_regime():
     telegram_bot = load_telegram_control_bot_module()
     trades = [
