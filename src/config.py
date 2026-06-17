@@ -57,6 +57,7 @@ class BotConfig:
     counter_trend_entry_edge_score: float
     strong_momentum_block_threshold: float
     adverse_move_exit_pct: float
+    wrong_way_exit_loss_pct: float
     min_reversion_confirmation_pct: float
     grid_spacing_low_vol_min_pct: float
     grid_spacing_low_vol_max_pct: float
@@ -236,7 +237,8 @@ class BotConfig:
             min_net_profit_fee_multiplier=float(os.getenv("MIN_NET_PROFIT_FEE_MULTIPLIER", os.getenv("MIN_EXPECTED_NET_PROFIT_FEE_MULTIPLE", "2.75"))),
             counter_trend_entry_edge_score=float(os.getenv("COUNTER_TREND_ENTRY_EDGE_SCORE", "3.5")),
             strong_momentum_block_threshold=float(os.getenv("STRONG_MOMENTUM_BLOCK_THRESHOLD", "0.65")),
-            adverse_move_exit_pct=float(os.getenv("ADVERSE_MOVE_EXIT_PCT", "0.008")),
+            adverse_move_exit_pct=float(os.getenv("ADVERSE_MOVE_EXIT_PCT", "0.015")),
+            wrong_way_exit_loss_pct=float(os.getenv("WRONG_WAY_EXIT_LOSS_PCT", "0.015")),
             min_reversion_confirmation_pct=float(os.getenv("MIN_REVERSION_CONFIRMATION_PCT", "0.0015")),
             grid_spacing_low_vol_min_pct=float(os.getenv("GRID_SPACING_LOW_VOL_MIN_PCT", "0.0025")),
             grid_spacing_low_vol_max_pct=float(os.getenv("GRID_SPACING_LOW_VOL_MAX_PCT", "0.0030")),

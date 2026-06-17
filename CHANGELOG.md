@@ -1,5 +1,10 @@
 # Changelog
 
+## Widen the defensive taker exits — they were the whole loss
+
+- The corrected edge breakdown made it decisive: the maker grid is **profitable** (+$2.35 over the bot fills, manual deficit-bursts excluded), and the **entire** loss comes from **74 defensive taker closes (−$4.67)** — split Close Short −$2.48 / Close Long −$2.19. These per-position exits cross the book as taker (3x fee) and close at a loss, fighting the grid's mean-reversion.
+- Widened both exits accordingly: `ADVERSE_MOVE_EXIT_PCT` 0.008 → **0.015**, and the wrong-way exit (previously hard-coded at a very tight 0.0035) is now configurable as `WRONG_WAY_EXIT_LOSS_PCT`, default **0.015**. The grid now holds through normal adverse moves and only force-exits a genuinely large one. The remaining trend protection is the max-position cap, the market-stress layer (one-siding / flat), and 1x leverage (liquidation effectively impossible). Goal: keep the +$2.35 maker edge instead of giving it back through taker stops.
+
 ## systemd unit for the Telegram control bot
 
 - Added `deploy/systemd/hyperliquid-telegram-control.service` so the Telegram controller runs as a managed service instead of a manual background process. Previously it was launched by hand and never restarted, so it kept serving stale code after a `git pull` (the `/performance` output lagged the deployed version) and would not survive a reboot. As a service it auto-restarts on failure/reboot; after a code update, `systemctl restart hyperliquid-telegram-control` reloads it.

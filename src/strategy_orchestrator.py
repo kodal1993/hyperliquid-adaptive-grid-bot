@@ -66,7 +66,7 @@ class StrategyOrchestrator:
         if flip_cooldown_minutes > 0:
             tick_seconds = max(int(getattr(config, "tick_seconds", 10)), 1)
             self.trend_flip_cooldown_ticks = max(self.trend_flip_cooldown_ticks, int(flip_cooldown_minutes * 60 / tick_seconds))
-        self.wrong_way_exit_loss_pct = 0.0035
+        self.wrong_way_exit_loss_pct = float(getattr(config, "wrong_way_exit_loss_pct", 0.015))
         self.adverse_move_exit_pct = max(float(getattr(config, "adverse_move_exit_pct", 0.0045)), 0.0)
         self.orphan_order_cleanup_count = 0
         self._orphan_missing_side_streak = 0
