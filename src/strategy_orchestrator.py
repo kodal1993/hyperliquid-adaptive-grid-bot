@@ -68,6 +68,9 @@ class StrategyOrchestrator:
             self.trend_flip_cooldown_ticks = max(self.trend_flip_cooldown_ticks, int(flip_cooldown_minutes * 60 / tick_seconds))
         self.wrong_way_exit_loss_pct = float(getattr(config, "wrong_way_exit_loss_pct", 0.015))
         self.adverse_move_exit_pct = max(float(getattr(config, "adverse_move_exit_pct", 0.0045)), 0.0)
+        self.position_stop_loss_pct = max(float(getattr(config, "position_stop_loss_pct", 0.0)), 0.0)
+        self.mean_reversion_override_pct = max(float(getattr(config, "mean_reversion_override_pct", 0.0)), 0.0)
+        self.mean_reversion_confirm_bars = max(int(getattr(config, "mean_reversion_confirm_bars", 1)), 1)
         self.orphan_order_cleanup_count = 0
         self._orphan_missing_side_streak = 0
         self.orphan_cleanup_confirm_ticks = max(int(getattr(config, "orphan_cleanup_confirm_ticks", 3)), 1)
@@ -330,6 +333,33 @@ class StrategyOrchestrator:
                 allow_sells = False
         force_reduce_only = effective_position_notional > rebalance_cap
 
+        # --- Hard per-position stop: regime- and mean-reversion-independent catastrophe
+        # backstop. Runs before every other exit so an unbounded adverse run is always
+        # capped, no matter the regime or mean-reversion state. Off when pct == 0.
+        hard_loss_pct = 0.0
+        if self.position_stop_loss_pct > 0 and effective_position_side in {"LONG", "SHORT"} and avg_entry > 0:
+            if effective_position_side == "LONG":
+                hard_loss_pct = max((avg_entry - price) / avg_entry, 0.0)
+            else:
+                hard_loss_pct = max((price - avg_entry) / avg_entry, 0.0)
+            if hard_loss_pct >= self.position_stop_loss_pct:
+                canceled = self.execution_engine.cancel_all_orders(symbol, force=True)
+                flattened = self.execution_engine.flatten_position(symbol, price)
+                self.trend_flip_cooldown_remaining = max(self.trend_flip_cooldown_remaining, self.trend_flip_cooldown_ticks)
+                logger.warning(
+                    "hard_position_stop_exit side=%s entry=%s price=%s loss_pct=%.5f threshold=%.5f canceled=%s flattened=%s",
+                    effective_position_side, avg_entry, price, hard_loss_pct,
+                    self.position_stop_loss_pct, canceled, flattened,
+                )
+                return {
+                    "status": "managing_position", "regime": regime.value, "risk": None,
+                    "mode": mode.value, "reason": "hard_position_stop_exit",
+                    "allowed_to_trade": False, "allowed_to_reduce": True,
+                    "canceled_orders": canceled, "flattened": flattened,
+                    "hard_loss_pct": hard_loss_pct, "position_stop_loss_pct": self.position_stop_loss_pct,
+                    **dust_context,
+                }
+
         wrong_way_trend_position = (
             (regime in {MarketRegime.TREND_DOWN, MarketRegime.TREND_DOWN_PULLBACK} and effective_position_side == "LONG")
             or (regime in {MarketRegime.TREND_UP, MarketRegime.TREND_UP_PULLBACK} and effective_position_side == "SHORT")
@@ -379,21 +409,28 @@ class StrategyOrchestrator:
             price,
             regime_signal.transition_direction,
         )
+        # A small bounce should not defer the adverse-move exit indefinitely: past
+        # mean_reversion_override_pct the reversion confirmation is ignored.
+        mr_override = (
+            self.mean_reversion_override_pct > 0
+            and adverse_move_pct >= self.mean_reversion_override_pct
+        )
         if (
             effective_position_side in {"LONG", "SHORT"}
             and adverse_move_pct > self.adverse_move_exit_pct
-            and not mean_reversion_confirmed
+            and (not mean_reversion_confirmed or mr_override)
         ):
             canceled = self.execution_engine.cancel_all_orders(symbol, force=True)
             flattened = self.execution_engine.flatten_position(symbol, price)
             logger.warning(
-                "adverse_move_protection_exit_requested side=%s entry=%s price=%s adverse_move_pct=%.5f threshold=%.5f mean_reversion_confirmed=%s canceled=%s flattened=%s",
+                "adverse_move_protection_exit_requested side=%s entry=%s price=%s adverse_move_pct=%.5f threshold=%.5f mean_reversion_confirmed=%s mean_reversion_override=%s canceled=%s flattened=%s",
                 effective_position_side,
                 avg_entry,
                 price,
                 adverse_move_pct,
                 self.adverse_move_exit_pct,
                 mean_reversion_confirmed,
+                mr_override,
                 canceled,
                 flattened,
             )
@@ -411,6 +448,7 @@ class StrategyOrchestrator:
                 "adverse_move_pct": adverse_move_pct,
                 "adverse_move_exit_pct": self.adverse_move_exit_pct,
                 "mean_reversion_confirmed": mean_reversion_confirmed,
+                "mean_reversion_override": mr_override,
                 **dust_context,
             }
 

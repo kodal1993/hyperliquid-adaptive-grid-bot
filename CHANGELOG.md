@@ -1,5 +1,13 @@
 # Changelog
 
+## Crash-exit machinery: maker-first flatten + a wide catastrophe backstop
+
+- Added config-driven crash handling that keeps the data-following posture (live data shows tight taker stops lose money, so nothing here tightens the existing 1.5% defensive exits):
+  - **Maker-first flatten** (`FLATTEN_MAKER_FIRST=true`, `FLATTEN_MAKER_WAIT_SECONDS=8`): every forced exit now first rests a post-only reduce-only order on our own side of the book (maker fee) instead of crossing as taker. If it has not filled by the deadline it escalates to an aggressive taker cross. This makes *all* defensive exits — adverse-move, wrong-way, hard stop — cheaper without making them fire any sooner.
+  - **Hard position stop** (`POSITION_STOP_LOSS_PCT`, default **0.025**): a regime- and mean-reversion-independent catastrophe backstop that flattens any position 2.5% underwater no matter what. Deliberately wide — it only catches an unbounded run, not normal grid drawdown. Set to 0 to disable. Runs before every other exit.
+  - **Mean-reversion override** (`MEAN_REVERSION_OVERRIDE_PCT`, default **0.0** = off): once an adverse move reaches this size, the "wait for the one-bar bounce" deferral on the adverse-move exit is ignored and the exit fires anyway, so a small bounce can no longer defer an exit indefinitely.
+- All knobs are config-driven with backward-compatible defaults; `ADVERSE_MOVE_EXIT_PCT` and `WRONG_WAY_EXIT_LOSS_PCT` stay at 0.015. The aggressive spec values (0.5% / 1.0% stops) are deliberately **not** deployed — the machinery is in place to tighten later only if the edge breakdown justifies it.
+
 ## Widen the defensive taker exits — they were the whole loss
 
 - The corrected edge breakdown made it decisive: the maker grid is **profitable** (+$2.35 over the bot fills, manual deficit-bursts excluded), and the **entire** loss comes from **74 defensive taker closes (−$4.67)** — split Close Short −$2.48 / Close Long −$2.19. These per-position exits cross the book as taker (3x fee) and close at a loss, fighting the grid's mean-reversion.

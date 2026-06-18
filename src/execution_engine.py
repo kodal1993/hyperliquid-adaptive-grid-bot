@@ -880,6 +880,9 @@ class LiveExecutionEngine:
         self.rate_limit_headroom_frugal = max(float(kwargs.pop("rate_limit_headroom_frugal", 500.0)), 0.0)
         self.rate_limit_min_action_interval_seconds = max(float(kwargs.pop("rate_limit_min_action_interval_seconds", 12.0)), 0.0)
         self.paired_tp_post_only = bool(kwargs.pop("paired_tp_post_only", True))
+        self.flatten_maker_first = bool(kwargs.pop("flatten_maker_first", True))
+        self.flatten_maker_wait_seconds = max(float(kwargs.pop("flatten_maker_wait_seconds", 8.0)), 0.0)
+        self._flatten_pending: dict | None = None
         self.max_order_ops_per_cycle = max(int(kwargs.pop("max_order_ops_per_cycle", 2)), 1)
         self.rate_limited_until = 0.0
         self.last_rate_limit_ts = 0.0
@@ -1404,18 +1407,51 @@ class LiveExecutionEngine:
         active_count = sum(1 for o in self.open_orders if o.get("symbol") == symbol and bool(o.get("reduce_only", False)) and o.get("side") == side)
         return {"submitted": submitted, "active_cleanup_orders": active_count, "canceled": canceled, "price": target_price, "size": remaining_qty, "reason": "submitted" if submitted else "submit_failed", "price_moved": price_moved, "size_changed": size_changed}
 
-    def flatten_position(self, symbol: str, mark_price: float) -> bool:
+    def flatten_position(self, symbol: str, mark_price: float, *, maker_first: bool | None = None) -> bool:
         self.sync_account(symbol, mark_price)
         if abs(self.state.position_size) < 1e-12:
+            self._flatten_pending = None
             return False
         side = "buy" if self.state.position_size < 0 else "sell"
+        qty = abs(self.state.position_size)
+        use_maker = self.flatten_maker_first if maker_first is None else maker_first
+        if use_maker and self.flatten_maker_wait_seconds > 0:
+            # Passive reduce-only on our own side of the book (post-only, non-crossing)
+            # so the forced exit pays the maker fee, not a taker cross. If it has not
+            # filled by the deadline, _maybe_escalate_flatten() crosses aggressively.
+            maker_px = mark_price * 0.9999 if side == "sell" else mark_price * 1.0001
+            placed = self._submit_live_limit(symbol, side, qty, maker_px, reduce_only=True, prefer_post_only=True)
+            if placed:
+                self._flatten_pending = {"symbol": symbol, "deadline": time.time() + self.flatten_maker_wait_seconds, "side": side}
+                logger.info("flatten_maker_first_submitted symbol=%s side=%s qty=%s px=%s wait=%s", symbol, side, qty, maker_px, self.flatten_maker_wait_seconds)
+                return True
+        # Aggressive taker cross (escalation, or maker disabled).
         limit_price = mark_price * 1.002 if side == "buy" else mark_price * 0.998
-        return self._submit_live_limit(symbol, side, abs(self.state.position_size), limit_price, reduce_only=True)
+        self._flatten_pending = None
+        return self._submit_live_limit(symbol, side, qty, limit_price, reduce_only=True)
+
+    def _maybe_escalate_flatten(self, symbol: str, mark_price: float) -> None:
+        """If a maker-first flatten has not filled by its deadline and the position
+        is still open, cancel any resting orders and cross aggressively (taker)."""
+        pending = self._flatten_pending
+        if not pending or time.time() < float(pending.get("deadline", 0.0)):
+            return
+        self.sync_account(symbol, mark_price)
+        if abs(self.state.position_size) < 1e-12:
+            self._flatten_pending = None
+            return
+        logger.warning("flatten_maker_escalation symbol=%s remaining=%s -> taker cross", symbol, self.state.position_size)
+        self.cancel_all_orders(symbol, force=True)
+        self.flatten_position(symbol, mark_price, maker_first=False)
 
     def on_candle(self, candle: dict, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", strategy_status: str = "running", orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None, prediction_bias: str = "") -> list[dict]:
         symbol = str(candle.get("symbol") or "")
         if not symbol and self.open_orders:
             symbol = str(self.open_orders[0].get("symbol", ""))
+        if self._flatten_pending and symbol:
+            mark = float(candle.get("close", candle.get("c", 0.0)) or 0.0)
+            if mark > 0:
+                self._maybe_escalate_flatten(symbol, mark)
         # No candle-touch fill simulation in live mode. This only polls exchange fills.
         return self.sync_user_fills(symbol or None, regime=regime, mode=mode, risk_state=risk_state, pause_reason=pause_reason, orderbook_classification=orderbook_classification, orderbook_imbalance_ratio=orderbook_imbalance_ratio, orderbook_pressure_score=orderbook_pressure_score, prediction_bias=prediction_bias)
 

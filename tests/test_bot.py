@@ -1329,6 +1329,7 @@ def test_live_flatten_position_uses_aggressive_reduce_only_limit_for_dust_long(t
         start_balance=160,
         min_notional_usd=10,
         max_notional_per_trade_usd=50,
+        flatten_maker_first=False,
         trade_ledger_csv=str(tmp_path / "trades.csv"),
         trade_ledger_jsonl=str(tmp_path / "trades.jsonl"),
         risk_decisions_csv=str(tmp_path / "risk.csv"),
@@ -2709,6 +2710,157 @@ def test_adverse_move_protection_closes_before_reversion_confirmation(tmp_path):
     assert status["reason"] == "adverse_move_protection_exit_requested"
     assert status["flattened"] is True
     assert status["adverse_move_pct"] > cfg.adverse_move_exit_pct
+
+
+def test_hard_position_stop_flattens_short_in_uptrend(tmp_path):
+    # The hard stop is a regime- and mean-reversion-independent catastrophe backstop:
+    # a short bleeding past the threshold in a rising market must be flattened even
+    # though the grid's normal defensive exits are configured wide here.
+    cfg = BotConfig.from_env()
+    cfg.position_stop_loss_pct = 0.02
+    cfg.adverse_move_exit_pct = 0.99
+    cfg.wrong_way_exit_loss_pct = 0.99
+    cfg.max_position_notional_usd = 500
+    eng = make_test_engine(tmp_path, "hard_stop.json", paper_mode=True, enable_live_trading=False)
+    eng.paper.position_size = -1.0
+    eng.paper.avg_entry = 100.0
+    orch = StrategyOrchestrator(cfg, eng)
+    closes = [100.0 + i * 0.05 for i in range(78)] + [102.0, 103.0]
+    candles = pd.DataFrame({"close": closes, "high": [c + 1 for c in closes], "low": [c - 1 for c in closes]})
+
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=103.0)
+
+    assert status["reason"] == "hard_position_stop_exit"
+    assert status["flattened"] is True
+    assert status["hard_loss_pct"] >= cfg.position_stop_loss_pct
+
+
+def test_hard_position_stop_disabled_when_pct_zero(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.position_stop_loss_pct = 0.0
+    cfg.adverse_move_exit_pct = 0.99
+    cfg.wrong_way_exit_loss_pct = 0.99
+    cfg.max_position_notional_usd = 500
+    eng = make_test_engine(tmp_path, "hard_stop_off.json", paper_mode=True, enable_live_trading=False)
+    eng.paper.position_size = -1.0
+    eng.paper.avg_entry = 100.0
+    orch = StrategyOrchestrator(cfg, eng)
+    closes = [100.0 + i * 0.05 for i in range(78)] + [102.0, 103.0]
+    candles = pd.DataFrame({"close": closes, "high": [c + 1 for c in closes], "low": [c - 1 for c in closes]})
+
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=103.0)
+
+    assert status.get("reason") != "hard_position_stop_exit"
+
+
+def test_mean_reversion_override_forces_adverse_exit_despite_bounce(tmp_path):
+    # A confirmed one-bar bounce normally defers the adverse-move exit. Past the
+    # override threshold the deferral is ignored and the exit fires anyway.
+    cfg = BotConfig.from_env()
+    cfg.adverse_move_exit_pct = 0.01
+    cfg.mean_reversion_override_pct = 0.02
+    cfg.min_reversion_confirmation_pct = 0.0015
+    cfg.wrong_way_exit_loss_pct = 0.99
+    cfg.max_position_notional_usd = 500
+    eng = make_test_engine(tmp_path, "mr_override.json", paper_mode=True, enable_live_trading=False)
+    eng.paper.position_size = 1.0
+    eng.paper.avg_entry = 100.0
+    orch = StrategyOrchestrator(cfg, eng)
+    closes = [100.0 for _ in range(77)] + [98.0, 96.0, 97.0]
+    candles = pd.DataFrame({"close": closes, "high": [c + 1 for c in closes], "low": [c - 1 for c in closes]})
+
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=97.0)
+
+    assert status["reason"] == "adverse_move_protection_exit_requested"
+    assert status["mean_reversion_confirmed"] is True
+    assert status["mean_reversion_override"] is True
+    assert status["flattened"] is True
+
+
+def test_mean_reversion_bounce_defers_exit_without_override(tmp_path):
+    cfg = BotConfig.from_env()
+    cfg.adverse_move_exit_pct = 0.01
+    cfg.mean_reversion_override_pct = 0.0
+    cfg.min_reversion_confirmation_pct = 0.0015
+    cfg.wrong_way_exit_loss_pct = 0.99
+    cfg.max_position_notional_usd = 500
+    eng = make_test_engine(tmp_path, "mr_defer.json", paper_mode=True, enable_live_trading=False)
+    eng.paper.position_size = 1.0
+    eng.paper.avg_entry = 100.0
+    orch = StrategyOrchestrator(cfg, eng)
+    closes = [100.0 for _ in range(77)] + [98.0, 96.0, 97.0]
+    candles = pd.DataFrame({"close": closes, "high": [c + 1 for c in closes], "low": [c - 1 for c in closes]})
+
+    status = orch.on_tick(candles, equity=1000.0, daily_pnl_pct=0.0, symbol="BTC", position_notional=97.0)
+
+    assert status.get("reason") != "adverse_move_protection_exit_requested"
+
+
+def test_live_flatten_maker_first_then_escalates_to_taker(tmp_path):
+    from src.execution_engine import LiveExecutionEngine
+
+    class FakeLiveClient:
+        def __init__(self):
+            self.placed = []
+            self.cancel_calls = 0
+
+        def require_live_execution_support(self):
+            return None
+
+        def get_balance(self):
+            return {"equity": 325.0}
+
+        def get_position(self, symbol):
+            return {"coin": symbol, "szi": "0.001", "entryPx": "70000"}
+
+        def get_open_orders(self, symbol):
+            return []
+
+        def get_user_fills(self, symbol=None):
+            return []
+
+        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False, post_only=False):
+            self.placed.append({"side": side, "size": size, "price": price, "reduce_only": reduce_only, "post_only": post_only})
+
+        def cancel_all_orders(self, symbol):
+            self.cancel_calls += 1
+            return 0
+
+    client = FakeLiveClient()
+    eng = LiveExecutionEngine(
+        client,
+        str(tmp_path / "live_state.json"),
+        start_balance=325,
+        min_notional_usd=10,
+        max_notional_per_trade_usd=200,
+        flatten_maker_first=True,
+        flatten_maker_wait_seconds=8,
+        trade_ledger_csv=str(tmp_path / "trades.csv"),
+        trade_ledger_jsonl=str(tmp_path / "trades.jsonl"),
+        risk_decisions_csv=str(tmp_path / "risk.csv"),
+    )
+
+    # Maker-first: rest a post-only reduce-only sell just below the mark.
+    assert eng.flatten_position("BTC", 71000.0) is True
+    assert eng._flatten_pending is not None
+    first = client.placed[-1]
+    assert first["post_only"] is True
+    assert first["reduce_only"] is True
+    assert first["side"] == "sell"
+    assert first["price"] == pytest.approx(70993.0, rel=1e-3)  # 71000 * 0.9999
+
+    # Before the deadline there is no escalation.
+    eng._maybe_escalate_flatten("BTC", 71000.0)
+    assert client.cancel_calls == 0
+
+    # After the deadline with the position still open: cancel resting + taker cross.
+    eng._flatten_pending["deadline"] = 0.0
+    eng._maybe_escalate_flatten("BTC", 71000.0)
+    assert client.cancel_calls == 1
+    assert eng._flatten_pending is None
+    aggressive = client.placed[-1]
+    assert aggressive["post_only"] is False
+    assert aggressive["price"] == pytest.approx(70858.0, rel=1e-3)  # 71000 * 0.998
 
 
 def test_volatility_adaptive_spacing_uses_configured_buckets(tmp_path):
