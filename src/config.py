@@ -58,6 +58,11 @@ class BotConfig:
     strong_momentum_block_threshold: float
     adverse_move_exit_pct: float
     wrong_way_exit_loss_pct: float
+    position_stop_loss_pct: float
+    mean_reversion_override_pct: float
+    mean_reversion_confirm_bars: int
+    flatten_maker_first: bool
+    flatten_maker_wait_seconds: float
     min_reversion_confirmation_pct: float
     grid_spacing_low_vol_min_pct: float
     grid_spacing_low_vol_max_pct: float
@@ -239,6 +244,11 @@ class BotConfig:
             strong_momentum_block_threshold=float(os.getenv("STRONG_MOMENTUM_BLOCK_THRESHOLD", "0.65")),
             adverse_move_exit_pct=float(os.getenv("ADVERSE_MOVE_EXIT_PCT", "0.015")),
             wrong_way_exit_loss_pct=float(os.getenv("WRONG_WAY_EXIT_LOSS_PCT", "0.015")),
+            position_stop_loss_pct=float(os.getenv("POSITION_STOP_LOSS_PCT", "0.0")),
+            mean_reversion_override_pct=float(os.getenv("MEAN_REVERSION_OVERRIDE_PCT", "0.0")),
+            mean_reversion_confirm_bars=int(os.getenv("MEAN_REVERSION_CONFIRM_BARS", "1")),
+            flatten_maker_first=os.getenv("FLATTEN_MAKER_FIRST", "true").lower() == "true",
+            flatten_maker_wait_seconds=float(os.getenv("FLATTEN_MAKER_WAIT_SECONDS", "8")),
             min_reversion_confirmation_pct=float(os.getenv("MIN_REVERSION_CONFIRMATION_PCT", "0.0015")),
             grid_spacing_low_vol_min_pct=float(os.getenv("GRID_SPACING_LOW_VOL_MIN_PCT", "0.0025")),
             grid_spacing_low_vol_max_pct=float(os.getenv("GRID_SPACING_LOW_VOL_MAX_PCT", "0.0030")),
@@ -364,6 +374,8 @@ class BotConfig:
             errors.append(f"base_leverage must be 1-50, got {self.base_leverage}")
         if self.order_notional_usd <= 0:
             errors.append(f"order_notional_usd must be > 0, got {self.order_notional_usd}")
+        if not (0.0 <= self.position_stop_loss_pct <= 0.5):
+            errors.append(f"position_stop_loss_pct must be in [0, 0.5], got {self.position_stop_loss_pct}")
         if self.grid_spacing_pct <= 0:
             errors.append(f"grid_spacing_pct must be > 0, got {self.grid_spacing_pct}")
         if self.tick_seconds < 1:
