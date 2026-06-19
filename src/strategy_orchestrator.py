@@ -307,6 +307,10 @@ class StrategyOrchestrator:
         vol = float(candles["close"].pct_change().std() or 0.0)
         atr_pct = regime_signal.atr_pct or calculate_atr_pct(candles, period=14)
         final_spacing_pct, spacing_source = self._calculate_spacing_pct(atr_pct, vol)
+        trend_spacing_mult = float(getattr(self.config, "trend_spacing_multiplier", 1.25))
+        if regime in {MarketRegime.TREND_UP, MarketRegime.TREND_DOWN} and trend_spacing_mult > 1.0:
+            final_spacing_pct *= trend_spacing_mult
+            spacing_source = f"{spacing_source}_trend_x{trend_spacing_mult:.2f}"
         volatility_grid_levels = self._volatility_adjusted_grid_levels(atr_pct)
         trend_bias = self._trend_bias(regime_confidence)
         logger.info("grid_spacing spacing_source=%s atr_pct=%.6f return_vol_pct=%.6f final_spacing_pct=%.6f volatility_grid_levels=%s raw_regime=%s regime=%s regime_confidence=%.3f trend_bias=%.2f", spacing_source, atr_pct, vol, final_spacing_pct, volatility_grid_levels, raw_regime.value, regime.value, regime_confidence, trend_bias)
@@ -569,6 +573,18 @@ class StrategyOrchestrator:
         )
         allow_buys = long_selectivity_context.pop("allow_buys")
         allow_sells = long_selectivity_context.pop("allow_sells")
+
+        short_selectivity_context = self._apply_short_side_selectivity(
+            allow_buys=allow_buys,
+            allow_sells=allow_sells,
+            position_side=effective_position_side,
+            regime=regime,
+            prediction=prediction,
+            orderbook=orderbook_context,
+            force_reduce_only=force_reduce_only,
+        )
+        allow_buys = short_selectivity_context.pop("allow_buys")
+        allow_sells = short_selectivity_context.pop("allow_sells")
 
         allow_buys_before_stress = allow_buys
         allow_sells_before_stress = allow_sells
@@ -1310,6 +1326,7 @@ class StrategyOrchestrator:
             "anti_chop_trigger_count": self.anti_chop_trigger_count,
             **prediction_bias_context,
             **long_selectivity_context,
+            **short_selectivity_context,
             **range_orderbook_long_context,
             **anti_chop_context,
         }
@@ -1416,6 +1433,52 @@ class StrategyOrchestrator:
         })
         logger.info(
             "long_selectivity_blocked regime=%s position_side=%s prediction_bias=%s confidence=%.4f orderbook_classification=%s",
+            regime.value,
+            position_side,
+            getattr(prediction, "prediction_bias", ""),
+            float(getattr(prediction, "confidence_score", 0.0) or 0.0),
+            classification or "Unavailable",
+        )
+        return context
+
+    def _apply_short_side_selectivity(
+        self,
+        *,
+        allow_buys: bool,
+        allow_sells: bool,
+        position_side: str,
+        regime: MarketRegime,
+        prediction: PredictionResult,
+        orderbook: dict,
+        force_reduce_only: bool,
+    ) -> dict:
+        context = {
+            "allow_buys": allow_buys,
+            "allow_sells": allow_sells,
+            "short_selectivity_action": "none",
+            "short_selectivity_blocked": False,
+        }
+        if force_reduce_only or position_side == "LONG" or not allow_sells:
+            return context
+        if regime not in {MarketRegime.TREND_UP, MarketRegime.TREND_UP_PULLBACK}:
+            return context
+
+        classification = str(orderbook.get("classification") or "")
+        bearish_orderbook = classification in {"Bearish", "Strong Bearish"}
+        prediction_short = prediction.available and prediction.prediction_bias in {"SHORT", "STRONG_SHORT"}
+        confidence_ok = float(getattr(prediction, "confidence_score", 0.0) or 0.0) > 0.70
+        if prediction_short and confidence_ok and bearish_orderbook:
+            context["short_selectivity_action"] = "allow_trend_up_short_exception"
+            return context
+
+        context.update({
+            "allow_sells": False,
+            "short_selectivity_action": "block_new_short_in_trend_up",
+            "short_selectivity_blocked": True,
+            "short_selectivity_reason": "requires_short_prediction_confidence_gt_0_70_and_bearish_orderbook",
+        })
+        logger.info(
+            "short_selectivity_blocked regime=%s position_side=%s prediction_bias=%s confidence=%.4f orderbook_classification=%s",
             regime.value,
             position_side,
             getattr(prediction, "prediction_bias", ""),

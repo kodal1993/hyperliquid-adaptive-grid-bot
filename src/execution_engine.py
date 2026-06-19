@@ -1713,13 +1713,15 @@ class LiveExecutionEngine:
         tp_side = "sell" if side == "buy" else "buy"
         tp_price = fill_price * (1.0 + spacing) if side == "buy" else fill_price * (1.0 - spacing)
         try:
-            # Prefer post-only so the TP rests as maker (a third of the taker
-            # fee); only cross the book when the price already moved past the
-            # level, otherwise the roundtrip would stay open.
+            # Post-only so the TP rests as maker (a third of the taker fee).
+            # If ALO is rejected the price already moved past the TP level —
+            # crossing as taker would pay 3x fees and was the #1 source of
+            # taker losses in live data.  Skip the TP; position management
+            # or the next grid cycle will handle the inventory.
             submitted = self._submit_live_limit(symbol, tp_side, tp_qty, tp_price, reduce_only=True, prefer_post_only=self.paired_tp_post_only)
             if not submitted and self.paired_tp_post_only and self.last_submit_error_kind == "alo_reject":
-                logger.info("paired_tp_post_only_crossed_falling_back_to_gtc tp_side=%s tp_price=%s", tp_side, tp_price)
-                submitted = self._submit_live_limit(symbol, tp_side, tp_qty, tp_price, reduce_only=True)
+                logger.info("paired_tp_alo_rejected_skip tp_side=%s tp_price=%s reason=avoid_taker_fee", tp_side, tp_price)
+                return False
         except Exception as exc:
             # TP placement must never break fill ingestion; the next tick's
             # position management still covers the open inventory.

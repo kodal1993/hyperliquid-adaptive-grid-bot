@@ -4803,7 +4803,9 @@ def test_live_regrid_recovery_mode_waits_between_exchange_actions(tmp_path):
     assert result["placed"] == 1
 
 
-def test_paired_tp_prefers_post_only_then_falls_back_to_gtc(tmp_path):
+def test_paired_tp_skips_on_alo_reject_instead_of_taker_fallback(tmp_path):
+    """When the paired TP ALO is rejected (price already crossed), skip the TP
+    entirely instead of falling back to a taker GTC order."""
     client = _StatefulLiveClient()
     alo_reject = {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"error": "Post only order would have immediately matched"}]}}}
     original_place = client.place_limit_order
@@ -4821,12 +4823,9 @@ def test_paired_tp_prefers_post_only_then_falls_back_to_gtc(tmp_path):
 
     submitted = eng._maybe_place_paired_take_profit("BTC", entry, {"dir": "Open Long"})
 
-    assert submitted is True
-    assert len(client.placed) == 2
+    assert submitted is False
+    assert len(client.placed) == 1
     assert client.placed[0]["post_only"] is True
-    assert client.placed[1]["post_only"] is False
-    assert client.placed[1]["reduce_only"] is True
-    assert client.placed[1]["price"] == pytest.approx(101.0)
 
 
 def test_paired_tp_post_only_succeeds_without_fallback(tmp_path):

@@ -24,6 +24,7 @@ class BotConfig:
     grid_spacing_pct: float
     grid_spacing_vol_multiplier: float
     grid_spacing_multiplier: float
+    trend_spacing_multiplier: float
     grid_spacing_min_pct: float
     grid_spacing_max_pct: float
     min_grid_levels: int
@@ -210,6 +211,7 @@ class BotConfig:
             grid_spacing_pct=float(os.getenv("GRID_SPACING_PCT", "0.003")),
             grid_spacing_vol_multiplier=float(os.getenv("GRID_SPACING_VOL_MULTIPLIER", "1.2")),
             grid_spacing_multiplier=float(os.getenv("GRID_SPACING_MULTIPLIER", "1.20")),
+            trend_spacing_multiplier=float(os.getenv("TREND_SPACING_MULTIPLIER", "1.25")),
             grid_spacing_min_pct=float(os.getenv("GRID_SPACING_MIN_PCT", "0.0018")),
             grid_spacing_max_pct=float(os.getenv("GRID_SPACING_MAX_PCT", "0.012")),
             min_grid_levels=int(os.getenv("MIN_GRID_LEVELS", "2")),
