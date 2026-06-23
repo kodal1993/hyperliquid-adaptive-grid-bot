@@ -882,6 +882,12 @@ class LiveExecutionEngine:
         self.paired_tp_post_only = bool(kwargs.pop("paired_tp_post_only", True))
         self.flatten_maker_first = bool(kwargs.pop("flatten_maker_first", True))
         self.flatten_maker_wait_seconds = max(float(kwargs.pop("flatten_maker_wait_seconds", 8.0)), 0.0)
+        # While a maker-first flatten is pending, re-peg the resting reduce-only
+        # order to the passive touch whenever the mark drifts at least this far
+        # from it, so the exit keeps filling as maker as the market moves instead
+        # of being left behind and escalating to a taker cross. 0 disables re-peg
+        # (one-shot place-then-escalate, the original behaviour).
+        self.flatten_maker_repeg_pct = max(float(kwargs.pop("flatten_maker_repeg_pct", 0.0)), 0.0)
         self._flatten_pending: dict | None = None
         self.max_order_ops_per_cycle = max(int(kwargs.pop("max_order_ops_per_cycle", 2)), 1)
         self.rate_limited_until = 0.0
@@ -1422,7 +1428,7 @@ class LiveExecutionEngine:
             maker_px = mark_price * 0.9999 if side == "sell" else mark_price * 1.0001
             placed = self._submit_live_limit(symbol, side, qty, maker_px, reduce_only=True, prefer_post_only=True)
             if placed:
-                self._flatten_pending = {"symbol": symbol, "deadline": time.time() + self.flatten_maker_wait_seconds, "side": side}
+                self._flatten_pending = {"symbol": symbol, "deadline": time.time() + self.flatten_maker_wait_seconds, "side": side, "px": maker_px}
                 logger.info("flatten_maker_first_submitted symbol=%s side=%s qty=%s px=%s wait=%s", symbol, side, qty, maker_px, self.flatten_maker_wait_seconds)
                 return True
         # Aggressive taker cross (escalation, or maker disabled).
@@ -1431,18 +1437,49 @@ class LiveExecutionEngine:
         return self._submit_live_limit(symbol, side, qty, limit_price, reduce_only=True)
 
     def _maybe_escalate_flatten(self, symbol: str, mark_price: float) -> None:
-        """If a maker-first flatten has not filled by its deadline and the position
-        is still open, cancel any resting orders and cross aggressively (taker)."""
+        """Tick a pending maker-first flatten.
+
+        Within the maker window the resting reduce-only order is re-pegged to the
+        passive touch as the mark drifts (so it keeps filling at the maker fee
+        instead of being left behind). Once the deadline passes with the position
+        still open, cancel any resting order and cross aggressively (taker)."""
         pending = self._flatten_pending
-        if not pending or time.time() < float(pending.get("deadline", 0.0)):
+        if not pending:
             return
         self.sync_account(symbol, mark_price)
         if abs(self.state.position_size) < 1e-12:
             self._flatten_pending = None
             return
+        if time.time() < float(pending.get("deadline", 0.0)):
+            self._maybe_repeg_flatten(symbol, mark_price, pending)
+            return
         logger.warning("flatten_maker_escalation symbol=%s remaining=%s -> taker cross", symbol, self.state.position_size)
         self.cancel_all_orders(symbol, force=True)
         self.flatten_position(symbol, mark_price, maker_first=False)
+
+    def _maybe_repeg_flatten(self, symbol: str, mark_price: float, pending: dict) -> None:
+        """Keep the resting maker-first exit pinned to the passive touch while the
+        window is open. Bounded by flatten_maker_repeg_pct so only a meaningful
+        drift triggers a cancel/replace; the deadline is preserved so the total
+        maker window (and taker backstop) is unchanged."""
+        repeg_pct = self.flatten_maker_repeg_pct
+        if repeg_pct <= 0 or mark_price <= 0:
+            return
+        side = str(pending.get("side") or ("buy" if self.state.position_size < 0 else "sell"))
+        target_px = mark_price * 0.9999 if side == "sell" else mark_price * 1.0001
+        resting_px = float(pending.get("px", 0.0) or 0.0)
+        if resting_px > 0 and abs(target_px - resting_px) / resting_px < repeg_pct:
+            return
+        qty = abs(self.state.position_size)
+        self.cancel_all_orders(symbol, force=True)
+        if self._submit_live_limit(symbol, side, qty, target_px, reduce_only=True, prefer_post_only=True):
+            pending["px"] = target_px
+            logger.info("flatten_maker_repeg symbol=%s side=%s qty=%s px=%s", symbol, side, qty, target_px)
+        else:
+            # Could not rest as maker (e.g. the touch would cross): cross now.
+            logger.warning("flatten_maker_repeg_failed symbol=%s side=%s -> taker cross", symbol, side)
+            self._flatten_pending = None
+            self.flatten_position(symbol, mark_price, maker_first=False)
 
     def on_candle(self, candle: dict, *, regime: str = "unknown", mode: str = "unknown", risk_state: str = "OK", pause_reason: str = "", strategy_status: str = "running", orderbook_classification: str = "", orderbook_imbalance_ratio: float | None = None, orderbook_pressure_score: float | None = None, prediction_bias: str = "") -> list[dict]:
         symbol = str(candle.get("symbol") or "")

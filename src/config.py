@@ -63,6 +63,7 @@ class BotConfig:
     mean_reversion_confirm_bars: int
     flatten_maker_first: bool
     flatten_maker_wait_seconds: float
+    flatten_maker_repeg_pct: float
     min_reversion_confirmation_pct: float
     grid_spacing_low_vol_min_pct: float
     grid_spacing_low_vol_max_pct: float
@@ -249,6 +250,7 @@ class BotConfig:
             mean_reversion_confirm_bars=int(os.getenv("MEAN_REVERSION_CONFIRM_BARS", "1")),
             flatten_maker_first=os.getenv("FLATTEN_MAKER_FIRST", "true").lower() == "true",
             flatten_maker_wait_seconds=float(os.getenv("FLATTEN_MAKER_WAIT_SECONDS", "8")),
+            flatten_maker_repeg_pct=float(os.getenv("FLATTEN_MAKER_REPEG_PCT", "0.0")),
             min_reversion_confirmation_pct=float(os.getenv("MIN_REVERSION_CONFIRMATION_PCT", "0.0015")),
             grid_spacing_low_vol_min_pct=float(os.getenv("GRID_SPACING_LOW_VOL_MIN_PCT", "0.0025")),
             grid_spacing_low_vol_max_pct=float(os.getenv("GRID_SPACING_LOW_VOL_MAX_PCT", "0.0030")),
