@@ -1,5 +1,12 @@
 # Changelog
 
+## Re-peg the maker-first flatten so defensive exits stop escalating to taker
+
+- Trade-history analysis of the May 28–Jun 23 export (676 fills, reconciled to the exchange net of −$5.97) confirmed the edge breakdown again: gross was ~flat (−$0.65) and **fees were the loss**, concentrated in ~25 taker defensive exits. ~**$1.51** of that was pure taker fee a maker exit would have avoided, and a separate ~−$3.57 came from the Jun 11/14 over-size churn burst (already prevented by the `_submit_live_limit` per-trade/per-position caps). See `docs/trade_history_loss_analysis.md`.
+- Root cause of the taker leak: the maker-first flatten placed its post-only reduce-only order **once** at the passive touch and, if the mark walked away during the 8s window (exactly what trend-move exits do), it escalated to a taker cross. The maker attempt only paid off in calm markets.
+- **Fix: re-peg while the window is open.** `_maybe_repeg_flatten` keeps the resting reduce-only exit pinned to the passive touch as the mark drifts (cancel/replace, still post-only), so the exit keeps filling at the maker fee instead of being left behind. The taker cross stays as the backstop once the window expires; the deadline is preserved across re-pegs.
+- New knob `FLATTEN_MAKER_REPEG_PCT` (live default **0.0006**, re-peg on ≥0.06% drift; **0.0** disables and preserves the original one-shot behaviour). `FLATTEN_MAKER_WAIT_SECONDS` 8 → **20** to give the maker order more time to fill before crossing. Backward-compatible defaults; covered by `test_live_flatten_maker_repeg_tracks_touch_then_escalates`.
+
 ## Crash-exit machinery: maker-first flatten + a wide catastrophe backstop
 
 - Added config-driven crash handling that keeps the data-following posture (live data shows tight taker stops lose money, so nothing here tightens the existing 1.5% defensive exits):

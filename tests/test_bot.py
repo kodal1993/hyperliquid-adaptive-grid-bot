@@ -2863,6 +2863,80 @@ def test_live_flatten_maker_first_then_escalates_to_taker(tmp_path):
     assert aggressive["price"] == pytest.approx(70858.0, rel=1e-3)  # 71000 * 0.998
 
 
+def test_live_flatten_maker_repeg_tracks_touch_then_escalates(tmp_path):
+    from src.execution_engine import LiveExecutionEngine
+
+    class FakeLiveClient:
+        def __init__(self):
+            self.placed = []
+            self.cancel_calls = 0
+
+        def require_live_execution_support(self):
+            return None
+
+        def get_balance(self):
+            return {"equity": 325.0}
+
+        def get_position(self, symbol):
+            return {"coin": symbol, "szi": "0.001", "entryPx": "70000"}
+
+        def get_open_orders(self, symbol):
+            return []
+
+        def get_user_fills(self, symbol=None):
+            return []
+
+        def place_limit_order(self, symbol, side, size, price, *, reduce_only=False, post_only=False):
+            self.placed.append({"side": side, "size": size, "price": price, "reduce_only": reduce_only, "post_only": post_only})
+
+        def cancel_all_orders(self, symbol):
+            self.cancel_calls += 1
+            return 0
+
+    client = FakeLiveClient()
+    eng = LiveExecutionEngine(
+        client,
+        str(tmp_path / "live_state.json"),
+        start_balance=325,
+        min_notional_usd=10,
+        max_notional_per_trade_usd=200,
+        flatten_maker_first=True,
+        flatten_maker_wait_seconds=20,
+        flatten_maker_repeg_pct=0.0006,
+        trade_ledger_csv=str(tmp_path / "trades.csv"),
+        trade_ledger_jsonl=str(tmp_path / "trades.jsonl"),
+        risk_decisions_csv=str(tmp_path / "risk.csv"),
+    )
+
+    # Maker-first rests a post-only reduce-only sell just below the mark.
+    assert eng.flatten_position("BTC", 71000.0) is True
+    assert eng._flatten_pending["px"] == pytest.approx(70993.0, rel=1e-3)
+
+    # A drift smaller than the re-peg threshold leaves the resting order alone.
+    eng._maybe_escalate_flatten("BTC", 71000.0)
+    assert client.cancel_calls == 0
+
+    # A meaningful adverse drift re-pegs the resting maker order to the new touch
+    # (cancel + replace, still post-only reduce-only) without escalating to taker
+    # and without resetting the deadline.
+    deadline_before = eng._flatten_pending["deadline"]
+    eng._maybe_escalate_flatten("BTC", 70000.0)
+    assert client.cancel_calls == 1
+    repeg = client.placed[-1]
+    assert repeg["post_only"] is True and repeg["reduce_only"] is True and repeg["side"] == "sell"
+    assert repeg["price"] == pytest.approx(69993.0, rel=1e-3)  # 70000 * 0.9999
+    assert eng._flatten_pending is not None
+    assert eng._flatten_pending["deadline"] == deadline_before
+
+    # Past the deadline the still-open position crosses as taker (non-post-only).
+    eng._flatten_pending["deadline"] = 0.0
+    eng._maybe_escalate_flatten("BTC", 70000.0)
+    assert eng._flatten_pending is None
+    taker = client.placed[-1]
+    assert taker["post_only"] is False and taker["reduce_only"] is True
+    assert taker["price"] == pytest.approx(69860.0, rel=1e-3)  # 70000 * 0.998
+
+
 def test_volatility_adaptive_spacing_uses_configured_buckets(tmp_path):
     cfg = BotConfig.from_env()
     orch = StrategyOrchestrator(cfg, make_test_engine(tmp_path, "vol_bucket_spacing.json", paper_mode=True, enable_live_trading=False))
