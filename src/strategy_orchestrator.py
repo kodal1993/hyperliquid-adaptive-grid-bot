@@ -1130,7 +1130,8 @@ class StrategyOrchestrator:
             recenter_context["rebuild_reason"] = "no_fill_watchdog"
             logger.info("maker_fill_proximity_mode enabled=true spacing_pct_before=%.6f spacing_pct_after=%.6f reduction_pct=%.3f min_spacing_pct=%.6f", before_watchdog_spacing, final_spacing_pct, reduction_pct, min_watchdog_spacing)
         recenter_context.update(no_fill_watchdog_context)
-        plan: GridPlan = self.grid_manager.build_grid(price, max(effective_grid_levels, 1), final_spacing_pct, 0.0, regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=build_allow_buys, allow_sells=build_allow_sells, force_recenter=force_recenter, spacing_source=spacing_source, atr_pct=atr_pct, trend_bias=trend_bias, regime_confidence=regime_confidence)
+        grid_center = self._reservation_price(price, effective_position_size, atr_pct)
+        plan: GridPlan = self.grid_manager.build_grid(grid_center, max(effective_grid_levels, 1), final_spacing_pct, 0.0, regime, order_size, self.config.regrid_threshold_pct, self.config.min_grid_profit_over_fees_pct, mode, allow_buys=build_allow_buys, allow_sells=build_allow_sells, force_recenter=force_recenter, spacing_source=spacing_source, atr_pct=atr_pct, trend_bias=trend_bias, regime_confidence=regime_confidence)
         if effective_position_side == "FLAT" and orderbook_analysis.available and orderbook_analysis.ready:
             self._apply_orderbook_size_multipliers(plan, price, orderbook_analysis.long_size_multiplier, orderbook_analysis.short_size_multiplier)
         prediction_bias_context = self._apply_prediction_grid_bias(
@@ -2414,6 +2415,26 @@ class StrategyOrchestrator:
         else:
             desired = 3
         return min(max(desired, self.config.min_grid_levels), self.config.max_grid_levels)
+
+    def _reservation_price(self, mid: float, inventory: float, sigma_pct: float) -> float:
+        """Avellaneda-Stoikov style inventory-skewed grid center.
+
+        Shifts the grid center AGAINST current inventory so the reducing side is
+        quoted more aggressively (as maker), pulling inventory back toward
+        neutral without taker flattening:
+          inventory > 0 (long)  -> center below mid -> sells sit nearer mid
+          inventory < 0 (short) -> center above mid -> buys sit nearer mid
+        ``inventory_skew_intensity == 0.0`` -> r == mid (no-op default).
+        Offset is scaled by normalized inventory in [-1, 1] and by volatility
+        (atr_pct), so the skew widens when an inventory build is riskier.
+        """
+        intensity = self.config.inventory_skew_intensity
+        if intensity == 0.0 or mid <= 0:
+            return mid
+        q_max = max(self.config.max_position_notional_usd / mid, 1e-9)
+        q_norm = max(-1.0, min(inventory / q_max, 1.0))
+        offset_pct = intensity * q_norm * max(sigma_pct, 0.0)
+        return mid * (1.0 - offset_pct)
 
     def _calculate_order_size(self, price: float) -> float:
         target_notional = min(self.config.order_notional_usd, self.config.max_notional_per_trade_usd)

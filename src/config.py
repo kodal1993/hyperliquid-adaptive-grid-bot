@@ -49,6 +49,7 @@ class BotConfig:
     max_active_exposure_usd: float
     regrid_threshold_pct: float
     min_grid_profit_over_fees_pct: float
+    inventory_skew_intensity: float
     min_expected_net_edge_usd: float
     min_expected_net_edge_pct: float
     min_rr_ratio: float
@@ -236,6 +237,7 @@ class BotConfig:
             max_active_exposure_usd=float(os.getenv("MAX_ACTIVE_EXPOSURE_USD", "110")),
             regrid_threshold_pct=float(os.getenv("REGRID_THRESHOLD_PCT", "0.003")),
             min_grid_profit_over_fees_pct=float(os.getenv("MIN_GRID_PROFIT_OVER_FEES_PCT", "0.0005")),
+            inventory_skew_intensity=float(os.getenv("INVENTORY_SKEW_INTENSITY", "0.0")),
             min_expected_net_edge_usd=float(os.getenv("MIN_EXPECTED_NET_EDGE_USD", "0")),
             min_expected_net_edge_pct=float(os.getenv("MIN_EXPECTED_NET_EDGE_PCT", "0")),
             min_rr_ratio=float(os.getenv("MIN_RR_RATIO", "1.0")),
