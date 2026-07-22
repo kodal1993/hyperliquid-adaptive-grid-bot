@@ -94,6 +94,11 @@ class StrategyOrchestrator:
             regime_confidence *= max(0.25, 1.0 - regime_signal.transition_confidence)
         price = float(candles["close"].iloc[-1])
         account_state = self.execution_engine.account_state(symbol, price)
+        
+        # --- ÚJ: Globális bálna-metrikák kinyerése az account state-ből ---
+        global_margin_usage = getattr(account_state, "margin_usage_pct", 0.0)
+        global_leverage = getattr(account_state, "cross_leverage", 0.0)
+
         logger.info("execution_state state_source=%s equity=%.4f position_size=%.8f position_notional=%.4f", account_state.state_source, account_state.equity, account_state.position_size, account_state.position_notional)
         equity = account_state.equity
         pos_size = account_state.position_size
@@ -104,6 +109,7 @@ class StrategyOrchestrator:
         effective_position_notional = 0.0 if is_dust_position else raw_position_notional
         effective_position_size = 0.0 if is_dust_position else pos_size
         effective_position_side = "LONG" if effective_position_size > 0 else ("SHORT" if effective_position_size < 0 else "FLAT")
+        
         if bool(getattr(self.config, "orderbook_filter_enabled", True)):
             orderbook_analysis = self.orderbook_analyzer.analyze(order_book_snapshot)
         else:
@@ -573,7 +579,6 @@ class StrategyOrchestrator:
         allow_buys_before_stress = allow_buys
         allow_sells_before_stress = allow_sells
         grid_levels_before_stress = volatility_grid_levels
-        spacing_before_stress = final_spacing_pct
         market_stress = decide_market_stress(
             candles=candles,
             raw_regime=raw_regime,
@@ -653,13 +658,29 @@ class StrategyOrchestrator:
 
         liquidation_distance_pct = 0.5
         one_direction_exposure_pct = 0.0 if equity <= 0 else effective_position_notional / equity
+        
+        # --- ÚJ: Frissített RiskManager hívás a globális védelmekkel ---
         risk_state = self.risk.evaluate(
-            equity=equity, daily_pnl_pct=daily_pnl_pct, emergency_stop=self.config.emergency_stop, stop_file=self.config.emergency_stop_file,
-            position_notional=effective_position_notional, max_position_notional=self.config.max_position_notional_usd,
-            one_direction_exposure_pct=one_direction_exposure_pct, max_one_direction_exposure_pct=self.config.max_one_direction_exposure_pct,
-            liquidation_distance_pct=liquidation_distance_pct, min_liquidation_distance_pct=self.config.liquidation_distance_min_pct,
-            attempted_side=attempted_side, would_increase_exposure=would_increase_exposure,
+            equity=equity, 
+            daily_pnl_pct=daily_pnl_pct, 
+            emergency_stop=self.config.emergency_stop, 
+            stop_file=self.config.emergency_stop_file,
+            position_notional=effective_position_notional, 
+            max_position_notional=self.config.max_position_notional_usd,
+            one_direction_exposure_pct=one_direction_exposure_pct, 
+            max_one_direction_exposure_pct=self.config.max_one_direction_exposure_pct,
+            liquidation_distance_pct=liquidation_distance_pct, 
+            min_liquidation_distance_pct=self.config.liquidation_distance_min_pct,
+            attempted_side=attempted_side, 
+            would_increase_exposure=would_increase_exposure,
+            
+            # Bálna metrikák átadása
+            global_margin_usage_pct=global_margin_usage,
+            max_global_margin_pct=0.40,
+            global_leverage=global_leverage,
+            max_global_leverage=3.0
         )
+        
         logger.info(
             "risk_check risk_state=%s pause_reason=%s current_position_notional=%.2f effective_position_notional=%.2f is_dust_position=%s max_position_notional_usd=%.2f attempted_side=%s would_increase_exposure=%s exposure_reducing_override=%s decision=%s trend_flip_cooldown_remaining=%s wrong_way_loss_pct=%.5f",
             risk_state.reason or "ok",
