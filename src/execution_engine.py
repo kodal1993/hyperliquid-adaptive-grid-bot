@@ -27,6 +27,9 @@ class AccountState:
     daily_start_realized_pnl: float
     daily_start_fees_paid: float
     current_day: str
+    # --- ÚJ: Globális bálna-metrikák a RiskManager számára ---
+    margin_usage_pct: float = 0.0
+    cross_leverage: float = 0.0
 
 
 @dataclass
@@ -45,6 +48,9 @@ class ExecutionState:
     bot_daily_realized_pnl: float = 0.0
     bot_daily_fees_paid: float = 0.0
     current_day: str = ""
+    # --- ÚJ: Számla szintű metrikák ---
+    margin_usage_pct: float = 0.0
+    cross_leverage: float = 0.0
 
     @property
     def cash(self) -> float:
@@ -357,6 +363,8 @@ class PaperExecutionEngine:
             daily_start_realized_pnl=self.paper.daily_start_realized_pnl,
             daily_start_fees_paid=self.paper.daily_start_fees_paid,
             current_day=self.paper.current_day,
+            margin_usage_pct=0.0,
+            cross_leverage=0.0,
         )
 
     def cancel_replace_grid(self, symbol: str, plan: GridPlan) -> dict[str, int | str]:
@@ -1130,7 +1138,20 @@ class LiveExecutionEngine:
         entry_px = float(position.get("entryPx", 0.0) or 0.0)
         self.state.position_size = size
         self.state.avg_entry = entry_px
-        self.state.cash = float(balance.get("equity", 0.0) or 0.0)
+        
+        # Kezeljük azt az esetet is, ha a wrapper a teljes user_state-et adja vissza, amiben marginSummary van
+        margin_summary = balance.get("marginSummary", balance)
+        
+        equity = float(balance.get("equity", margin_summary.get("accountValue", self.state.cash)) or 0.0)
+        self.state.cash = equity
+        
+        # --- Bálna-metrikák kinyerése és mentése a state-be ---
+        margin_used = float(balance.get("margin_used", margin_summary.get("totalMarginUsed", 0.0)) or 0.0)
+        total_notional = float(balance.get("total_notional", margin_summary.get("totalNtlPos", 0.0)) or 0.0)
+        
+        self.state.margin_usage_pct = float(balance.get("margin_usage_pct", (margin_used / equity) if equity > 0 else 0.0))
+        self.state.cross_leverage = float(balance.get("cross_leverage", (total_notional / equity) if equity > 0 else 0.0))
+
         if mark_price is not None:
             self.state.daily_start_equity = self.state.daily_start_equity or self.state.cash
         self.sync_open_orders(symbol)
@@ -1158,6 +1179,8 @@ class LiveExecutionEngine:
             daily_start_realized_pnl=self.state.daily_start_realized_pnl,
             daily_start_fees_paid=self.state.daily_start_fees_paid,
             current_day=self.state.current_day,
+            margin_usage_pct=self.state.margin_usage_pct,
+            cross_leverage=self.state.cross_leverage,
         )
 
     def sync_open_orders(self, symbol: str) -> list[dict]:
