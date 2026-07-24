@@ -3,13 +3,14 @@ from __future__ import annotations
 import csv
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
 
 def setup_logging(level: str = "INFO") -> None:
     Path("logs").mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", handlers=[logging.FileHandler("logs/bot.log"), logging.StreamHandler()])
+    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", handlers=[RotatingFileHandler("logs/bot.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"), logging.StreamHandler()])
 
 
 def save_json(path: str, payload: dict[str, Any]) -> None:
