@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
@@ -109,6 +110,7 @@ class HyperliquidClient:
         self.private_key = private_key
         self.account_address = account_address
         self.network = network
+        self.http_timeout_seconds = float(os.getenv("HTTP_TIMEOUT_SECONDS", "15"))
         self.info: Any | None = None
         self.exchange: Any | None = None
         self.base_url = (
@@ -136,9 +138,33 @@ class HyperliquidClient:
         self._ws_fills_snapshot = False
         self._ws_fill_calls = 0
 
+    def _install_session_timeout(self, api_obj: Any, label: str) -> None:
+        """Force a timeout onto the Hyperliquid SDK's requests.Session.
+
+        The SDK issues requests without a timeout, so a half-open TCP socket
+        can block the calling thread forever with no exception raised.
+        """
+        session = getattr(api_obj, "session", None)
+        if session is None or getattr(session, "_grid_bot_timeout_installed", False):
+            return
+        original_request = session.request
+
+        def _request_with_timeout(*args: Any, **kwargs: Any) -> Any:
+            kwargs.setdefault("timeout", self.http_timeout_seconds)
+            return original_request(*args, **kwargs)
+
+        session.request = _request_with_timeout
+        session._grid_bot_timeout_installed = True
+        logger.info(
+            "sdk_session_timeout_installed target=%s timeout_seconds=%s",
+            label,
+            self.http_timeout_seconds,
+        )
+
     def connect(self) -> None:
         try:
             self.info = Info(self.base_url, skip_ws=not self.use_websocket)
+            self._install_session_timeout(self.info, "info")
             logger.info(
                 "Hyperliquid SDK Info connected network=%s websocket=%s",
                 self.network,
@@ -150,6 +176,7 @@ class HyperliquidClient:
             if self.use_websocket:
                 try:
                     self.info = Info(self.base_url, skip_ws=True)
+                    self._install_session_timeout(self.info, "info_rest_fallback")
                     logger.warning("SDK info reconnected without websocket, falling back to REST polling")
                 except Exception as rest_exc:
                     self.info = None
@@ -163,6 +190,7 @@ class HyperliquidClient:
                     base_url=self.base_url,
                     account_address=self.account_address or None,
                 )
+                self._install_session_timeout(self.exchange, "exchange")
                 logger.info(
                     "Hyperliquid SDK Exchange connected network=%s account_present=%s",
                     self.network,

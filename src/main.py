@@ -20,6 +20,7 @@ from .startup_validation import run_startup_validation
 from .strategy_orchestrator import StrategyOrchestrator
 from .telegram_handler import TelegramHandler
 from .utils import append_csv, setup_logging
+from .watchdog import HeartbeatWatchdog
 
 logger = logging.getLogger(__name__)
 STATUS_FILE = Path("data/status.json")
@@ -298,8 +299,17 @@ def run() -> None:
 
     telegram_status = _send_startup_telegram(cfg, tg)
 
+    watchdog = HeartbeatWatchdog(
+        alert_after_seconds=float(os.getenv("WATCHDOG_ALERT_SECONDS", "300")),
+        restart_after_seconds=float(os.getenv("WATCHDOG_RESTART_SECONDS", "600")),
+        alert_callback=(lambda msg: tg.send(msg)) if tg is not None else None,
+        enabled=os.getenv("WATCHDOG_ENABLED", "true").lower() != "false",
+    )
+    watchdog.start()
+
     while True:
         try:
+            watchdog.beat()
             buys: list[dict] = []
             sells: list[dict] = []
             candles = to_df(client.get_candles(cfg.default_symbol, lookback=200))
