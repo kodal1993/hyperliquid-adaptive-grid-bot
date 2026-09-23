@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""
+Hyperliquid perp spread-screen — melyik szimbolumon van egyaltalan ertelme
+passziv likviditast adni?
+
+MIERT EZ A METRIKA:
+  A grid-bot varhato erteke  EV = -2*phi + alfa,  ahol phi az egyoldali dij.
+  Alfa csak akkor keletkezik, ha a resting order tenylegesen a spreadet fogja,
+  azaz a jegyzes a touch kozeleben van. Ha a spread szukebb, mint a korbefordulo
+  dij, akkor passziv likviditast adni matematikailag vesztes — barmilyen
+  spacinggel, barmilyen stoppal, barmilyen volatilitas mellett.
+
+  Kuszob:  median spread (bps)  >  2 * maker_fee_bps   (alap tier: 2*1.5 = 3 bps)
+  Biztonsagi savval:            >  ~8-10 bps, mert az adverse selection is eszik.
+
+HASZNALAT (a VPS-en, ahol van halozati eleres):
+    python3 spread_screen.py                 # top 40 coin forgalom szerint
+    python3 spread_screen.py --top 80 --samples 30 --interval 10
+    python3 spread_screen.py --coins TAO,SOL,HYPE,kPEPE
+
+Csak stdlib kell, semmi fuggoseg.
+"""
+import argparse, json, statistics, sys, time, urllib.request
+
+API = "https://api.hyperliquid.xyz/info"
+MAKER_FEE_BPS = 1.5          # Hyperliquid alap tier maker dij
+TAKER_FEE_BPS = 4.5
+
+
+def post(payload, timeout=20):
+    req = urllib.request.Request(
+        API, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def universe_by_volume():
+    """(coin, 24h notional volume, mid) lista, forgalom szerint csokkenoen."""
+    meta, ctxs = post({"type": "metaAndAssetCtxs"})
+    out = []
+    for asset, ctx in zip(meta["universe"], ctxs):
+        try:
+            mid = float(ctx.get("midPx") or 0)
+            vol = float(ctx.get("dayNtlVlm") or 0)
+        except (TypeError, ValueError):
+            continue
+        if mid > 0 and not asset.get("isDelisted"):
+            out.append((asset["name"], vol, mid, int(asset.get("maxLeverage", 0))))
+    out.sort(key=lambda x: -x[1])
+    return out
+
+
+def spread_bps(coin):
+    """Egy pillanatnyi touch-spread bps-ben, plusz a touch melysege USD-ben."""
+    book = post({"type": "l2Book", "coin": coin})
+    levels = book.get("levels") or []
+    if len(levels) < 2 or not levels[0] or not levels[1]:
+        return None
+    bid, ask = levels[0][0], levels[1][0]
+    bp, ap = float(bid["px"]), float(ask["px"])
+    if bp <= 0 or ap <= 0 or ap <= bp:
+        return None
+    mid = (bp + ap) / 2
+    depth = min(float(bid["sz"]) * bp, float(ask["sz"]) * ap)
+    return (ap - bp) / mid * 1e4, depth
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--top", type=int, default=40, help="hany coin forgalom szerint")
+    ap.add_argument("--coins", type=str, default="", help="konkret lista, vesszovel")
+    ap.add_argument("--samples", type=int, default=12, help="hany mintavetel coinonkent")
+    ap.add_argument("--interval", type=float, default=5.0, help="masodperc a korok kozott")
+    ap.add_argument("--min-vol", type=float, default=1e6, help="min 24h forgalom USD")
+    args = ap.parse_args()
+
+    uni = universe_by_volume()
+    volmap = {c: (v, m, lev) for c, v, m, lev in uni}
+
+    if args.coins:
+        coins = [c.strip() for c in args.coins.split(",") if c.strip()]
+    else:
+        coins = [c for c, v, m, lev in uni if v >= args.min_vol][: args.top]
+
+    print(f"# {len(coins)} szimbolum, {args.samples} mintavetel, {args.interval}s kozzel")
+    print(f"# becsult ido: ~{len(coins)*args.samples*0.15 + args.samples*args.interval:.0f} mp\n")
+
+    samples = {c: [] for c in coins}
+    depths = {c: [] for c in coins}
+    for i in range(args.samples):
+        for c in coins:
+            try:
+                r = spread_bps(c)
+                if r:
+                    samples[c].append(r[0])
+                    depths[c].append(r[1])
+            except Exception:
+                pass
+            time.sleep(0.12)          # udvarias rate limit
+        print(f"  kor {i+1}/{args.samples} kesz", file=sys.stderr)
+        if i < args.samples - 1:
+            time.sleep(args.interval)
+
+    rt_fee = 2 * MAKER_FEE_BPS
+    rows = []
+    for c in coins:
+        s = samples[c]
+        if len(s) < max(3, args.samples // 3):
+            continue
+        med = statistics.median(s)
+        p25 = statistics.quantiles(s, n=4)[0] if len(s) >= 4 else med
+        vol, mid, lev = volmap.get(c, (0, 0, 0))
+        d = statistics.median(depths[c]) if depths[c] else 0
+        rows.append((c, vol, med, p25, med - rt_fee, d, lev))
+
+    rows.sort(key=lambda r: -r[4])
+
+    print(f"\n{'COIN':<12}{'24h vol M$':>11}{'spread bps':>12}{'p25':>8}"
+          f"{'spread-dij':>12}{'touch $':>10}{'maxLev':>8}  ITELET")
+    print("-" * 92)
+    for c, vol, med, p25, net, d, lev in rows:
+        if net > 6:
+            verdict = "ERDEMES megnezni"
+        elif net > 2:
+            verdict = "hatareset"
+        else:
+            verdict = "nem eri meg (spread < dij)"
+        print(f"{c:<12}{vol/1e6:>11.1f}{med:>12.2f}{p25:>8.2f}"
+              f"{net:>12.2f}{d:>10.0f}{lev:>8d}  {verdict}")
+
+    print(f"""
+MAGYARAZAT
+  spread-dij = median touch-spread minusz a korbefordulo maker dij ({rt_fee:.1f} bps).
+  Ez a FELSO korlatja annak, amit passziv jegyzessel egyaltalan lehet keresni
+  egy korbefordulason — es a valosagban ennek csak a toredeke marad meg, mert
+  az informalt flow (adverse selection) elviszi a nagy reszet.
+
+  Ha ez a szam <= 0, a szimbolumon passziv likviditast adni MATEMATIKAILAG
+  vesztes, fuggetlenul minden stratégia-parametertol.
+
+  'touch $' = a legjobb bid/ask szinten allo notional. Ha ez kisebb, mint a
+  tervezett order-mereted, akkor te vagy a touch — mas a jatek.
+""")
+
+
+if __name__ == "__main__":
+    main()
