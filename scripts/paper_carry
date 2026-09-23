@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+"""
+PAPER funding carry bot — Hyperliquid (HYPE spot long + HYPE perp short), valodi penz NELKUL.
+
+MIT CSINAL
+  Pontosan azt szimulalja, amit az eles carry_bot.py csinalna, de a tozsdere
+  soha nem kuld semmit, es privat kulcsot sem olvas be. Csak a publikus API-t
+  hasznalja:
+    * teljesulesek: a VALODI order book (L2) vegigjarasaval, csuszassal egyutt
+    * dijak: konfiguralhato taker dij mindket labon
+    * funding: a TENYLEGES orankenti Hyperliquid funding ratak alapjan
+      konyveli (fundingHistory), tehat a paper eredmeny azt mutatja, amit egy
+      eles pozicio kapott volna
+    * likvidalas: ha az ar eleri a szimulalt likvidalasi arat, a short labat
+      likvidaltnak tekinti (stressz-teszt)
+
+  Minden esemeny a state/paper_carry_log.csv-be kerul — ebbol kesobb ugyanugy
+  elemezheto, mint a trade_history.
+
+PARANCSOK (a repo gyokereben, a venv pythonjaval):
+    .venv/bin/python scripts/paper_carry.py status     # virtualis allapot + piac
+    .venv/bin/python scripts/paper_carry.py open       # virtualis nyitas
+    .venv/bin/python scripts/paper_carry.py run        # felugyeleti ciklus (5 perc)
+    .venv/bin/python scripts/paper_carry.py report     # osszesito: hozam, funding, dijak
+    .venv/bin/python scripts/paper_carry.py close      # virtualis zaras
+    .venv/bin/python scripts/paper_carry.py reset      # virtualis szamla nullazasa
+
+KONFIG (.env, mind opcionalis):
+    CARRY_COIN=HYPE
+    PAPER_START_USD=100          # virtualis kezdotoke
+    CARRY_NOTIONAL_USD=50        # hedgelt meret (spot lab), a maradek a perp margin
+    CARRY_MIN_FUNDING_ANN=3.0    # %/ev — 7 napos atlag ez ala esik -> zaras
+    CARRY_LIQ_WARN=0.50          # likvidalasi tavolsag riasztas
+    CARRY_LIQ_CRIT=0.25          # e alatt mindket lab felezese
+    CARRY_DELTA_MAX_USD=10
+    CARRY_INTERVAL_SEC=300
+    PAPER_PERP_FEE_BPS=4.5       # perp taker dij
+    PAPER_SPOT_FEE_BPS=7.0       # spot taker dij — ELLENORIZD a sajat tieredet
+    PAPER_MMR=0.05               # karbantartasi margin arany (konzervativ)
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # opcionalis
+"""
+import argparse, csv, fcntl, json, math, os, sys, time, urllib.parse, urllib.request
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+from hyperliquid.info import Info
+from hyperliquid.utils import constants
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE_FILE = ROOT / "state" / "paper_carry_state.json"
+LOG_FILE = ROOT / "state" / "paper_carry_log.csv"
+STOP_FILE = ROOT / "state" / "STOP_CARRY"
+LOCK_FILE = Path("/tmp/hyperliquid_paper_carry.lock")
+HOURS_PER_YEAR = 24 * 365
+MIN_ORDER_USD = 11.0
+LOG_FIELDS = ["ts", "event", "mark", "spot_mid", "spot_sz", "short_sz", "spot_usdc",
+              "perp_usdc", "equity", "funding_cum", "fees_cum", "note"]
+
+
+def load_env():
+    if load_dotenv:
+        load_dotenv(ROOT / "config" / "live.env", override=False)
+        load_dotenv(ROOT / ".env", override=True)
+
+
+def cfg(key, default, cast=float):
+    v = os.getenv(key)
+    return cast(v) if v not in (None, "") else default
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+
+def telegram(msg):
+    tok, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if not tok or not chat:
+        return
+    try:
+        data = urllib.parse.urlencode({"chat_id": chat, "text": f"[PAPER CARRY] {msg}"}).encode()
+        urllib.request.urlopen(f"https://api.telegram.org/bot{tok}/sendMessage", data=data, timeout=10)
+    except Exception as e:
+        log(f"telegram hiba: {e}")
+
+
+def floor_dec(x, dec):
+    f = 10 ** dec
+    return math.floor(x * f) / f
+
+
+class PaperCarry:
+    def __init__(self):
+        load_env()
+        self.coin = os.getenv("CARRY_COIN", "HYPE")
+        self.spot_name = f"{self.coin}/USDC"
+        self.start_usd = cfg("PAPER_START_USD", 100.0)
+        self.notional = cfg("CARRY_NOTIONAL_USD", 50.0)
+        self.min_funding = cfg("CARRY_MIN_FUNDING_ANN", 3.0)
+        self.liq_warn = cfg("CARRY_LIQ_WARN", 0.50)
+        self.liq_crit = cfg("CARRY_LIQ_CRIT", 0.25)
+        self.delta_max = cfg("CARRY_DELTA_MAX_USD", 10.0)
+        self.interval = cfg("CARRY_INTERVAL_SEC", 300, int)
+        self.perp_fee = cfg("PAPER_PERP_FEE_BPS", 4.5) / 1e4
+        self.spot_fee = cfg("PAPER_SPOT_FEE_BPS", 7.0) / 1e4
+        self.mmr = cfg("PAPER_MMR", 0.05)
+
+        net = os.getenv("HL_NETWORK", "mainnet")
+        base = constants.MAINNET_API_URL if net == "mainnet" else constants.TESTNET_API_URL
+        self.info = Info(base, skip_ws=True)
+        if self.spot_name not in self.info.name_to_coin:
+            sys.exit(f"HIBA: nincs {self.spot_name} spot par")
+        self.spot_coin = self.info.name_to_coin[self.spot_name]
+        self.perp_dec = self.info.asset_to_sz_decimals[self.info.name_to_asset(self.coin)]
+        self.spot_dec = self.info.asset_to_sz_decimals[self.info.name_to_asset(self.spot_name)]
+        self.st = self._load()
+
+    # ------------------------------------------------------------ allapot ---
+    def _fresh(self):
+        return {"spot_usdc": 0.0, "perp_usdc": self.start_usd, "spot_sz": 0.0, "spot_cost": 0.0,
+                "short_sz": 0.0, "short_entry": 0.0, "funding_cum": 0.0, "fees_cum": 0.0,
+                "start_usd": self.start_usd, "created_ms": int(time.time() * 1000),
+                "opened_ms": None, "last_funding_ms": None, "liquidations": 0}
+
+    def _load(self):
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            return self._fresh()
+
+    def _save(self):
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(self.st, indent=2))
+
+    def _log_row(self, event, mk, note=""):
+        new = not LOG_FILE.exists()
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+            if new:
+                w.writeheader()
+            w.writerow({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "event": event,
+                        "mark": round(mk["mark"], 6), "spot_mid": round(mk["spot_mid"], 6),
+                        "spot_sz": self.st["spot_sz"], "short_sz": self.st["short_sz"],
+                        "spot_usdc": round(self.st["spot_usdc"], 6), "perp_usdc": round(self.st["perp_usdc"], 6),
+                        "equity": round(self.equity(mk), 6), "funding_cum": round(self.st["funding_cum"], 6),
+                        "fees_cum": round(self.st["fees_cum"], 6), "note": note})
+
+    # --------------------------------------------------------------- piac ---
+    def market(self):
+        mids = self.info.all_mids()
+        return {"mark": float(mids[self.coin]), "spot_mid": float(mids.get(self.spot_coin, mids[self.coin]))}
+
+    def fill_px(self, name, is_buy, sz):
+        """VWAP a valodi L2 konyv vegigjarasaval."""
+        book = self.info.l2_snapshot(name)
+        levels = book["levels"][1] if is_buy else book["levels"][0]
+        left, cost = sz, 0.0
+        last = None
+        for lv in levels:
+            px, q = float(lv["px"]), float(lv["sz"])
+            take = min(left, q)
+            cost += take * px
+            left -= take
+            last = px
+            if left <= 1e-12:
+                break
+        if left > 1e-12:                    # nincs eleg melyseg: buntetoar
+            pen = (last or float(self.info.all_mids()[self.info.name_to_coin[name]])) * (1.01 if is_buy else 0.99)
+            cost += left * pen
+        return cost / sz
+
+    def market_funding_ann(self, days=7):
+        start = int((time.time() - days * 86400) * 1000)
+        h = self.info.funding_history(self.coin, start)
+        r = [float(x["fundingRate"]) for x in h]
+        return (sum(r) / len(r) * HOURS_PER_YEAR * 100) if r else None
+
+    # ------------------------------------------------------------ szamitas ---
+    def perp_equity(self, mk):
+        return self.st["perp_usdc"] + self.st["short_sz"] * (self.st["short_entry"] - mk["mark"])
+
+    def equity(self, mk):
+        return self.st["spot_usdc"] + self.st["spot_sz"] * mk["spot_mid"] + self.perp_equity(mk)
+
+    def liq_px(self):
+        s = self.st["short_sz"]
+        if s <= 0:
+            return None
+        # perp_usdc + s*(entry - m) = mmr*s*m  ->  m = (perp_usdc + s*entry) / (s*(1+mmr))
+        return (self.st["perp_usdc"] + s * self.st["short_entry"]) / (s * (1 + self.mmr))
+
+    # ---------------------------------------------------- virtualis muveletek ---
+    def _spot_trade(self, is_buy, sz, mk, why):
+        if sz <= 0:
+            return
+        px = self.fill_px(self.spot_name, is_buy, sz)
+        val = sz * px
+        fee = val * self.spot_fee
+        if is_buy:
+            self.st["spot_usdc"] -= val + fee
+            self.st["spot_cost"] += val
+            self.st["spot_sz"] += sz
+        else:
+            avg = self.st["spot_cost"] / self.st["spot_sz"] if self.st["spot_sz"] else px
+            self.st["spot_cost"] -= avg * sz
+            self.st["spot_sz"] -= sz
+            self.st["spot_usdc"] += val - fee
+        self.st["fees_cum"] += fee
+        log(f"  [PAPER] spot {'VETEL' if is_buy else 'ELADAS'} {sz} @ {px:.4f}  (dij {fee:.4f} $)")
+        self._log_row("spot_buy" if is_buy else "spot_sell", mk, f"{why} {sz}@{px:.4f}")
+
+    def _perp_trade(self, increase_short, sz, mk, why):
+        if sz <= 0:
+            return
+        px = self.fill_px(self.coin, not increase_short, sz)
+        fee = sz * px * self.perp_fee
+        s, e = self.st["short_sz"], self.st["short_entry"]
+        if increase_short:
+            self.st["short_entry"] = (s * e + sz * px) / (s + sz)
+            self.st["short_sz"] = s + sz
+        else:
+            sz = min(sz, s)
+            self.st["perp_usdc"] += sz * (e - px)          # realizalt PnL
+            self.st["short_sz"] = s - sz
+            if self.st["short_sz"] <= 1e-12:
+                self.st["short_sz"], self.st["short_entry"] = 0.0, 0.0
+        self.st["perp_usdc"] -= fee
+        self.st["fees_cum"] += fee
+        log(f"  [PAPER] perp {'SHORT+' if increase_short else 'SHORT-'} {sz} @ {px:.4f}  (dij {fee:.4f} $)")
+        self._log_row("perp_short_add" if increase_short else "perp_short_reduce", mk, f"{why} {sz}@{px:.4f}")
+
+    def _transfer(self, usd, to_perp):
+        usd = round(max(usd, 0.0), 2)
+        if usd <= 0:
+            return
+        if to_perp:
+            self.st["spot_usdc"] -= usd; self.st["perp_usdc"] += usd
+        else:
+            self.st["perp_usdc"] -= usd; self.st["spot_usdc"] += usd
+        log(f"  [PAPER] atvezetes {usd} USDC -> {'perp' if to_perp else 'spot'}")
+
+    def accrue_funding(self, mk):
+        """A tenyleges orankenti funding ratak konyvelese a nyitott shortra."""
+        if self.st["short_sz"] <= 0 or not self.st["last_funding_ms"]:
+            return 0.0
+        recs = self.info.funding_history(self.coin, self.st["last_funding_ms"] + 1)
+        got = 0.0
+        for r in sorted(recs, key=lambda x: int(x["time"])):
+            t, rate = int(r["time"]), float(r["fundingRate"])
+            pay = rate * self.st["short_sz"] * mk["mark"]      # pozitiv rata: a short KAP
+            self.st["perp_usdc"] += pay
+            self.st["funding_cum"] += pay
+            self.st["last_funding_ms"] = t
+            got += pay
+        if recs:
+            self._log_row("funding", mk, f"{len(recs)} ora, {got:+.6f} $")
+        return got
+
+    # ------------------------------------------------------------ parancsok ---
+    def status(self):
+        mk = self.market()
+        f7 = self.market_funding_ann(7)
+        lp = self.liq_px()
+        eq = self.equity(mk)
+        print(f"\n=== PAPER CARRY  {self.coin}  perp {mk['mark']:.4f} / spot {mk['spot_mid']:.4f} ===")
+        print(f"  spot {self.coin}:  {self.st['spot_sz']}   spot USDC {self.st['spot_usdc']:.2f}")
+        print(f"  perp short:  {self.st['short_sz']} @ {self.st['short_entry']:.4f}   perp USDC {self.st['perp_usdc']:.2f}")
+        print(f"  delta:       {(self.st['spot_sz']-self.st['short_sz'])*mk['mark']:+.2f} $")
+        if lp:
+            print(f"  likv. ar:    {lp:.4f}  (tavolsag {(lp-mk['mark'])/mk['mark']*100:.0f}%)")
+        print(f"  equity:      {eq:.2f} $  (kezdo {self.st['start_usd']:.2f})")
+        print(f"  funding:     {self.st['funding_cum']:+.4f} $   dijak: {self.st['fees_cum']:.4f} $")
+        print(f"  piaci funding 7 nap: {None if f7 is None else round(f7, 2)} %/ev")
+
+    def open(self):
+        if self.st["short_sz"] > 0:
+            sys.exit("Mar van nyitott virtualis pozicio. (close vagy reset)")
+        mk = self.market()
+        f7 = self.market_funding_ann(7)
+        if f7 is None or f7 < self.min_funding:
+            sys.exit(f"MEGTAGADVA: 7 napos funding {f7} %/ev < {self.min_funding}")
+        sz = floor_dec(self.notional / mk["spot_mid"], min(self.spot_dec, self.perp_dec))
+        if sz * mk["spot_mid"] < MIN_ORDER_USD:
+            sys.exit("A meret 11 $ alatt van, noveld a CARRY_NOTIONAL_USD-t")
+        need = sz * mk["spot_mid"] * (1 + self.spot_fee) * 1.02 - self.st["spot_usdc"]
+        if need > self.st["perp_usdc"]:
+            sys.exit("Nincs eleg virtualis toke")
+        log(f"PAPER NYITAS: {sz} {self.coin} (~{self.notional} $)")
+        self._transfer(need, to_perp=False)
+        self._spot_trade(True, sz, mk, "nyitas")
+        self._perp_trade(True, sz, mk, "nyitas")
+        now = int(time.time() * 1000)
+        self.st["opened_ms"] = now
+        self.st["last_funding_ms"] = now
+        self._save()
+        telegram(f"Nyitva: {sz} {self.coin} spot + short")
+        self.status()
+
+    def close(self, reason="kezi"):
+        mk = self.market()
+        self.accrue_funding(mk)
+        log(f"PAPER ZARAS ({reason})")
+        self._perp_trade(False, self.st["short_sz"], mk, "zaras")
+        self._spot_trade(False, floor_dec(self.st["spot_sz"], self.spot_dec), mk, "zaras")
+        self._transfer(self.st["spot_usdc"], to_perp=True)
+        self.st["opened_ms"] = None
+        self._save()
+        telegram(f"Zarva ({reason}). {self.summary_line(mk)}")
+        self.report()
+
+    def tick(self):
+        mk = self.market()
+        if self.st["short_sz"] <= 0:
+            log("nincs nyitott virtualis pozicio")
+            return
+        self.accrue_funding(mk)
+
+        lp = self.liq_px()
+        if lp and mk["mark"] >= lp:                         # szimulalt likvidalas
+            loss = self.st["short_sz"] * (lp - self.st["short_entry"])
+            log(f"LIKVIDALAS (szimulalt) @ {lp:.4f}, veszteseg {loss:.2f} $")
+            self.st["perp_usdc"] = max(self.st["perp_usdc"] - loss, 0.0)
+            self.st["short_sz"], self.st["short_entry"] = 0.0, 0.0
+            self.st["liquidations"] += 1
+            self._log_row("LIQUIDATION", mk, f"@{lp:.4f}")
+            # hedge nelkul maradt spot lab: lezarjuk, vissza a semleges (flat) allapotba
+            self._spot_trade(False, floor_dec(self.st["spot_sz"], self.spot_dec), mk, "likvidalas utan")
+            self._transfer(self.st["spot_usdc"], to_perp=True)
+            self.st["opened_ms"] = None
+            self._save()
+            telegram(f"SZIMULALT LIKVIDALAS @ {lp:.4f} — spot lab lezarva")
+            return
+
+        if STOP_FILE.exists():
+            return self.close("STOP_CARRY fajl")
+        f7 = self.market_funding_ann(7)
+        if f7 is not None and f7 < self.min_funding:
+            return self.close(f"7 napos funding {f7:.2f}%/ev < {self.min_funding}")
+
+        dist = (lp - mk["mark"]) / mk["mark"] if lp else math.inf
+        if dist < self.liq_crit:
+            log(f"KRITIKUS likv. tavolsag {dist*100:.0f}% -> felezes")
+            self._perp_trade(False, floor_dec(self.st["short_sz"] / 2, self.perp_dec), mk, "felezes")
+            self._spot_trade(False, floor_dec(self.st["spot_sz"] / 2, self.spot_dec), mk, "felezes")
+            telegram(f"Kritikus likvidalasi tavolsag {dist*100:.0f}%, felezve")
+        elif dist < self.liq_warn and self.st["spot_usdc"] > 1:
+            self._transfer(self.st["spot_usdc"] - 0.5, to_perp=True)
+            telegram(f"Likvidalasi tavolsag {dist*100:.0f}%, USDC atvezetve perpre")
+
+        d = self.st["spot_sz"] - self.st["short_sz"]
+        if abs(d) * mk["mark"] >= max(self.delta_max, MIN_ORDER_USD):
+            self._perp_trade(d > 0, floor_dec(abs(d), self.perp_dec), mk, "delta")
+
+        self._log_row("tick", mk)
+        self._save()
+        log(f"ok | {self.summary_line(mk)} | likv {dist*100 if dist != math.inf else 999:.0f}% | "
+            f"funding7 {None if f7 is None else round(f7, 2)}%")
+
+    def summary_line(self, mk):
+        eq = self.equity(mk)
+        return (f"equity {eq:.2f} $ ({eq - self.st['start_usd']:+.2f}) | "
+                f"funding {self.st['funding_cum']:+.4f} | dijak {self.st['fees_cum']:.4f}")
+
+    def report(self):
+        mk = self.market()
+        eq = self.equity(mk)
+        days = (time.time() * 1000 - self.st["created_ms"]) / 86400000
+        pnl = eq - self.st["start_usd"]
+        basis = pnl - self.st["funding_cum"] + self.st["fees_cum"]
+        print(f"\n=== PAPER CARRY OSSZESITO ({days:.1f} nap) ===")
+        print(f"  kezdo toke:        {self.st['start_usd']:.2f} $")
+        print(f"  jelenlegi equity:  {eq:.2f} $   PnL {pnl:+.4f} $")
+        print(f"    ebbol funding:   {self.st['funding_cum']:+.4f} $")
+        print(f"    ebbol dijak:     {-self.st['fees_cum']:+.4f} $")
+        print(f"    ebbol bazis/ar:  {basis:+.4f} $   (spot es perp arkulonbseg-mozgas)")
+        if days >= 1:
+            print(f"  evesitett hozam a tokere: {pnl / self.st['start_usd'] * 365 / days * 100:+.2f} %")
+            print(f"  evesitett funding a tokere: {self.st['funding_cum'] / self.st['start_usd'] * 365 / days * 100:+.2f} %")
+        print(f"  szimulalt likvidalasok: {self.st['liquidations']}")
+        print(f"  naplo: {LOG_FILE}")
+
+    def run(self):
+        telegram("Paper felugyeleti ciklus indul")
+        last_daily = 0
+        while True:
+            try:
+                self.tick()
+                if time.time() - last_daily > 86400:
+                    telegram(f"Napi: {self.summary_line(self.market())}")
+                    last_daily = time.time()
+            except Exception as e:
+                log(f"HIBA: {e}")
+            time.sleep(self.interval)
+
+    def reset(self):
+        self.st = self._fresh()
+        self._save()
+        log(f"Virtualis szamla nullazva, kezdotoke {self.start_usd} $")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["status", "open", "run", "report", "close", "reset"])
+    a = ap.parse_args()
+    lock = LOCK_FILE.open("w")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if a.cmd in ("run", "open", "close", "reset"):
+            sys.exit("HIBA: mar fut egy paper carry peldany (a 'status' es 'report' ettol meg hasznalhato)")
+    b = PaperCarry()
+    {"status": b.status, "open": b.open, "run": b.run, "report": b.report,
+     "close": b.close, "reset": b.reset}[a.cmd]()
+
+
+if __name__ == "__main__":
+    main()
