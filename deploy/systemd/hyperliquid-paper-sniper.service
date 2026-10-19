@@ -1,0 +1,15 @@
+[Unit]
+Description=pump.fun PAPER sniper (valodi penz nelkul)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/hyperliquid-adaptive-grid-bot-live
+ExecStart=/root/hyperliquid-adaptive-grid-bot-live/.venv/bin/python scripts/paper_sniper run
+Restart=always
+RestartSec=15
+User=root
+
+[Install]
+WantedBy=multi-user.target
