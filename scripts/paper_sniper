@@ -1,0 +1,710 @@
+#!/usr/bin/env python3
+"""
+PAPER sniper — pump.fun, valodi penz NELKUL.
+
+MIT CSINAL
+  Figyeli a pump.fun tokenek szuleteset (PumpPortal ingyenes WebSocket: uj token
+  + graduacio), es tobb strategiat PARHUZAMOSAN szimulal. Mindegyik a VALODI
+  bonding curve allapotan "vasarol" (a vetel pillanataban az RPC-rol kiolvasva,
+  beallithato kesleltetessel), es a valodi gorbe alapjan "ad el". Privat kulcsot
+  nem olvas be, tranzakciot nem kuld. A cel: kideriteni, hogy van-e barmelyik
+  szuronek pozitiv varhato erteke dijakkal, kesessel, csuszassal szamolva.
+
+  A szimulacio szandekosan inkabb pesszimista:
+    * pump.fun dij mindket iranyban (PAPER_SNIPER_FEE_BPS, alap 100 = 1%)
+    * prioritasi / Jito dij minden tranzakciora (PAPER_SNIPER_PRIO_SOL)
+    * a vetel a kesleltetes UTAN kiolvasott gorbearon tortenik (a sniperek
+      addigra mar vettek)
+  Optimista resz: graduacional a gorbe vegso aran adunk el (a valosagban az AMM-en
+  utana gyakran esik az ar). Ezt a report kulon jeloli.
+
+STRATEGIAK
+    S0_minta     veletlen minta minden uj tokenbol (alapvonal), azonnal
+    S1_dev       bizonyitott fejleszto: volt mar graduált tokenje (a sajat helyi
+                 adatbazis szerint) es 7 napja nem inditott, azonnal
+    S2_gyors     szuletesi szuro: nem masolt nev, nem sorozat-dev, dev-vetel
+                 0.5-5 SOL, dev < 20% — azonnal
+    S2_lassu     ugyanez 5 mp kesessel (mennyit ront a kesleltetes?)
+    S3_linkek    Telegram + X link a metaadatban, nem masolat, nem sorozat-dev
+    S4_lendulet  3 percen belul >= 30%-os gorbe + van Telegram vagy X
+
+PARANCSOK (a repo gyokereben, a venv pythonjaval):
+    .venv/bin/python scripts/paper_sniper run       # figyeles + szimulacio (systemd alatt)
+    .venv/bin/python scripts/paper_sniper report    # strategiankenti eredmeny
+    .venv/bin/python scripts/paper_sniper status    # mi fut most, nyitott poziciok
+    .venv/bin/python scripts/paper_sniper reset     # szimulalt eredmenyek torlese (a dev-adatbazis marad)
+
+KONFIG (.env, mind opcionalis):
+    SOLANA_RPC_URL=https://api.mainnet-beta.solana.com   # Helius-kulcsos URL ajanlott
+    PAPER_SNIPER_SIZE_SOL=0.1       # szimulalt tetel / vetel
+    PAPER_SNIPER_FEE_BPS=100        # pump.fun dij / irany — ELLENORIZD az aktualisat
+    PAPER_SNIPER_PRIO_SOL=0.001     # prioritasi / Jito dij tranzakcionkent
+    PAPER_SNIPER_TP_X=2.0           # kiszallas ennyiszeres erteknel
+    PAPER_SNIPER_SL_X=0.5           # stop ennyiszeres erteknel
+    PAPER_SNIPER_MAX_HOLD_MIN=30    # idokorlat
+    PAPER_SNIPER_SAMPLE=0.02        # S0 minta aranya
+    PAPER_SNIPER_MAX_OPEN=60        # strategiankent egyszerre nyitott poziciok
+    PAPER_SNIPER_POLL_SEC=10        # gorbe-lekerdezes gyakorisaga
+    PAPER_SNIPER_STRATS=            # ures = mind; pl. S0_minta,S2_gyors,S3_linkek
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # opcionalis napi osszesito
+
+LEALLITAS: systemctl stop hyperliquid-paper-sniper   vagy   touch state/STOP_SNIPER
+"""
+import argparse, asyncio, base64, csv, fcntl, json, math, os, random, re, signal, struct, sys, time, unicodedata
+import urllib.error, urllib.parse, urllib.request
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE_DIR = ROOT / "state"
+STATE_FILE = STATE_DIR / "paper_sniper_state.json"
+DB_FILE = STATE_DIR / "paper_sniper_db.json"
+TRADES_FILE = STATE_DIR / "paper_sniper_trades.csv"
+STOP_FILE = STATE_DIR / "STOP_SNIPER"
+LOCK_FILE = Path("/tmp/paper_sniper.lock")
+
+PUMP = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+GRAD_SOL = 85.0                        # ennyi valodi SOL-nal graduall a gorbe
+BASE58 = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+TRADE_FIELDS = ["ts_open", "ts_close", "strat", "mint", "name", "symbol", "latency_s", "entry_vsol", "exit_vsol",
+                "cost_sol", "proceeds_sol", "pnl_sol", "ret_pct", "reason", "hold_s", "graduated"]
+STRAT_DESC = {
+    "S0_minta": "veletlen minta, azonnal (alapvonal)",
+    "S1_dev": "bizonyitott dev (volt graduáltja, 7 napja csendes), azonnal",
+    "S2_gyors": "szuletesi szuro, azonnal",
+    "S2_lassu": "szuletesi szuro, 5 mp keses",
+    "S3_linkek": "Telegram + X link, nem masolat, nem sorozat-dev",
+    "S4_lendulet": "3 percen belul >=30% gorbe + TG vagy X",
+}
+
+
+# ---------------------------------------------------------------- segedek
+def load_env():
+    if load_dotenv:
+        load_dotenv(ROOT / "config" / "live.env", override=False)
+        load_dotenv(ROOT / ".env", override=True)
+
+
+def cfg(key, default, cast=float):
+    v = os.getenv(key)
+    return cast(v) if v not in (None, "") else default
+
+
+def log(msg):
+    try:
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+    except (BrokenPipeError, OSError):
+        pass
+
+
+def telegram(msg):
+    tok, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if not tok or not chat:
+        return
+    try:
+        data = urllib.parse.urlencode({"chat_id": chat, "text": f"[PAPER SNIPER] {msg}"}).encode()
+        urllib.request.urlopen(f"https://api.telegram.org/bot{tok}/sendMessage", data=data, timeout=10)
+    except Exception as e:
+        log(f"telegram hiba: {e}")
+
+
+def norm(s):
+    s = unicodedata.normalize("NFKD", str(s or "")).lower()
+    return re.sub(r"[^a-z0-9]", "", s)
+
+
+def fnum(x, d=0.0):
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else d
+    except (TypeError, ValueError):
+        return d
+
+
+def atomic_write(path, obj):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj))
+    tmp.replace(path)
+
+
+def read_json(path, default):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return default
+
+
+# ---------------------------------------------------------------- RPC
+class Rpc:
+    def __init__(self, url):
+        self.url = url
+        self.sem = asyncio.Semaphore(4)
+        self.calls = 0
+        self.errors = 0
+
+    def _post(self, method, params):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+        req = urllib.request.Request(self.url, data=body, headers={"Content-Type": "application/json", "User-Agent": "paper-sniper/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            j = json.loads(r.read())
+        if "error" in j:
+            raise RuntimeError(str(j["error"].get("message", j["error"])))
+        return j.get("result")
+
+    async def call(self, method, params, retries=3):
+        async with self.sem:
+            for a in range(retries):
+                try:
+                    self.calls += 1
+                    return await asyncio.to_thread(self._post, method, params)
+                except urllib.error.HTTPError as e:
+                    self.errors += 1
+                    if e.code == 429 and a < retries - 1:
+                        await asyncio.sleep(1.5 * (a + 1))
+                        continue
+                    raise
+                except Exception:
+                    self.errors += 1
+                    if a == retries - 1:
+                        raise
+                    await asyncio.sleep(0.5 * (a + 1))
+
+
+def parse_curve(acc):
+    """pump.fun BondingCurve: 8 bajt discriminator, majd u64: virtual_token, virtual_sol, real_token, real_sol, supply; bool complete"""
+    if not acc or acc.get("owner") != PUMP:
+        return None
+    try:
+        b = base64.b64decode(acc["data"][0])
+    except Exception:
+        return None
+    if len(b) < 49:
+        return None
+    vtok, vsol, rtok, rsol, _supply = struct.unpack_from("<QQQQQ", b, 8)
+    return {"vtok": float(vtok), "vsol": float(vsol), "rsol": float(rsol), "done": b[48] == 1}
+
+
+def buy_tokens(c, sol_lam, fee):
+    """allando szorzat: a dij a SOL-bol jon le a gorbe elott"""
+    net = sol_lam * (1 - fee)
+    k = c["vsol"] * c["vtok"]
+    return c["vtok"] - k / (c["vsol"] + net)
+
+
+def sell_sol(c, tokens, fee, cap_real=True):
+    k = c["vsol"] * c["vtok"]
+    out = c["vsol"] - k / (c["vtok"] + tokens)
+    if cap_real and not c["done"]:
+        out = min(out, c["rsol"])
+    return max(0.0, out * (1 - fee))
+
+
+# ---------------------------------------------------------------- metaadat (IPFS)
+def gateway_url(uri):
+    uri = str(uri or "").strip()
+    m = (re.match(r"^ipfs://(?:ipfs/)?([A-Za-z0-9]{46,100})(/[\w.\-/]*)?$", uri)
+         or re.match(r"^https://[^/?#]+/ipfs/([A-Za-z0-9]{46,100})(/[\w.\-/]*)?(?:[?#].*)?$", uri))
+    if m:
+        return os.getenv("PAPER_SNIPER_IPFS", "https://ipfs.io/ipfs/") + m.group(1) + (m.group(2) or "")
+    m = re.match(r"^https://(?:www\.)?arweave\.net/([A-Za-z0-9_\-]{43})(/[\w.\-/]*)?(?:[?#].*)?$", uri)
+    if m:
+        return "https://arweave.net/" + m.group(1) + (m.group(2) or "")
+    return None
+
+
+def fetch_meta(uri):
+    g = gateway_url(uri)
+    if not g:
+        return None
+    req = urllib.request.Request(g, headers={"User-Agent": "paper-sniper/1.0"})
+    with urllib.request.urlopen(req, timeout=8) as r:
+        raw = r.read(200_001)
+    if len(raw) > 200_000:
+        return None
+    j = json.loads(raw)
+    return j if isinstance(j, dict) else None
+
+
+def link_kinds(j):
+    """csak azt nezzuk, milyen linkek vannak; megnyitni nem nyitjuk meg oket"""
+    has_tg = has_x = has_web = False
+    for o in (j, j.get("extensions") or {}):
+        if not isinstance(o, dict):
+            continue
+        for k in ("twitter", "x", "telegram", "website"):
+            v = o.get(k)
+            if not isinstance(v, str) or not v.strip():
+                continue
+            v = v.strip().lower()
+            if k == "telegram" and ("t.me/" in v or "telegram.me/" in v or re.match(r"^@?[a-z0-9_]{5,64}$", v)):
+                has_tg = True
+            elif k in ("twitter", "x") and ("x.com/" in v or "twitter.com/" in v or re.match(r"^@?[a-z0-9_]{1,15}$", v)):
+                has_x = True
+            elif k == "website" and v.startswith("http"):
+                has_web = True
+    return has_tg, has_x, has_web
+
+
+# ---------------------------------------------------------------- a szimulator
+class Sniper:
+    def __init__(self):
+        load_env()
+        STATE_DIR.mkdir(exist_ok=True)
+        self.rpc = Rpc(os.getenv("SOLANA_RPC_URL") or "https://api.mainnet-beta.solana.com")
+        self.ws_url = os.getenv("PUMPPORTAL_WS_URL") or "wss://pumpportal.fun/api/data"
+        self.size = cfg("PAPER_SNIPER_SIZE_SOL", 0.1)
+        self.fee = cfg("PAPER_SNIPER_FEE_BPS", 100.0) / 1e4
+        self.prio = cfg("PAPER_SNIPER_PRIO_SOL", 0.001)
+        self.tp = cfg("PAPER_SNIPER_TP_X", 2.0)
+        self.sl = cfg("PAPER_SNIPER_SL_X", 0.5)
+        self.max_hold = cfg("PAPER_SNIPER_MAX_HOLD_MIN", 30.0) * 60
+        self.sample = cfg("PAPER_SNIPER_SAMPLE", 0.02)
+        self.max_open = cfg("PAPER_SNIPER_MAX_OPEN", 60, int)
+        self.poll = cfg("PAPER_SNIPER_POLL_SEC", 10.0)
+        only = [s.strip() for s in (os.getenv("PAPER_SNIPER_STRATS") or "").split(",") if s.strip()]
+        self.strats = [s for s in STRAT_DESC if not only or s in only]
+        st = read_json(STATE_FILE, {})
+        self.positions = st.get("positions", [])            # nyitott szimulalt poziciok
+        self.stats = st.get("stats", {"started": time.time(), "seen": 0, "migrations": 0, "skipped": {}, "missed": {}, "meta_ok": 0, "meta_fail": 0, "meta_drop": 0})
+        db = read_json(DB_FILE, {})
+        self.creators = db.get("creators", {})               # dev -> {"t": [ido...], "g": graduáltak}
+        self.names = db.get("names", {})                     # "n:nev" / "s:ticker" -> [mint, ido]
+        self.mint_dev = db.get("mint_dev", {})               # mint -> [dev, ido]  (graduacio hozzarendelese)
+        self.watch = {}                                      # S4 jeloltek: mint -> token
+        self.tokens = {}                                     # friss tokenek memoriaban
+        self.meta_q = asyncio.Queue(maxsize=40)
+        self.stop = False
+
+    # ---- allapot
+    def save(self, db=True):
+        atomic_write(STATE_FILE, {"positions": self.positions, "stats": self.stats, "saved": time.time()})
+        if db:
+            self.save_db()
+
+    def save_db(self):
+        cut = time.time() - 7 * 86400
+        for k in list(self.creators):
+            c = self.creators[k]
+            c["t"] = [x for x in c.get("t", []) if x > cut][-50:]
+            if not c["t"] and not c.get("g"):
+                del self.creators[k]
+        for k in list(self.names):
+            if self.names[k][1] < cut:
+                del self.names[k]
+        cut2 = time.time() - 2 * 86400
+        for k in list(self.mint_dev):
+            if self.mint_dev[k][1] < cut2:
+                del self.mint_dev[k]
+        if len(self.names) > 300_000:
+            for k in sorted(self.names, key=lambda k: self.names[k][1])[: len(self.names) - 300_000]:
+                del self.names[k]
+        if len(self.creators) > 300_000:
+            for k in sorted(self.creators, key=lambda k: (self.creators[k]["t"] or [0])[-1])[: len(self.creators) - 300_000]:
+                del self.creators[k]
+        atomic_write(DB_FILE, {"creators": self.creators, "names": self.names, "mint_dev": self.mint_dev})
+
+    def open_count(self, strat):
+        return sum(1 for p in self.positions if p["strat"] == strat)
+
+    # ---- esemenyek
+    def on_create(self, m):
+        mint = str(m.get("mint") or "")
+        if not BASE58.match(mint) or mint in self.tokens or mint in self.mint_dev:
+            return                                   # mar lattuk (pl. ujrakapcsolodas vagy ujrainditas utan)
+        now = time.time()
+        dev = m.get("traderPublicKey") if BASE58.match(str(m.get("traderPublicKey") or "")) else None
+        curve = m.get("bondingCurveKey") if BASE58.match(str(m.get("bondingCurveKey") or "")) else None
+        if not curve:
+            return
+        dev_tok = fnum(m.get("initialBuy"))
+        if dev_tok > 1e9:
+            dev_tok /= 1e6
+        T = {"mint": mint, "curve": curve, "dev": dev, "t": now, "name": str(m.get("name") or "")[:60], "symbol": str(m.get("symbol") or "")[:20],
+             "uri": str(m.get("uri") or "")[:400], "dev_sol": fnum(m.get("solAmount")), "dev_share": dev_tok / 1e9 * 100,
+             "rand": random.random(), "tg": None, "x": None, "web": None, "done": set()}
+        if dev:
+            c = self.creators.setdefault(dev, {"t": [], "g": 0})
+            T["dev_prior"] = sum(1 for x in c["t"] if x > now - 7 * 86400)
+            T["dev_grad"] = c.get("g", 0)
+            c["t"].append(now)
+            self.mint_dev[mint] = [dev, now]
+        else:
+            T["dev_prior"], T["dev_grad"] = 0, 0
+        nn, ss = norm(T["name"]), norm(T["symbol"])
+        T["copy"] = bool((len(nn) >= 3 and "n:" + nn in self.names and self.names["n:" + nn][0] != mint)
+                         or (len(ss) >= 3 and "s:" + ss in self.names and self.names["s:" + ss][0] != mint))
+        for k in (("n:" + nn) if len(nn) >= 3 else None, ("s:" + ss) if len(ss) >= 3 else None):
+            if k and k not in self.names:
+                self.names[k] = [mint, now]
+        self.tokens[mint] = T
+        self.stats["seen"] += 1
+        if len(self.tokens) > 5000:
+            for k in sorted(self.tokens, key=lambda k: self.tokens[k]["t"])[:1000]:
+                del self.tokens[k]
+
+        basic = not T["copy"] and T["dev_prior"] < 3
+        birth = basic and 0.5 <= T["dev_sol"] <= 5 and T["dev_share"] < 20
+        if T["rand"] < self.sample:
+            self.enter_later("S0_minta", T, 0)
+        if T["dev_grad"] > 0 and T["dev_prior"] == 0:
+            self.enter_later("S1_dev", T, 0)
+        if birth:
+            self.enter_later("S2_gyors", T, 0)
+            self.enter_later("S2_lassu", T, 5)
+        if basic and ("S3_linkek" in self.strats or "S4_lendulet" in self.strats):
+            try:
+                self.meta_q.put_nowait(T)
+            except asyncio.QueueFull:
+                self.stats["meta_drop"] += 1
+
+    def on_migrate(self, m):
+        mint = str(m.get("mint") or "")
+        if not BASE58.match(mint):
+            return
+        self.stats["migrations"] += 1
+        d = self.mint_dev.get(mint)
+        if d and d[0] in self.creators:
+            self.creators[d[0]]["g"] = self.creators[d[0]].get("g", 0) + 1
+
+    # ---- belepes
+    def enter_later(self, strat, T, delay):
+        if strat not in self.strats or strat in T["done"]:
+            return
+        if any(p["mint"] == T["mint"] and p["strat"] == strat for p in self.positions):
+            return
+        T["done"].add(strat)
+        if self.open_count(strat) >= self.max_open:
+            self.stats["skipped"][strat] = self.stats["skipped"].get(strat, 0) + 1
+            return
+        asyncio.get_running_loop().create_task(self.enter(strat, T, delay))
+
+    async def enter(self, strat, T, delay):
+        t0 = time.time()
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            r = await self.rpc.call("getAccountInfo", [T["curve"], {"encoding": "base64", "commitment": "processed"}])
+            c = parse_curve(r and r.get("value"))
+        except Exception:
+            c = None
+        if not c or c["done"] or c["vsol"] <= 0:
+            self.stats["missed"][strat] = self.stats["missed"].get(strat, 0) + 1
+            return
+        lam = self.size * 1e9
+        tokens = buy_tokens(c, lam, self.fee)
+        self.positions.append({"strat": strat, "mint": T["mint"], "curve": T["curve"], "name": T["name"], "symbol": T["symbol"],
+                               "t_open": time.time(), "born": T["t"], "latency": round(time.time() - T["t"], 2),
+                               "entry_vsol": c["vsol"] / 1e9, "tokens": tokens, "cost": self.size + self.prio, "last": c, "miss": 0})
+
+    # ---- metaadat-feldolgozok
+    async def meta_worker(self):
+        while not self.stop:
+            T = await self.meta_q.get()
+            if time.time() - T["t"] > 120:
+                self.stats["meta_drop"] += 1
+                continue
+            try:
+                j = await asyncio.to_thread(fetch_meta, T["uri"])
+            except Exception:
+                j = None
+            if not j:
+                self.stats["meta_fail"] += 1
+                continue
+            self.stats["meta_ok"] += 1
+            T["tg"], T["x"], T["web"] = link_kinds(j)
+            if T["tg"] and T["x"]:
+                self.enter_later("S3_linkek", T, 2)
+            if (T["tg"] or T["x"]) and "S4_lendulet" in self.strats:
+                self.watch[T["mint"]] = T
+
+    # ---- gorbe-lekerdezes: kiszallasok + S4 lendulet
+    async def poll_loop(self):
+        while not self.stop:
+            await asyncio.sleep(self.poll)
+            if STOP_FILE.exists():
+                log("STOP_SNIPER fajl -> leallas")
+                self.stop = True
+                break
+            try:
+                await self.poll_once()
+            except Exception as e:
+                log(f"poll hiba: {e}")
+
+    async def poll_once(self):
+        now = time.time()
+        for k in [k for k, T in self.watch.items() if now - T["t"] > 180]:
+            del self.watch[k]
+        keys = list(dict.fromkeys([p["curve"] for p in self.positions] + [T["curve"] for T in self.watch.values()]))
+        curves = {}
+        for i in range(0, len(keys), 100):
+            chunk = keys[i:i + 100]
+            try:
+                r = await self.rpc.call("getMultipleAccounts", [chunk, {"encoding": "base64", "commitment": "confirmed"}])
+                for k, a in zip(chunk, (r or {}).get("value") or []):
+                    c = parse_curve(a)
+                    if c:
+                        curves[k] = c
+            except Exception as e:
+                log(f"getMultipleAccounts hiba: {e}")
+        for mint, T in list(self.watch.items()):
+            c = curves.get(T["curve"])
+            if c and not c["done"] and c["rsol"] / 1e9 >= 0.3 * GRAD_SOL:
+                del self.watch[mint]
+                self.enter_later("S4_lendulet", T, 2)
+        keep = []
+        for p in self.positions:
+            c = curves.get(p["curve"])
+            if c is None:
+                p["miss"] += 1
+                c = p["last"]
+            done = bool(c["done"])
+            if done and (c["vsol"] <= 0 or c["vtok"] <= 0):
+                c = dict(p["last"], done=True)       # graduacio utan a gorbe kiurul: az utolso ismert allapot
+            value = sell_sol(c, p["tokens"], self.fee, cap_real=not done) / 1e9 - self.prio
+            ratio = value / p["cost"] if p["cost"] else 0
+            hold = now - p["t_open"]
+            reason = None
+            if done:
+                reason = "graduált"
+            elif ratio >= self.tp:
+                reason = "TP"
+            elif ratio <= self.sl:
+                reason = "SL"
+            elif hold >= self.max_hold:
+                reason = "ido"
+            elif p["miss"] >= 30:
+                reason = "nincs adat"
+            if not done:
+                p["last"] = c
+            if reason:
+                self.close(p, c, value, reason, now)
+            else:
+                keep.append(p)
+        self.positions = keep
+
+    def close(self, p, c, value, reason, now):
+        pnl = value - p["cost"]
+        new = not TRADES_FILE.exists()
+        with TRADES_FILE.open("a", newline="") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(TRADE_FIELDS)
+            w.writerow([round(p["t_open"]), round(now), p["strat"], p["mint"], p["name"], p["symbol"], p["latency"],
+                        round(p["entry_vsol"], 3), round(c["vsol"] / 1e9, 3), round(p["cost"], 6), round(value, 6),
+                        round(pnl, 6), round(pnl / p["cost"] * 100, 2), reason, round(now - p["t_open"]), int(reason == "graduált")])
+
+    # ---- WebSocket
+    async def ws_loop(self):
+        backoff = 5
+        while not self.stop:
+            try:
+                await self._ws_session()
+                backoff = 5
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log(f"WebSocket megszakadt: {e} — ujra {backoff} mp mulva")
+            if self.stop:
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 120)
+
+    def handle(self, raw):
+        if not isinstance(raw, str) or len(raw) > 20000:
+            return
+        try:
+            m = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(m, dict):
+            return
+        tx = str(m.get("txType") or "")
+        if tx == "create":
+            self.on_create(m)
+        elif "mint" in m and (re.search("migrat", tx, re.I) or m.get("method") == "migration"):
+            self.on_migrate(m)
+        elif isinstance(m.get("message"), str) and re.search("error|key|denied|limit", m["message"], re.I):
+            log("PumpPortal: " + m["message"][:200])
+
+    async def _ws_session(self):
+        subs = [json.dumps({"method": "subscribeNewToken"}), json.dumps({"method": "subscribeMigration"})]
+        try:
+            import websockets
+        except ImportError:
+            websockets = None
+        if websockets:
+            async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=30, max_size=2 ** 20) as ws:
+                for s in subs:
+                    await ws.send(s)
+                log("PumpPortal: kapcsolodva")
+                async for raw in ws:
+                    self.handle(raw)
+                    if self.stop:
+                        break
+            return
+        try:
+            import aiohttp
+        except ImportError:
+            sys.exit("HIBA: nincs WebSocket-kliens. Telepitsd:  .venv/bin/pip install websockets")
+        async with aiohttp.ClientSession() as s:
+            async with s.ws_connect(self.ws_url, heartbeat=20, max_msg_size=2 ** 20) as ws:
+                for x in subs:
+                    await ws.send_str(x)
+                log("PumpPortal: kapcsolodva (aiohttp)")
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        self.handle(msg.data)
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+                    if self.stop:
+                        break
+
+    # ---- futtatas
+    async def periodic(self):
+        last_daily = time.time()
+        n = 0
+        while not self.stop:
+            await asyncio.sleep(60)
+            n += 1
+            self.save(db=(n % 10 == 0))          # allapot percenkent, a (nagyobb) dev-adatbazis 10 percenkent
+            open_ = len(self.positions)
+            log(f"latott {self.stats['seen']} token, {self.stats['migrations']} graduacio, nyitott {open_}, RPC hivas {self.rpc.calls} (hiba {self.rpc.errors})")
+            if time.time() - last_daily > 86400:
+                telegram("Napi:\n" + report_text(short=True))
+                last_daily = time.time()
+
+    async def main(self):
+        log(f"Paper sniper indul. Strategiak: {', '.join(self.strats)}. Tetel {self.size} SOL, dij {self.fee*100:.2f}%/irany, prio {self.prio} SOL/tx, "
+            f"TP {self.tp}x, SL {self.sl}x, max {self.max_hold/60:.0f} perc. RPC: {urllib.parse.urlsplit(self.rpc.url).netloc}")
+        telegram("Paper sniper indul (valodi penz nelkul)")
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, lambda: setattr(self, "stop", True))
+            except NotImplementedError:
+                pass
+        tasks = [asyncio.create_task(self.ws_loop()), asyncio.create_task(self.poll_loop()), asyncio.create_task(self.periodic())]
+        tasks += [asyncio.create_task(self.meta_worker()) for _ in range(3)]
+        try:
+            while not self.stop:
+                await asyncio.sleep(1)
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self.save()
+            log("Leallt, allapot elmentve.")
+
+
+# ---------------------------------------------------------------- riport
+def load_trades():
+    if not TRADES_FILE.exists():
+        return []
+    with TRADES_FILE.open() as f:
+        return list(csv.DictReader(f))
+
+
+def report_text(short=False):
+    rows = load_trades()
+    st = read_json(STATE_FILE, {}).get("stats", {})
+    lines = []
+    if st:
+        days = max(1e-9, (time.time() - st.get("started", time.time())) / 86400)
+        lines.append(f"Futasi ido: {days:.1f} nap, latott token: {st.get('seen', 0)}, graduacio (esemeny): {st.get('migrations', 0)}")
+    if not rows:
+        lines.append("Meg nincs lezart szimulalt pozicio.")
+        return "\n".join(lines)
+    by = {}
+    for r in rows:
+        by.setdefault(r["strat"], []).append(r)
+    for s in [k for k in STRAT_DESC if k in by] + [k for k in by if k not in STRAT_DESC]:
+        xs = by[s]
+        n = len(xs)
+        pnl = [float(r["pnl_sol"]) for r in xs]
+        ret = [float(r["ret_pct"]) for r in xs]
+        cost = sum(float(r["cost_sol"]) for r in xs)
+        wins = sum(1 for p in pnl if p > 0)
+        grad = sum(1 for r in xs if r["graduated"] == "1")
+        mean = sum(ret) / n
+        sd = math.sqrt(sum((x - mean) ** 2 for x in ret) / (n - 1)) if n > 1 else 0.0
+        ci = 1.96 * sd / math.sqrt(n) if n > 1 else float("nan")
+        gp, gl = sum(p for p in pnl if p > 0), -sum(p for p in pnl if p < 0)
+        pf = gp / gl if gl > 0 else float("inf")
+        reasons = {}
+        for r in xs:
+            reasons[r["reason"]] = reasons.get(r["reason"], 0) + 1
+        lat = sorted(float(r["latency_s"]) for r in xs)[n // 2]
+        verdict = "POZITIV (statisztikailag)" if n >= 30 and mean - ci > 0 else ("NEGATIV (statisztikailag)" if n >= 30 and mean + ci < 0 else "meg nem eldontheto")
+        if short:
+            lines.append(f"{s}: n={n}, PnL {sum(pnl):+.3f} SOL, atlag {mean:+.1f}% ±{ci:.1f}, graduált {grad} -> {verdict}")
+            continue
+        lines.append("")
+        lines.append(f"{s} — {STRAT_DESC.get(s, '')}")
+        lines.append(f"  poziciok: {n}   nyero: {wins} ({wins/n*100:.0f}%)   graduált: {grad} ({grad/n*100:.1f}%)   median keses a szuleteshez: {lat:.1f} mp")
+        lines.append(f"  PnL: {sum(pnl):+.4f} SOL a {cost:.3f} SOL befektetett osszegen ({sum(pnl)/cost*100:+.1f}%)   profit factor: {pf:.2f}")
+        lines.append(f"  atlagos hozam / pozicio: {mean:+.1f}%  (95% CI ±{ci:.1f})  ->  {verdict}")
+        lines.append(f"  kiszallasok: " + ", ".join(f"{k} {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])))
+        if grad:
+            g_pnl = sum(float(r["pnl_sol"]) for r in xs if r["graduated"] == "1")
+            lines.append(f"  ebbol a graduáltakon: {g_pnl:+.4f} SOL (OPTIMISTA: a gorbe vegso aran szamolva)")
+    sk, mi = st.get("skipped", {}), st.get("missed", {})
+    if sk or mi:
+        lines.append("")
+        lines.append("Kihagyva (tele volt a strategia): " + (", ".join(f"{k} {v}" for k, v in sk.items()) or "-")
+                     + "   nem sikerult belepni: " + (", ".join(f"{k} {v}" for k, v in mi.items()) or "-"))
+    if not short:
+        lines.append("")
+        lines.append("Olvasat: legalabb 30 pozicio kell strategiankent. Csak akkor van eselye egy eles valtozatnak, ha az atlag a")
+        lines.append("hibahatarral egyutt is pozitiv, ES a graduáltak nelkul sem negativ (azok eladasa optimista).")
+    return "\n".join(lines)
+
+
+def status():
+    st = read_json(STATE_FILE, {})
+    pos = st.get("positions", [])
+    s = st.get("stats", {})
+    saved = st.get("saved")
+    print(f"utolso mentes: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(saved)) if saved else '-'}")
+    print(f"latott token: {s.get('seen', 0)}   graduacio: {s.get('migrations', 0)}   metaadat ok/hiba/eldobva: {s.get('meta_ok', 0)}/{s.get('meta_fail', 0)}/{s.get('meta_drop', 0)}")
+    by = {}
+    for p in pos:
+        by[p["strat"]] = by.get(p["strat"], 0) + 1
+    print("nyitott poziciok: " + (", ".join(f"{k} {v}" for k, v in by.items()) or "nincs"))
+    db = read_json(DB_FILE, {})
+    cr = db.get("creators", {})
+    print(f"dev-adatbazis: {len(cr)} fejleszto, ebbol graduálttal: {sum(1 for c in cr.values() if c.get('g'))}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="pump.fun papir-sniper (valodi penz nelkul)")
+    ap.add_argument("cmd", choices=["run", "report", "status", "reset"])
+    a = ap.parse_args()
+    load_env()
+    if a.cmd == "report":
+        print(report_text())
+        return
+    if a.cmd == "status":
+        status()
+        return
+    lock = LOCK_FILE.open("w")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("HIBA: mar fut egy paper sniper peldany (a 'report' es 'status' ettol meg hasznalhato)")
+    if a.cmd == "reset":
+        for f in (STATE_FILE, TRADES_FILE):
+            if f.exists():
+                f.rename(f.with_suffix(f.suffix + f".bak{int(time.time())}"))
+        log("Szimulalt eredmenyek archivalva (.bak), a dev-adatbazis megmaradt.")
+        return
+    if STOP_FILE.exists():
+        sys.exit("HIBA: state/STOP_SNIPER letezik — torold, ha indulhat:  rm state/STOP_SNIPER")
+    asyncio.run(Sniper().main())
+
+
+if __name__ == "__main__":
+    main()
