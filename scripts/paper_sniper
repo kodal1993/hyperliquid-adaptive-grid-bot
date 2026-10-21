@@ -3,8 +3,10 @@
 PAPER sniper — pump.fun, valodi penz NELKUL: tarcak kovetese.
 
 MIT CSINAL
-  Figyeli a pump.fun tokeneket (PumpPortal ingyenes WebSocket: uj token, kereskedesek,
-  graduacio), sajat tarca-adatbazist epit, es tarcak kovetesen alapulo strategiakat
+  Figyeli a pump.fun tokeneket: uj token + graduacio a PumpPortal ingyenes WebSocketjerol,
+  a KERESKEDESEK pedig kozvetlenul a Solana RPC WebSocketjerol (logsSubscribe a pump.fun
+  programra: a "Program data:" sorokban levo TradeEvent esemenyek; ingyenes, a PumpPortal
+  kereskedes-adatahoz fizetos API-kulcs kellene). Sajat tarca-adatbazist epit, es tarcak kovetesen alapulo strategiakat
   szimulal a VALODI bonding curve allapotan (RPC), dijakkal, keseskel. Privat kulcsot
   nem olvas be, tranzakciot nem kuld.
 
@@ -55,6 +57,7 @@ PARANCSOK (a repo gyokereben, a venv pythonjaval):
 
 KONFIG (.env, mind opcionalis):
     SOLANA_RPC_URL=https://api.mainnet-beta.solana.com   # Helius-kulcsos URL ajanlott
+    SOLANA_WS_URL=                  # ures = a SOLANA_RPC_URL https->wss valtozata (a kereskedes-esemenyekhez)
     PAPER_SNIPER_SIZE_SOL=0.1       # szimulalt tetel / vetel
     PAPER_SNIPER_FEE_BPS=125        # pump.fun gorbe-dij / irany (2026: 0.95% protokoll + 0.30% keszito)
     PAPER_SNIPER_AMM_FEE_BPS=30     # graduacio utani (PumpSwap) dij / irany
@@ -113,6 +116,8 @@ EARLY_SEC = 2.0                        # ennyi mp-en beluli vetel "korai" (bundl
 CLUSTER_SEC = 3.0                      # a klaszter-elemzes korai ablaka
 CLUSTER_MAX_EARLY = 15                 # legfeljebb ennyi korai vevo parjait szamoljuk tokenenkent
 WSOL = "So11111111111111111111111111111111111111112"
+TRADE_EVENT_DISC = bytes.fromhex("bddb7fd34ee661ee")   # sha256("event:TradeEvent")[:8] (Anchor esemeny)
+B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 S12_RULE = {"trail_x": 0.0, "trail_drop": 0.5, "max": 24 * 60, "hold_grad": True}   # csucstol -50%, 24 ora
 # kiszallasi valtozatok: alap a konfigbol; masol a kovetett tarca eladasara (csak kovetett tarcas pozicion)
 EXITS = {
@@ -275,6 +280,32 @@ def recompute_value(r, fee, prio, fixed=True):
 
 
 # ---------------------------------------------------------------- metaadat (IPFS)
+def b58encode(b):
+    n = int.from_bytes(b, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = B58_ALPHABET[r] + out
+    return "1" * (len(b) - len(b.lstrip(b"\0"))) + out
+
+
+def decode_trade_event(data):
+    """pump.fun TradeEvent (a 'Program data:' sor base64-e) -> PumpPortal-szeru uzenet, vagy None.
+    Elrendezes: disc(8) mint(32) sol_amount u64, token_amount u64, is_buy u8, user(32), timestamp i64,
+    virtual_sol_reserves u64, virtual_token_reserves u64, ... (a tobbi mezot nem hasznaljuk)"""
+    try:
+        b = base64.b64decode(data)
+    except Exception:
+        return None
+    if len(b) < 113 or b[:8] != TRADE_EVENT_DISC:
+        return None
+    sol, tok = struct.unpack_from("<QQ", b, 40)
+    is_buy = b[56] == 1
+    vsol, vtok = struct.unpack_from("<QQ", b, 97)
+    return {"txType": "buy" if is_buy else "sell", "mint": b58encode(b[8:40]), "traderPublicKey": b58encode(b[57:89]),
+            "solAmount": sol / 1e9, "tokenAmount": tok / 1e6, "vSolInBondingCurve": vsol / 1e9, "vTokensInBondingCurve": vtok / 1e6}
+
+
 def dex_prices(mints):
     """graduacio utani SOL-ar mintenkent a DexScreener nyilvanos API-jabol (30-asaval); {mint: ar}"""
     out = {}
@@ -303,6 +334,8 @@ class Sniper:
         STATE_DIR.mkdir(exist_ok=True)
         self.rpc = Rpc(os.getenv("SOLANA_RPC_URL") or "https://api.mainnet-beta.solana.com")
         self.ws_url = os.getenv("PUMPPORTAL_WS_URL") or "wss://pumpportal.fun/api/data"
+        http = os.getenv("SOLANA_RPC_URL") or "https://api.mainnet-beta.solana.com"
+        self.rpc_ws_url = os.getenv("SOLANA_WS_URL") or re.sub(r"^http", "ws", http)
         self.size = cfg("PAPER_SNIPER_SIZE_SOL", 0.1)
         self.fee = cfg("PAPER_SNIPER_FEE_BPS", 125.0) / 1e4
         self.prio = cfg("PAPER_SNIPER_PRIO_SOL", 0.001)
@@ -343,6 +376,7 @@ class Sniper:
         self.copy_lat = cfg("PAPER_SNIPER_COPY_LAT", 1.0)
         self.copy_n = cfg("PAPER_SNIPER_COPY_MIN_N", 8, int)
         self.led = {}                                        # (mint, kovetett tarca) -> poziciok (masol kiszallas)
+        self.led_wallets = set()
         self.sample_s10 = cfg("PAPER_SNIPER_SAMPLE_S10", 0.3)
         self.cluster_min = cfg("PAPER_SNIPER_CLUSTER_MIN", 3, int)
         self.pairs = db.get("pairs", {})                     # "a|b" (rendezve) -> [kozos korai tokenek, utolso ido]
@@ -486,10 +520,13 @@ class Sniper:
         return bool(r) and r[0] >= self.smart_n and r[1] / r[0] >= self.smart_win and r[2] >= self.smart_pnl
 
     def on_trade(self, m):
-        T = self.tracked.get(str(m.get("mint") or ""))
+        mint, w = str(m.get("mint") or ""), str(m.get("traderPublicKey") or "")
+        if m.get("txType") == "sell":
+            for p in self.led.get((mint, w), ()):
+                p.setdefault("leader_sold", time.time())   # a kovetett tarca elad (a masol kiszallashoz)
+        T = self.tracked.get(mint)
         if T is None:
             return
-        w = str(m.get("traderPublicKey") or "")
         sol, tok = fnum(m.get("solAmount")), fnum(m.get("tokenAmount"))
         if not BASE58.match(w) or sol < 0 or tok < 0:
             self.stats["trade_bad"] += 1
@@ -532,8 +569,6 @@ class Sniper:
             rec[7] += 1
             if len(rec) >= 10 and not rec[9]:
                 rec[9] = now
-            for p in self.led.get((T["mint"], w), ()):
-                p.setdefault("leader_sold", now)
             T["n_sell"] += 1
             if w == T["dev"]:
                 T["dev_sold"] = True
@@ -694,6 +729,7 @@ class Sniper:
             p["leader"], p["leaders"] = leaders[0], leaders
             for w in leaders:
                 self.led.setdefault((T["mint"], w), []).append(p)
+                self.led_wallets.add(w)
             if sold:
                 p["leader_sold"] = time.time()          # a kovetett tarca mar a belepes elott elkezdett eladni
 
@@ -810,6 +846,7 @@ class Sniper:
         for p in keep:
             for w in p.get("leaders") or ([p["leader"]] if p.get("leader") else []):
                 self.led.setdefault((p["mint"], w), []).append(p)
+        self.led_wallets = {w for _, w in self.led}
 
     def close(self, p, c, value, reason, now, exit_name="alap"):
         pnl = value - p["cost"]
@@ -840,6 +877,8 @@ class Sniper:
             backoff = min(backoff * 2, 120)
 
     def handle(self, raw):
+        if isinstance(raw, (bytes, bytearray)):
+            raw = bytes(raw).decode("utf-8", "ignore")    # binaris keret is lehet
         if not isinstance(raw, str) or len(raw) > 20000:
             return
         try:
@@ -849,6 +888,16 @@ class Sniper:
         if not isinstance(m, dict):
             return
         tx = str(m.get("txType") or "")
+        wt = self.stats.setdefault("ws_types", {})
+        k = tx or ("message" if "message" in m else ("errors" if "errors" in m else "egyeb"))
+        if k in wt or len(wt) < 20:
+            wt[k] = wt.get(k, 0) + 1
+        if not tx and ("message" in m or "errors" in m):
+            pm = self.stats.setdefault("pp_msgs", [])
+            txt = str(m.get("message") or m.get("errors"))[:200]
+            if not pm or pm[-1][1] != txt:
+                pm.append([round(time.time()), txt])
+                del pm[:-5]
         if tx == "create":
             self.on_create(m)
         elif tx in ("buy", "sell"):
@@ -903,16 +952,67 @@ class Sniper:
                     sender.cancel()
 
     async def sub_sender(self, send):
-        """masodpercenkent kotegelve kuldi a token-kereskedes (le)iratkozasokat"""
+        """masodpercenkent: a lejart kovetesi ablakok elszamolasa. (A PumpPortal subscribeTokenTrade
+        fizetos API-kulcsot ker, ezert a kereskedeseket a Solana RPC-rol olvassuk: rpc_ws_loop.)"""
         while not self.stop:
             await asyncio.sleep(1)
             if self.trades_on:
                 self.finalize_tracked()
-            for method, q in (("unsubscribeTokenTrade", "unsub_q"), ("subscribeTokenTrade", "sub_q")):
-                keys = getattr(self, q)
-                setattr(self, q, [])
-                for i in range(0, len(keys), 100):
-                    await send(json.dumps({"method": method, "keys": keys[i:i + 100]}))
+            self.sub_q, self.unsub_q = [], []
+
+    # ---- kereskedesek a Solana RPC-rol (logsSubscribe a pump.fun programra)
+    async def rpc_ws_loop(self):
+        backoff = 5
+        while not self.stop:
+            try:
+                await self._rpc_ws_session()
+                backoff = 5
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                st = self.stats.setdefault("rpc_ws", {})
+                st["reconnects"] = st.get("reconnects", 0) + 1
+                st["last_error"] = f"{type(e).__name__}: {str(e)[:150]}"
+                log(f"RPC WebSocket megszakadt: {st['last_error']} — ujra {backoff} mp mulva")
+            if self.stop:
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 120)
+
+    def handle_rpc_log(self, raw):
+        st = self.stats.setdefault("rpc_ws", {})
+        try:
+            m = json.loads(raw)
+        except ValueError:
+            return
+        if m.get("method") != "logsNotification":
+            if "error" in m:
+                st["last_error"] = str(m["error"])[:200]
+                log(f"RPC logsSubscribe hiba: {st['last_error']}")
+            return
+        v = ((m.get("params") or {}).get("result") or {}).get("value") or {}
+        st["notifications"] = st.get("notifications", 0) + 1
+        if v.get("err") is not None:
+            return                                     # sikertelen tranzakcio
+        for ln in v.get("logs") or ():
+            if ln.startswith("Program data: "):
+                ev = decode_trade_event(ln[14:])
+                if ev:
+                    st["events"] = st.get("events", 0) + 1
+                    if ev["mint"] in self.tracked or ev["traderPublicKey"] in self.led_wallets:
+                        self.on_trade(ev)
+
+    async def _rpc_ws_session(self):
+        sub = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
+                          "params": [{"mentions": [PUMP]}, {"commitment": "processed"}]})
+        import websockets
+        async with websockets.connect(self.rpc_ws_url, ping_interval=20, ping_timeout=30, max_size=2 ** 22) as ws:
+            await ws.send(sub)
+            log(f"RPC WebSocket: kapcsolodva ({urllib.parse.urlsplit(self.rpc_ws_url).hostname}), logsSubscribe pump.fun")
+            async for raw in ws:
+                self.handle_rpc_log(raw if isinstance(raw, str) else bytes(raw).decode("utf-8", "ignore"))
+                if self.stop:
+                    break
 
     # ---- futtatas
     async def periodic(self):
@@ -943,7 +1043,8 @@ class Sniper:
                 loop.add_signal_handler(sig, lambda: setattr(self, "stop", True))
             except NotImplementedError:
                 pass
-        tasks = [asyncio.create_task(self.ws_loop()), asyncio.create_task(self.poll_loop()), asyncio.create_task(self.periodic())]
+        tasks = [asyncio.create_task(self.ws_loop()), asyncio.create_task(self.poll_loop()), asyncio.create_task(self.periodic()),
+                 asyncio.create_task(self.rpc_ws_loop())]
         try:
             while not self.stop:
                 await asyncio.sleep(1)
@@ -1133,7 +1234,7 @@ def telegram_report(hours=2.0):
                    f" kovetett token {wst.get('tracked', 0)},"
                    f" kereskedes-uzenet {s.get('trade_msgs', 0)}")
         if s.get("trade_msgs", 0) == 0:
-            warn.append("nem jon kereskedes-uzenet (a tarca-adatbazis nem tanul)")
+            warn.append("nem jon kereskedes-uzenet a Solana RPC-rol (a tarca-adatbazis nem tanul) — /diag")
     rpc = s.get("rpc") or {}
     if rpc.get("calls", 0) >= 100 and rpc.get("errors", 0) / rpc["calls"] > 0.1:
         warn.append(f"RPC hibaarany {rpc['errors'] / rpc['calls'] * 100:.0f}%")
@@ -1413,13 +1514,23 @@ def diag():
 
     print("\n== Belepesek strategiankent (belepett / tele volt / nem sikerult)")
     ent, sk, mi = s.get("entered", {}), s.get("skipped", {}), s.get("missed", {})
-    for k in sorted(set(ent) | set(sk) | set(mi) | set(STRAT_DESC), key=strat_order):
+    for k in sorted(STRAT_DESC, key=strat_order):
         print(f"  {k:12s} {ent.get(k, '-')!s:>6} / {sk.get(k, 0):>5} / {mi.get(k, 0):>5}")
 
     print("\n== Tarca-kovetes (S6/S8/S10)")
     wst = s.get("wallets") or {}
     print(f"kereskedes-uzenet: {s.get('trade_msgs', 0)}  hibas: {s.get('trade_bad', 0)}  elszamolt tarca-pozicio: {s.get('wallet_closes', 0)}"
-          f"  kovetett token most: {wst.get('tracked', '-')}")
+          f"  kovetett token most: {wst.get('tracked', '-')}  feliratkozas elkuldve: {s.get('subs_sent', 0)} token")
+    rw = s.get("rpc_ws") or {}
+    print(f"Solana RPC logsSubscribe: ertesites {rw.get('notifications', 0)}, TradeEvent {rw.get('events', 0)},"
+          f" ujrakapcsolodas {rw.get('reconnects', 0)}" + (f", utolso hiba: {rw['last_error']}" if rw.get("last_error") else ""))
+    if not rw.get("events"):
+        print("  FIGYELEM: nem jon TradeEvent a Solana RPC-rol (SOLANA_WS_URL / a nyilvanos RPC korlatozhat — Helius-kulcs ajanlott)")
+    wt = s.get("ws_types") or {}
+    if wt:
+        print("WebSocket-uzenetek tipus szerint: " + ", ".join(f"{k} {v}" for k, v in sorted(wt.items(), key=lambda kv: -kv[1])))
+    for t, txt in s.get("pp_msgs") or []:
+        print(f"  PumpPortal ({time.strftime('%m-%d %H:%M', time.localtime(t))}): {txt}")
     wl = read_json(DB_FILE, {}).get("wallets", {})
     if wl:
         mn, mw, mp = cfg("PAPER_SNIPER_SMART_MIN_N", 5, int), cfg("PAPER_SNIPER_SMART_MIN_WIN", 0.5), cfg("PAPER_SNIPER_SMART_MIN_PNL", 0.5)
