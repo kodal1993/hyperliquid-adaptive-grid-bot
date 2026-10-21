@@ -1733,6 +1733,51 @@ def test_control_bot_report_interval_default_two_hours(monkeypatch):
     assert telegram_bot.report_interval_seconds() == 0
 
 
+def test_control_bot_export_only_whitelisted_files(tmp_path, monkeypatch):
+    import io
+    import zipfile
+
+    telegram_bot = load_telegram_control_bot_module()
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "paper_sniper_trades.csv").write_text("ts_open,strat\n1,S0_minta\n")
+    (tmp_path / "state" / "paper_carry_state.json").write_text("{}")
+    (tmp_path / ".env").write_text("HL_PRIVATE_KEY=0x" + "b" * 64)
+    (tmp_path / "state" / "secret.txt").write_text("x")
+    monkeypatch.setattr(telegram_bot, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(telegram_bot, "paper_script", lambda *a, **k: "TELEGRAM_BOT_TOKEN=123456:abcdefghijklmnopqrstuvwxyzABCDEF ok")
+    monkeypatch.setattr(telegram_bot, "version_text", lambda fetch=True: "v")
+
+    name, data, caption = telegram_bot.build_export()
+    names = set(zipfile.ZipFile(io.BytesIO(data)).namelist())
+    assert name.startswith("paper_export_") and name.endswith(".zip")
+    assert "state/paper_sniper_trades.csv" in names and "state/paper_carry_state.json" in names
+    assert not any(".env" in n or "secret" in n for n in names)
+    assert "sniper_diag.txt" in names and "sniper_kiszallas.txt" in names
+    diag = zipfile.ZipFile(io.BytesIO(data)).read("sniper_diag.txt").decode()
+    assert "abcdefghijklmnopqrstuvwxyzABCDEF" not in diag
+    assert "hiányzik" in caption
+
+
+def test_control_bot_version_reports_pending_prs(monkeypatch):
+    telegram_bot = load_telegram_control_bot_module()
+
+    def fake_run(args, timeout=60):
+        if args[:2] == ["git", "log"] and "HEAD..origin/main" in args:
+            return 0, "aaa111 Merge pull request #101 from x/y\nbbb222 some fix"
+        if args[:2] == ["git", "log"] and "origin/main..HEAD" in args:
+            return 0, "ccc333 raise micro live ceilings to 45/150"
+        if args[:2] == ["git", "log"]:
+            return 0, "ccc333 2026-10-21 14:00 raise micro live ceilings"
+        return 0, ""
+
+    monkeypatch.setattr(telegram_bot, "run_cmd", fake_run)
+    monkeypatch.setattr(telegram_bot, "service_state", lambda unit: "inactive")
+    text = telegram_bot.version_text(fetch=False)
+    assert "2 új commit" in text and "#101" in text and "/pull" in text
+    assert "helyi commit" in text
+    assert "telepítetlen" in telegram_bot.version_warning()
+
+
 def _cfg_for_grid_tests(monkeypatch):
     monkeypatch.delenv("ENV_PROFILE", raising=False)
     cfg = BotConfig.from_env()

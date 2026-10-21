@@ -1,5 +1,11 @@
 # Changelog
 
+## Telegram: /export és /version
+
+- `/export`: egy zip a sniper és a carry adatfájljaival (`state/paper_sniper_trades.csv`, `paper_sniper_state.json`, `paper_carry_log.csv`, `paper_carry_state.json`), valamint a `report`, a `report --kiszallas`, a `diag` és a carry `report` kimenetével. Csak a felsorolt fájlok kerülnek bele (a `.env` soha), a szövegekből a titkok ki vannak takarva.
+- `/version`: a futó commit, a telepítetlen commitok és PR-ek száma az `origin/main`-hez képest, a VPS helyi commitjai, és melyik szolgáltatás fut a lemezen lévőnél régebbi kóddal (újraindítás kell).
+- A 2 órás jelentés első részében egy sor jelzi a telepítetlen PR-eket és az újraindításra váró szolgáltatásokat.
+
 ## Paper sniper: párhuzamos kiszállási változatok, párosított összevetés
 
 - Minden szimulált belépést 6 kiszállási szabály szerint is lezárunk: `alap` (konfig TP/SL/időkorlát), `trail`, `gyors`, `reszl` (részleges TP + trail / nullszint), `szoros`, `futtat`. A CSV-ben `S2_gyors~trail` formában szerepelnek. Az alap sorok neve nem változott, így a korábbi adatokkal folytonos.
