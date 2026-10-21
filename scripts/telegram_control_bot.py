@@ -86,7 +86,7 @@ HELP_TEXT = """🤖 PAPÍR-BOTOK VEZÉRLÉSE (valódi pénz nélkül)
 📊 /report - teljes jelentés most (sniper + carry)
 🩺 /status - szolgáltatások állapota
 🎯 /sniper - sniper: stratégiánkénti részletes eredmény
-🔬 /diag - sniper: diagnosztika (metaadat, RPC, kiürült görbék)
+🔬 /diag - sniper: diagnosztika (RPC, tárca-követés, bennfentes-klaszterek)
 👛 /wallets - okos tárcák viselkedése: mi működik, szerencse vagy tudás
 💰 /carry - carry: állapot és összesítő
 📜 /logs_sniper, /logs_carry - utolsó naplósorok

@@ -1,5 +1,15 @@
 # Changelog
 
+## Paper sniper: csak tárcakövetés + S12_futtat (graduáció után is)
+
+- **Kivezetve:** S0–S5, S7, S9, a metaadat-letöltés (IPFS), a trail/gyors/reszl/szoros/futtat kiszállási változatok, a `report --javitott` és a kiürültgörbe-diagnosztika. A régi sorok a CSV-ben maradnak, de a riportok csak az aktív stratégiákat mutatják.
+- **Marad:** S6_okos, S6_okos2, S8_masol, S10_bennfentes; a tárca-adatbázis, a követhetőség, a bennfentes-klaszterek, a viselkedésnapló, valamint az `alap` és a `masol` kiszállás.
+- **Új `S12_futtat`:**
+  - belépés, ha a görbe legalább 50%-on van, nincs klaszter, nem másolt név, legalább 25 vevő, és eladás/vétel < 0,7;
+  - **graduáció után is tartjuk:** az ár a DexScreener nyilvános API-jából jön, a legnagyobb likviditású SOL-pár `priceNative` értéke, 30 mp-enként, 30-asával lekérdezve; az AMM-díj `PAPER_SNIPER_AMM_FEE_BPS` (30);
+  - kiszállás a csúcstól −50%-nál, legfeljebb 24 óra, TP-plafon nélkül; a záráskori ok `+amm` jelölést kap.
+- A `docs/KISERLETEK.md` sniper-kártyája frissült. S12 határideje: 2026-11-04.
+
 ## Paper sniper: S10_bennfentes — a bennfentesek követése, kiszállás az első eladásukkor
 
 - `S10_bennfentes`: belépés a klaszteres tokenbe a felismerés után (3 mp + `COPY_LAT`), ha még egyik bennfentes sem adott el; ha már eladtak, kimarad. A minta aránya `PAPER_SNIPER_SAMPLE_S10` (0,3).

@@ -1,134 +1,76 @@
 #!/usr/bin/env python3
 """
-PAPER sniper — pump.fun, valodi penz NELKUL.
+PAPER sniper — pump.fun, valodi penz NELKUL: tarcak kovetese.
 
 MIT CSINAL
-  Figyeli a pump.fun tokenek szuleteset (PumpPortal ingyenes WebSocket: uj token
-  + graduacio), es tobb strategiat PARHUZAMOSAN szimulal. Mindegyik a VALODI
-  bonding curve allapotan "vasarol" (a vetel pillanataban az RPC-rol kiolvasva,
-  beallithato kesleltetessel), es a valodi gorbe alapjan "ad el". Privat kulcsot
-  nem olvas be, tranzakciot nem kuld. A cel: kideriteni, hogy van-e barmelyik
-  szuronek pozitiv varhato erteke dijakkal, kesessel, csuszassal szamolva.
-
-  A szimulacio szandekosan inkabb pesszimista:
-    * pump.fun dij mindket iranyban (PAPER_SNIPER_FEE_BPS, alap 100 = 1%)
-    * prioritasi / Jito dij minden tranzakciora (PAPER_SNIPER_PRIO_SOL)
-    * a vetel a kesleltetes UTAN kiolvasott gorbearon tortenik (a sniperek
-      addigra mar vettek)
-  Optimista resz: graduacional a gorbe vegso aran adunk el (a valosagban az AMM-en
-  utana gyakran esik az ar). Ezt a report kulon jeloli.
+  Figyeli a pump.fun tokeneket (PumpPortal ingyenes WebSocket: uj token, kereskedesek,
+  graduacio), sajat tarca-adatbazist epit, es tarcak kovetesen alapulo strategiakat
+  szimulal a VALODI bonding curve allapotan (RPC), dijakkal, keseskel. Privat kulcsot
+  nem olvas be, tranzakciot nem kuld.
 
 STRATEGIAK
-    S0_minta     veletlen minta minden uj tokenbol (alapvonal), azonnal
-    S1_dev       bizonyitott fejleszto: volt mar graduált tokenje (a sajat helyi
-                 adatbazis szerint) es 7 napja nem inditott, azonnal
-                 (az elso 7 napban szinte sosem lep be: a graduáltat csak az
-                 elmult 7 nap inditasaibol ismerjuk)
-    S1_grad      volt mar graduált tokenje, nem sorozat-dev (<= 3 inditas / 7 nap),
-                 nem masolt nev, azonnal
-    S2_gyors     szuletesi szuro: nem masolt nev, nem sorozat-dev, dev-vetel
-                 0.5-5 SOL, dev < 20% — azonnal
-    S2_lassu     ugyanez 5 mp kesessel (mennyit ront a kesleltetes?)
-    S3_linkek    Telegram + X link a metaadatban, nem masolat, nem sorozat-dev
-    S4_lendulet  3 percen belul >= 30%-os gorbe + van Telegram vagy X
-    S5_tiszta    minden szuro egyutt: nem masolat, a dev elso inditasa 7 napon belul,
-                 dev-vetel 0.5-3 SOL, dev < 10%, TG vagy X link — a metaadat utan
-    S6_okos      egy "okos tarca" vett (sajat tarca-adatbazis, lasd lent), 1 mp kesessel
-    S6_okos2     legalabb 2 okos tarca vett ugyanabbol
-    S7_tiszta    S7_organikus, de csak bennfentes-klaszter nelkuli tokenben (lasd lent)
-    S9_klaszter_nelkul  10 mp-nel, veletlen minta (PAPER_SNIPER_SAMPLE_S9) a klaszter nelkuli tokenekbol
-    S9_klaszteres       ugyanez a klaszteres tokenekbol (kontroll: rosszabbnak kell lennie)
-    S10_bennfentes      a bennfentesek kovetese: belepes, amint a token klaszteres (3 mp + COPY_LAT),
-                        ha meg egyik bennfentes sem adott el; a "masol" kiszallas az ELSO bennfentes
-                        eladasara zar (a minta aranya: PAPER_SNIPER_SAMPLE_S10)
-    S8_masol     kovethetoen nyero tarca vett: a tarcat azon mertuk, mennyit hozott volna NEKUNK
-                 kovetve (1 mp keses, a mi dijaink, kiszallas a tarca eladasakor), es ennek az
-                 also hibahatara is pozitiv — 1 mp kesessel
-    S7_organikus 60 mp-nel: >= 15 kulon vevo, a korai (2 mp-en beluli) vevok < 15%-ot
-                 vettek, a dev nem adott el, eladas/vetel < 0.6 — a bundle-os tokenek kimaradnak
+    S6_okos         egy "okos tarca" (sajat PnL szerint) vett, 1 mp kesessel
+    S6_okos2        legalabb 2 okos tarca vett ugyanabbol
+    S8_masol        MASOLHATO tarca vett: a tarcat azon mertuk, mennyit hozott volna NEKUNK
+                    kovetve (COPY_LAT keses, a mi dijaink, kiszallas az o eladasakor), es ennek
+                    az also hibahatara is pozitiv
+    S10_bennfentes  bennfentes-klaszter (lasd lent) vett: belepes a felismeres utan
+                    (3 mp + COPY_LAT), ha meg egyik bennfentes sem adott el
+    S12_futtat      tapadast mutato token (gorbe >= 50%, klaszter nelkul, sok vevo):
+                    a nyerok futtatasa — graduacio UTAN is tartjuk (ar: DexScreener, AMM-dij),
+                    kiszallas a csucstol -50%-nal, legfeljebb 24 ora; nincs TP-plafon
 
-TARCA-ADATBAZIS (informacios elony)
+KISZALLAS
+    alap    TP / SL / idokorlat (PAPER_SNIPER_TP_X / SL_X / MAX_HOLD_MIN); graduacional a gorbe
+            vegso aran zar (optimista)
+    masol   ki, amikor a kovetett tarca (S10: az elso bennfentes) elad; SL 0.5x, max 30 perc
+    S12_futtat sajat szabaly: csucstol -50%, max 24 ora, graduacio utan is
+  A CSV-ben "S8_masol" (alap) es "S8_masol~masol"; a kulonbseg parositva: report --kiszallas.
+
+TARCA-ADATBAZIS
   Minden uj token kereskedeseit figyeljuk az elso PAPER_SNIPER_TRADE_WINDOW_MIN percben
-  (PumpPortal subscribeTokenTrade). Az ablak vegen tarcankent elszamoljuk: kapott SOL +
-  a megmaradt tokenek erteke az utolso aron - a befizetett SOL. Nem szamit bele a dev, es
-  az sem, aki az elso 2 mp-ben vett (bundle / gyors sniper: ot ugysem tudnank kovetni).
-  "Okos" a tarca, ha legalabb SMART_MIN_N tokenen kereskedett, a nyero arany >= SMART_MIN_WIN
-  es az osszes PnL >= SMART_MIN_PNL SOL. Csak a mar lezart ablakok szamitanak (nincs elorelatas).
-  Kovethetoseg ("okosabbak az okosaknal"): a tarca sajat PnL-je felrevezet — egy gyors bot mindig
-  nyerni latszik, de mire mi utana lepunk, az ar elment. Ezert minden tarca-poziciohoz kiszamoljuk a
-  KOVETO hozamat is: belepes a tarca vetele utan COPY_LAT mp-cel az akkori aron, kiszallas a tarca
-  elso eladasa utan COPY_LAT mp-cel (vagy az ablak vegen), a mi dijainkkal es prio-dijunkkal. A hozam
-  +500%-nal le van vagva, hogy egyetlen szerencses token ne vigye el. Masolhato a tarca, ha legalabb
-  COPY_MIN_N ilyen pozicioja van, es az atlagos koveto hozam - 2 * standard hiba > 0.
-  Bennfentes-klaszterek (csak a lanc, RPC nelkul): a token elso CLUSTER_SEC (3) mp-enek vevoi
-  ("korai vevok", a dev nelkul). Klaszter-jel egy tokenben:
-    * visszatero csoport: ket korai vevo legalabb CLUSTER_MIN (3) korabbi tokenben is egyutt volt korai
-    * dev-barat: a korai vevo ugyanennek a devnek legalabb 2 korabbi tokenjeben is korai volt
-  Klaszteres a token, ha legalabb 2 visszatero-csoport tag VAGY legalabb 1 dev-barat van benne. A jelet a 3. mp utan szamoljuk, csak a
-  korabbi tokenekbol (nincs elorelatas), utana frissul a statisztika.
-  Viselkedesnaplo (state/paper_sniper_wallet_trades.csv): a legalabb 2 korabbi tokennel rendelkezo
-  tarcak minden pozicioja + 5% veletlen minta a tobbibol (minta=1, alapvonal). A 'wallets' parancs
-  ebbol mutatja meg, milyen belepesi idozites / tartas mukodik, es hogy az okos tarcak eredmenye
-  kitart-e (elso fele alapjan okos -> a masodik feleben is jo?).
-
-KISZALLASI VALTOZATOK (ugyanazokon a belepeseken, parhuzamosan)
-  Minden poziciot tobb kiszallasi szabaly szerint is lezarunk; a CSV-ben a strategia
-  neve "S2_gyors" (alap) vagy "S2_gyors~trail". Mivel a belepes azonos, a kulonbseg
-  parositva merheto (report --kiszallas), ami sokkal kisebb mintan is eldontheto.
-    alap    TP / SL / idokorlat a PAPER_SNIPER_TP_X / SL_X / MAX_HOLD_MIN szerint
-    trail   1.3x felett a csucstol 25%-os visszaesesnel ki, SL 0.5x, max 30 perc
-    gyors   TP 1.5x, SL 0.7x, max 3 perc
-    reszl   2x-nel a fele el, a maradek: csucstol -30% vagy vissza 1.0x-ig, SL 0.5x, max 60 perc
-    szoros  TP 2x, SL 0.8x, max 30 perc
-    futtat  TP 5x, SL 0.4x, max 60 perc
-    masol   (csak S6/S8/S9/S10) ki, amikor a kovetett tarca (S9/S10: barmelyik bennfentes) elad; SL 0.5x, max 30 perc
+  (subscribeTokenTrade). Az ablak vegen tarcankent: kapott SOL + a maradek token erteke -
+  befizetett SOL. A dev es a 2 mp-en beluli vevok kimaradnak. Okos: >= SMART_MIN_N token,
+  nyero >= SMART_MIN_WIN, PnL >= SMART_MIN_PNL. Kovethetoseg: minden tarca-poziciohoz a KOVETO
+  hozam is (belepes COPY_LAT mp-cel a veteluk utan, kiszallas az elso eladasuk utan, a mi
+  dijainkkal, +500%-nal levagva); masolhato, ha >= COPY_MIN_N ilyen pozicio es atlag - 2 SE > 0.
+  Bennfentes-klaszter (RPC nelkul): a token elso 3 mp-enek vevoi kozott visszatero csoport
+  (>= CLUSTER_MIN kozos korai token) vagy dev-barat (a dev >= 2 korabbi tokenjeben korai).
+  Viselkedesnaplo (state/paper_sniper_wallet_trades.csv) -> 'wallets' parancs.
 
 ELSZAMOLAS
-  A papir-vetel nincs benne a valodi gorbeben, ezert eladaskor a valodi SOL-tartalek
-  melle a sajat (dij utani) betetunket is hozzaadjuk. Enelkul egy "kiurult" gorben
-  (mindenki eladott) a pozicio ~0-t erne, holott a valosagban a mi SOL-unk is ott lenne.
+  A papir-vetel nincs a valodi gorbeben, ezert eladaskor a sajat (dij utani) SOL-unkat is a
+  gorbe tartalekahoz szamoljuk. Graduacio utan (S12) az ar a DexScreener SOL-arfolyama, a dij
+  PAPER_SNIPER_AMM_FEE_BPS.
 
 PARANCSOK (a repo gyokereben, a venv pythonjaval):
     .venv/bin/python scripts/paper_sniper run       # figyeles + szimulacio (systemd alatt)
     .venv/bin/python scripts/paper_sniper report    # strategiankenti eredmeny
-    .venv/bin/python scripts/paper_sniper report --javitott   # a regi sorok ujraszamolva a javitott elszamolassal
-    .venv/bin/python scripts/paper_sniper report --kiszallas  # kiszallasi valtozatok parositott osszevetese
-    .venv/bin/python scripts/paper_sniper wallets   # okos tarcak viselkedese: mi mukodik, szerencse vagy tudas
-    .venv/bin/python scripts/paper_sniper diag      # diagnosztika: kiszallasok, kiurult gorbek, metaadat, RPC
+    .venv/bin/python scripts/paper_sniper report --kiszallas  # masol vs alap, parositva
     .venv/bin/python scripts/paper_sniper report --telegram --ora 2   # tomor jelentes (a Telegram-vezerlo hivja)
+    .venv/bin/python scripts/paper_sniper wallets   # tarcak viselkedese, kovethetoseg
+    .venv/bin/python scripts/paper_sniper diag      # diagnosztika: RPC, tarca-kovetes, klaszterek
     .venv/bin/python scripts/paper_sniper status    # mi fut most, nyitott poziciok
-    .venv/bin/python scripts/paper_sniper reset     # szimulalt eredmenyek torlese (a dev-adatbazis marad)
+    .venv/bin/python scripts/paper_sniper reset     # szimulalt eredmenyek archivalasa (az adatbazis marad)
 
 KONFIG (.env, mind opcionalis):
     SOLANA_RPC_URL=https://api.mainnet-beta.solana.com   # Helius-kulcsos URL ajanlott
     PAPER_SNIPER_SIZE_SOL=0.1       # szimulalt tetel / vetel
     PAPER_SNIPER_FEE_BPS=125        # pump.fun gorbe-dij / irany (2026: 0.95% protokoll + 0.30% keszito)
+    PAPER_SNIPER_AMM_FEE_BPS=30     # graduacio utani (PumpSwap) dij / irany
     PAPER_SNIPER_PRIO_SOL=0.001     # prioritasi / Jito dij tranzakcionkent
-    PAPER_SNIPER_TP_X=2.0           # kiszallas ennyiszeres erteknel
-    PAPER_SNIPER_SL_X=0.5           # stop ennyiszeres erteknel
-    PAPER_SNIPER_MAX_HOLD_MIN=30    # idokorlat
-    PAPER_SNIPER_SAMPLE=0.02        # S0 minta aranya
+    PAPER_SNIPER_TP_X=2.0 / SL_X=0.5 / MAX_HOLD_MIN=30   # az alap kiszallas
     PAPER_SNIPER_MAX_OPEN=120       # strategiankent egyszerre nyitott poziciok
-    PAPER_SNIPER_EXITS=             # ures = minden kiszallasi valtozat; pl. alap,trail (az alap mindig fut)
     PAPER_SNIPER_POLL_SEC=10        # gorbe-lekerdezes gyakorisaga
-    PAPER_SNIPER_STRATS=            # ures = mind; pl. S0_minta,S2_gyors,S3_linkek
-    PAPER_SNIPER_IPFS=https://ipfs.io/ipfs/,https://dweb.link/ipfs/,https://w3s.link/ipfs/   # IPFS-atjarok sorrendben
-    PAPER_SNIPER_META_HOSTS=        # nem-IPFS metaadat-hosztok (https, pontos egyezes), vesszovel
-    PAPER_SNIPER_META_WORKERS=8     # parhuzamos metaadat-letoltok
-    PAPER_SNIPER_TRADES=1           # 0 = nincs kereskedes-kovetes (S6/S7 es a tarca-adatbazis kikapcsol)
+    PAPER_SNIPER_STRATS=            # ures = mind; pl. S8_masol,S12_futtat
     PAPER_SNIPER_TRADE_WINDOW_MIN=15   # ennyi percig kovetjuk egy token kereskedeseit
-    PAPER_SNIPER_SMART_MIN_N=5      # okos tarca: legalabb ennyi elszamolt token
-    PAPER_SNIPER_SMART_MIN_WIN=0.5  #   nyero arany
-    PAPER_SNIPER_SMART_MIN_PNL=0.5  #   osszes PnL (SOL)
-    PAPER_SNIPER_COPY_LAT=1.0       # koveto keses (mp) a kovethetosegi pontszamhoz
+    PAPER_SNIPER_SMART_MIN_N=5 / SMART_MIN_WIN=0.5 / SMART_MIN_PNL=0.5   # okos tarca
+    PAPER_SNIPER_COPY_LAT=1.0       # koveto keses (mp)
     PAPER_SNIPER_COPY_MIN_N=8       # masolhato tarca: legalabb ennyi koveto-pozicio
-    PAPER_SNIPER_SAMPLE_S9=0.1      # S9 minta aranya csoportonkent
     PAPER_SNIPER_SAMPLE_S10=0.3     # S10: a klaszteres tokenek ekkora reszebe lepunk be
     PAPER_SNIPER_CLUSTER_MIN=3      # visszatero csoport: ennyi kozos korai token
-    PAPER_SNIPER_WALLET_LOG=1       # 0 = nincs viselkedesnaplo
-    PAPER_SNIPER_WALLET_LOG_MB=300  # e folott a naplo archivalodik (.bak) es ujraindul
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # inditasi uzenet; a rendszeres jelentest a
-                                           # scripts/telegram_control_bot.py kuldi
+    PAPER_SNIPER_WALLET_LOG=1 / WALLET_LOG_MB=300   # viselkedesnaplo
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # inditasi uzenet; a jelentest a telegram_control_bot.py kuldi
 
 LEALLITAS: systemctl stop hyperliquid-paper-sniper   vagy   touch state/STOP_SNIPER
 """
@@ -160,52 +102,31 @@ BASE58 = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 TRADE_FIELDS = ["ts_open", "ts_close", "strat", "mint", "name", "symbol", "latency_s", "entry_vsol", "exit_vsol",
                 "cost_sol", "proceeds_sol", "pnl_sol", "ret_pct", "reason", "hold_s", "graduated"]
 STRAT_DESC = {
-    "S0_minta": "veletlen minta, azonnal (alapvonal)",
-    "S1_dev": "bizonyitott dev (volt graduáltja, 7 napja csendes), azonnal",
-    "S1_grad": "volt graduáltja, nem sorozat-dev, nem masolat, azonnal",
-    "S2_gyors": "szuletesi szuro, azonnal",
-    "S2_lassu": "szuletesi szuro, 5 mp keses",
-    "S3_linkek": "Telegram + X link, nem masolat, nem sorozat-dev",
-    "S4_lendulet": "3 percen belul >=30% gorbe + TG vagy X",
-    "S5_tiszta": "minden szuro + TG vagy X, a metaadat utan",
-    "S6_okos": "okos tarca vett (sajat tarca-adatbazis), 1 mp keses",
+    "S6_okos": "okos tarca vett (sajat PnL szerint), 1 mp keses",
     "S6_okos2": "legalabb 2 okos tarca vett",
-    "S7_organikus": "60 mp: sok vevo, kevés korai/bundle, a dev tart",
-    "S8_masol": "kovethetoen nyero tarca vett (a mi kesesunkkel + dijainkkal mert)",
-    "S7_tiszta": "S7_organikus, bennfentes-klaszter nelkul",
-    "S9_klaszter_nelkul": "10 mp, minta a klaszter nelkuli tokenekbol",
-    "S9_klaszteres": "10 mp, minta a klaszteres tokenekbol (kontroll)",
+    "S8_masol": "masolhato tarca vett (a mi kesesunkkel + dijainkkal mert)",
     "S10_bennfentes": "bennfentesek kovetese: be 4 mp-nel, ki az elso bennfentes eladasakor",
+    "S12_futtat": "tapadas (gorbe >= 50%, tiszta): graduacio utan is, csucstol -50%, max 24 ora",
 }
 TOTAL_SUPPLY = 1e9                     # pump.fun tokenek teljes kinalata
 EARLY_SEC = 2.0                        # ennyi mp-en beluli vetel "korai" (bundle / gyors sniper)
 CLUSTER_SEC = 3.0                      # a klaszter-elemzes korai ablaka
 CLUSTER_MAX_EARLY = 15                 # legfeljebb ennyi korai vevo parjait szamoljuk tokenenkent
-META_STRATS = ("S3_linkek", "S4_lendulet", "S5_tiszta")
-# kiszallasi valtozatok: tp/sl a pozicio ertekenek tobbszorose, max perc; trail: csucs folott trail_x,
-# kiszallas a csucstol trail_drop esesnel; part: part_x-nel part_frac eladasa, be: utana 1.0x alatt ki
+WSOL = "So11111111111111111111111111111111111111112"
+S12_RULE = {"trail_x": 0.0, "trail_drop": 0.5, "max": 24 * 60, "hold_grad": True}   # csucstol -50%, 24 ora
+# kiszallasi valtozatok: alap a konfigbol; masol a kovetett tarca eladasara (csak kovetett tarcas pozicion)
 EXITS = {
-    "alap": {},                                                       # a konfigbol (TP_X / SL_X / MAX_HOLD_MIN)
-    "trail": {"sl": 0.5, "max": 30, "trail_x": 1.3, "trail_drop": 0.25},
-    "gyors": {"tp": 1.5, "sl": 0.7, "max": 3},
-    "reszl": {"sl": 0.5, "max": 60, "part_x": 2.0, "part_frac": 0.5, "be": True, "trail_x": 2.0, "trail_drop": 0.3},
-    "szoros": {"tp": 2.0, "sl": 0.8, "max": 30},
-    "futtat": {"tp": 5.0, "sl": 0.4, "max": 60},
-    "masol": {"leader": True, "sl": 0.5, "max": 30},                  # csak kovetett tarcas poziciokon
+    "alap": {},
+    "masol": {"leader": True, "sl": 0.5, "max": 30},
 }
 EXIT_DESC = {
     "alap": "a konfig TP/SL/idokorlatja",
-    "trail": "1.3x felett csucstol -25%",
-    "gyors": "TP 1.5x, SL 0.7x, 3 perc",
-    "reszl": "2x-nel fele el, maradek trail/1.0x",
-    "szoros": "TP 2x, SL 0.8x",
-    "futtat": "TP 5x, SL 0.4x, 60 perc",
     "masol": "ki, amikor a kovetett tarca elad",
 }
 
 
 def split_strat(k):
-    """'S2_gyors~trail' -> ('S2_gyors', 'trail'); 'S2_gyors' -> ('S2_gyors', 'alap')"""
+    """'S8_masol~masol' -> ('S8_masol', 'masol'); 'S8_masol' -> ('S8_masol', 'alap')"""
     base, _, ex = str(k).partition("~")
     return base, ex or "alap"
 
@@ -354,82 +275,25 @@ def recompute_value(r, fee, prio, fixed=True):
 
 
 # ---------------------------------------------------------------- metaadat (IPFS)
-IPFS_GATEWAYS = ["https://ipfs.io/ipfs/", "https://dweb.link/ipfs/", "https://w3s.link/ipfs/"]
-
-
-def uri_host(uri):
-    uri = str(uri or "").strip()
-    if uri.startswith("ipfs://"):
-        return "ipfs://"
-    h = urllib.parse.urlsplit(uri).hostname if uri.startswith(("http://", "https://")) else None
-    return h or ("ures" if not uri else "egyeb")
-
-
-def gateway_urls(uri):
-    """a letoltheto URL-ek sorrendben; IPFS-nel tobb atjaro (ipfs.io gyakran 429-et ad)"""
-    uri = str(uri or "").strip()
-    m = (re.match(r"^ipfs://(?:ipfs/)?([A-Za-z0-9]{46,100})(/[\w.\-/]*)?$", uri)
-         or re.match(r"^https://[^/?#]+/ipfs/([A-Za-z0-9]{46,100})(/[\w.\-/]*)?(?:[?#].*)?$", uri))
-    if m:
-        gws = [g.strip() for g in (os.getenv("PAPER_SNIPER_IPFS") or "").split(",") if g.strip().startswith("https://")] or IPFS_GATEWAYS
-        return [g if g.endswith("/") else g + "/" for g in gws], m.group(1) + (m.group(2) or "")
-    m = re.match(r"^https://(?:www\.)?arweave\.net/([A-Za-z0-9_\-]{43})(/[\w.\-/]*)?(?:[?#].*)?$", uri)
-    if m:
-        return ["https://arweave.net/"], m.group(1) + (m.group(2) or "")
-    hosts = {h.strip().lower() for h in (os.getenv("PAPER_SNIPER_META_HOSTS") or "").split(",") if h.strip()}
-    sp = urllib.parse.urlsplit(uri)
-    if sp.scheme == "https" and sp.hostname and sp.hostname.lower() in hosts and sp.port in (None, 443):
-        return [""], uri
-    return [], None
-
-
-def fetch_meta(uri, timeout=6):
-    """(json | None, hiba-ok)"""
-    gws, path = gateway_urls(uri)
-    if not gws:
-        return None, "nem_tamogatott_uri"
-    err = "?"
-    for g in gws:
-        req = urllib.request.Request(g + path, headers={"User-Agent": "paper-sniper/1.0", "Accept": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                raw = r.read(200_001)
-        except urllib.error.HTTPError as e:
-            err = f"http_{e.code}"
-            if e.code in (404, 410):
-                break                                 # a tartalom nincs meg, masik atjaro sem segit
+def dex_prices(mints):
+    """graduacio utani SOL-ar mintenkent a DexScreener nyilvanos API-jabol (30-asaval); {mint: ar}"""
+    out = {}
+    for i in range(0, len(mints), 30):
+        chunk = [m for m in mints[i:i + 30] if BASE58.match(m)]
+        if not chunk:
             continue
-        except Exception as e:
-            err = "timeout" if "timed out" in str(e) else type(e).__name__
-            continue
-        if len(raw) > 200_000:
-            return None, "tul_nagy"
-        try:
-            j = json.loads(raw)
-        except ValueError:
-            return None, "nem_json"
-        return (j, "") if isinstance(j, dict) else (None, "nem_objektum")
-    return None, err
-
-
-def link_kinds(j):
-    """csak azt nezzuk, milyen linkek vannak; megnyitni nem nyitjuk meg oket"""
-    has_tg = has_x = has_web = False
-    for o in (j, j.get("extensions") or {}):
-        if not isinstance(o, dict):
-            continue
-        for k in ("twitter", "x", "telegram", "website"):
-            v = o.get(k)
-            if not isinstance(v, str) or not v.strip():
-                continue
-            v = v.strip().lower()
-            if k == "telegram" and ("t.me/" in v or "telegram.me/" in v or re.match(r"^@?[a-z0-9_]{5,64}$", v)):
-                has_tg = True
-            elif k in ("twitter", "x") and ("x.com/" in v or "twitter.com/" in v or re.match(r"^@?[a-z0-9_]{1,15}$", v)):
-                has_x = True
-            elif k == "website" and v.startswith("http"):
-                has_web = True
-    return has_tg, has_x, has_web
+        req = urllib.request.Request("https://api.dexscreener.com/tokens/v1/solana/" + ",".join(chunk),
+                                     headers={"User-Agent": "paper-sniper/1.0", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            pairs = json.loads(r.read(2_000_001))
+        best = {}
+        for pr in pairs if isinstance(pairs, list) else []:
+            base, quote = (pr.get("baseToken") or {}).get("address"), (pr.get("quoteToken") or {}).get("address")
+            px, liq = fnum(pr.get("priceNative")), fnum((pr.get("liquidity") or {}).get("usd"))
+            if base in chunk and quote == WSOL and px > 0 and liq >= best.get(base, (0, -1))[1]:
+                best[base] = (px, liq)
+        out.update({m: v[0] for m, v in best.items()})
+    return out
 
 
 # ---------------------------------------------------------------- a szimulator
@@ -445,30 +309,27 @@ class Sniper:
         self.tp = cfg("PAPER_SNIPER_TP_X", 2.0)
         self.sl = cfg("PAPER_SNIPER_SL_X", 0.5)
         self.max_hold = cfg("PAPER_SNIPER_MAX_HOLD_MIN", 30.0) * 60
-        self.sample = cfg("PAPER_SNIPER_SAMPLE", 0.02)
         self.max_open = cfg("PAPER_SNIPER_MAX_OPEN", 120, int)
-        ex_only = [e.strip() for e in (os.getenv("PAPER_SNIPER_EXITS") or "").split(",") if e.strip()]
-        self.exits = {k: dict(v) for k, v in EXITS.items() if k == "alap" or not ex_only or k in ex_only}
+        self.exits = {k: dict(v) for k, v in EXITS.items()}
         self.exits["alap"] = {"tp": self.tp, "sl": self.sl, "max": self.max_hold / 60}
+        self.amm_fee = cfg("PAPER_SNIPER_AMM_FEE_BPS", 30.0) / 1e4
+        self.dex_px = {}                                     # mint -> (SOL-ar graduacio utan, ido)
+        self.dex_last = 0.0
         self.poll = cfg("PAPER_SNIPER_POLL_SEC", 10.0)
         only = [s.strip() for s in (os.getenv("PAPER_SNIPER_STRATS") or "").split(",") if s.strip()]
         self.strats = [s for s in STRAT_DESC if not only or s in only]
         st = read_json(STATE_FILE, {})
         self.positions = st.get("positions", [])            # nyitott szimulalt poziciok
         self.stats = st.get("stats", {"started": time.time()})
-        for k, v in (("seen", 0), ("migrations", 0), ("skipped", {}), ("missed", {}), ("meta_ok", 0), ("meta_fail", 0),
-                     ("meta_drop", 0), ("meta_err", {}), ("meta_hosts", {}), ("entered", {})):
+        for k, v in (("seen", 0), ("migrations", 0), ("skipped", {}), ("missed", {}), ("entered", {})):
             self.stats.setdefault(k, v)
-        self.meta_workers = cfg("PAPER_SNIPER_META_WORKERS", 8, int)
         db = read_json(DB_FILE, {})
         self.creators = db.get("creators", {})               # dev -> {"t": [ido...], "g": graduáltak}
         self.names = db.get("names", {})                     # "n:nev" / "s:ticker" -> [mint, ido]
         self.mint_dev = db.get("mint_dev", {})               # mint -> [dev, ido]  (graduacio hozzarendelese)
-        self.watch = {}                                      # S4 jeloltek: mint -> token
         self.tokens = {}                                     # friss tokenek memoriaban
-        self.meta_q = asyncio.Queue(maxsize=200)
         self.stop = False
-        self.trades_on = cfg("PAPER_SNIPER_TRADES", 1, int) == 1
+        self.trades_on = True                                # a tarca-kovetes alapja
         self.trade_window = cfg("PAPER_SNIPER_TRADE_WINDOW_MIN", 15.0) * 60
         self.smart_n = cfg("PAPER_SNIPER_SMART_MIN_N", 5, int)
         self.smart_win = cfg("PAPER_SNIPER_SMART_MIN_WIN", 0.5)
@@ -482,7 +343,6 @@ class Sniper:
         self.copy_lat = cfg("PAPER_SNIPER_COPY_LAT", 1.0)
         self.copy_n = cfg("PAPER_SNIPER_COPY_MIN_N", 8, int)
         self.led = {}                                        # (mint, kovetett tarca) -> poziciok (masol kiszallas)
-        self.sample_s9 = cfg("PAPER_SNIPER_SAMPLE_S9", 0.1)
         self.sample_s10 = cfg("PAPER_SNIPER_SAMPLE_S10", 0.3)
         self.cluster_min = cfg("PAPER_SNIPER_CLUSTER_MIN", 3, int)
         self.pairs = db.get("pairs", {})                     # "a|b" (rendezve) -> [kozos korai tokenek, utolso ido]
@@ -554,8 +414,7 @@ class Sniper:
         if dev_tok > 1e9:
             dev_tok /= 1e6
         T = {"mint": mint, "curve": curve, "dev": dev, "t": now, "name": str(m.get("name") or "")[:60], "symbol": str(m.get("symbol") or "")[:20],
-             "uri": str(m.get("uri") or "")[:400], "dev_sol": fnum(m.get("solAmount")), "dev_share": dev_tok / 1e9 * 100,
-             "rand": random.random(), "tg": None, "x": None, "web": None, "done": set()}
+             "dev_sol": fnum(m.get("solAmount")), "dev_share": dev_tok / 1e9 * 100, "done": set()}
         if dev:
             c = self.creators.setdefault(dev, {"t": [], "g": 0})
             T["dev_prior"] = sum(1 for x in c["t"] if x > now - 7 * 86400)
@@ -576,29 +435,7 @@ class Sniper:
             for k in sorted(self.tokens, key=lambda k: self.tokens[k]["t"])[:1000]:
                 del self.tokens[k]
 
-        basic = not T["copy"] and T["dev_prior"] < 3
-        birth = basic and 0.5 <= T["dev_sol"] <= 5 and T["dev_share"] < 20
-        T["clean"] = basic and T["dev_prior"] == 0 and 0.5 <= T["dev_sol"] <= 3 and T["dev_share"] < 10
-        if T["rand"] < self.sample:
-            self.enter_later("S0_minta", T, 0)
-        if T["dev_grad"] > 0 and T["dev_prior"] == 0:
-            self.enter_later("S1_dev", T, 0)
-        if T["dev_grad"] > 0 and T["dev_prior"] <= 3 and not T["copy"]:
-            self.enter_later("S1_grad", T, 0)
-        if birth:
-            self.enter_later("S2_gyors", T, 0)
-            self.enter_later("S2_lassu", T, 5)
-        if self.trades_on:
-            self.track(T, m)
-        if basic and any(s in self.strats for s in META_STRATS):
-            h = uri_host(T["uri"])
-            mh = self.stats["meta_hosts"]
-            if h in mh or len(mh) < 50:
-                mh[h] = mh.get(h, 0) + 1
-            try:
-                self.meta_q.put_nowait(T)
-            except asyncio.QueueFull:
-                self.stats["meta_drop"] += 1
+        self.track(T, m)
 
     # ---- kereskedes-kovetes es tarca-adatbazis
     def track(self, T, m):
@@ -609,10 +446,7 @@ class Sniper:
             self.add_px(T, time.time(), vs / vt)
         self.tracked[T["mint"]] = T
         self.sub_q.append(T["mint"])
-        loop = asyncio.get_running_loop()
-        loop.call_later(CLUSTER_SEC, self.eval_cluster, T)
-        if "S7_organikus" in self.strats or "S7_tiszta" in self.strats:
-            loop.call_later(60, self.eval_organic, T)
+        asyncio.get_running_loop().call_later(CLUSTER_SEC, self.eval_cluster, T)
 
     @staticmethod
     def add_px(T, t, px):
@@ -688,6 +522,9 @@ class Sniper:
             if w != T["dev"] and self.is_copyable(w):
                 T["leaders"].setdefault("S8_masol", w)
                 self.enter_later("S8_masol", T, self.copy_lat)
+            if (vs - V0_SOL >= 0.5 * GRAD_SOL and T.get("clustered") is False and not T["copy"]
+                    and len(T["buyers"]) >= 25 and T["n_sell"] < 0.7 * T["n_buy"]):
+                self.enter_later("S12_futtat", T, self.copy_lat)   # tapadas: gorbe >= 50%, tiszta, sok vevo
         else:
             rec[1] += sol
             rec[2] = max(0.0, rec[2] - tok)
@@ -738,25 +575,9 @@ class Sniper:
                 pr[1] = round(now)
         if not T["copy"]:
             if T["clustered"]:
-                T["leaders"]["S9_klaszteres"] = T["insiders"]
                 T["leaders"]["S10_bennfentes"] = T["insiders"]
                 if random.random() < self.sample_s10:
                     self.enter_later("S10_bennfentes", T, self.copy_lat)
-            if T["clustered"] and T["rand"] < self.sample_s9:
-                asyncio.get_running_loop().call_later(10 - CLUSTER_SEC, self.enter_later, "S9_klaszteres", T, 0)
-            elif not T["clustered"] and T["rand"] < self.sample_s9:
-                asyncio.get_running_loop().call_later(10 - CLUSTER_SEC, self.enter_later, "S9_klaszter_nelkul", T, 0)
-
-    def eval_organic(self, T):
-        if self.tracked.get(T["mint"]) is not T or T["copy"]:
-            return
-        T["org"] = {"buyers": len(T["buyers"]), "early": T["early_tok"] / TOTAL_SUPPLY * 100,
-                    "sell_ratio": T["n_sell"] / max(1, T["n_buy"])}
-        if (len(T["buyers"]) >= 15 and T["early_tok"] / TOTAL_SUPPLY < 0.15 and T["dev_share"] < 10
-                and not T["dev_sold"] and T["n_sell"] < 0.6 * T["n_buy"]):
-            self.enter_later("S7_organikus", T, 0)
-            if T.get("clustered") is False:           # csak ha megvolt a klaszter-elemzes, es tiszta
-                self.enter_later("S7_tiszta", T, 0)
 
     def finalize_tracked(self, force=False):
         """a lejart kovetesi ablakok elszamolasa a tarca-adatbazisba, es leiratkozas"""
@@ -867,7 +688,7 @@ class Sniper:
         self.positions.append({"strat": strat, "mint": T["mint"], "curve": T["curve"], "name": T["name"], "symbol": T["symbol"],
                                "t_open": time.time(), "born": T["t"], "latency": round(time.time() - T["t"], 2),
                                "entry_vsol": c["vsol"] / 1e9, "tokens": tokens, "net_lam": lam * (1 - self.fee),
-                               "cost": self.size + self.prio, "last": c, "miss": 0, "exits": self.new_exits()})
+                               "cost": self.size + self.prio, "last": c, "miss": 0, "exits": self.new_exits(strat)})
         if leaders:
             p = self.positions[-1]
             p["leader"], p["leaders"] = leaders[0], leaders
@@ -876,36 +697,14 @@ class Sniper:
             if sold:
                 p["leader_sold"] = time.time()          # a kovetett tarca mar a belepes elott elkezdett eladni
 
-    def new_exits(self):
-        return {k: {"peak": 0.0, "rem": 1.0, "got": 0.0, "part": False} for k in self.exits}
+    def new_exits(self, strat=""):
+        names = ["alap"] if strat == "S12_futtat" else list(self.exits)
+        return {k: {"peak": 0.0, "rem": 1.0, "got": 0.0, "part": False} for k in names}
 
-    # ---- metaadat-feldolgozok
-    async def meta_worker(self):
-        while not self.stop:
-            T = await self.meta_q.get()
-            if time.time() - T["t"] > 120:
-                self.stats["meta_drop"] += 1
-                continue
-            try:
-                j, err = await asyncio.to_thread(fetch_meta, T["uri"])
-            except Exception as e:
-                j, err = None, type(e).__name__
-            if not j:
-                self.stats["meta_fail"] += 1
-                me = self.stats["meta_err"]
-                if err in me or len(me) < 30:
-                    me[err] = me.get(err, 0) + 1
-                continue
-            self.stats["meta_ok"] += 1
-            T["tg"], T["x"], T["web"] = link_kinds(j)
-            if T["tg"] and T["x"]:
-                self.enter_later("S3_linkek", T, 2)
-            if T.get("clean") and (T["tg"] or T["x"]):
-                self.enter_later("S5_tiszta", T, 0)
-            if (T["tg"] or T["x"]) and "S4_lendulet" in self.strats:
-                self.watch[T["mint"]] = T
+    def rule(self, p, name):
+        return S12_RULE if p["strat"] == "S12_futtat" and name == "alap" else self.exits.get(name)
 
-    # ---- gorbe-lekerdezes: kiszallasok + S4 lendulet
+    # ---- gorbe-lekerdezes: kiszallasok
     async def poll_loop(self):
         while not self.stop:
             await asyncio.sleep(self.poll)
@@ -920,9 +719,15 @@ class Sniper:
 
     async def poll_once(self):
         now = time.time()
-        for k in [k for k, T in self.watch.items() if now - T["t"] > 180]:
-            del self.watch[k]
-        keys = list(dict.fromkeys([p["curve"] for p in self.positions] + [T["curve"] for T in self.watch.values()]))
+        amm = [p["mint"] for p in self.positions if p.get("amm")]
+        if amm and now - self.dex_last >= 30:
+            self.dex_last = now
+            try:
+                for mint, px in (await asyncio.to_thread(dex_prices, list(dict.fromkeys(amm)))).items():
+                    self.dex_px[mint] = (px, now)
+            except Exception as e:
+                log(f"DexScreener hiba: {e}")
+        keys = list(dict.fromkeys(p["curve"] for p in self.positions if not p.get("amm")))
         curves = {}
         for i in range(0, len(keys), 100):
             chunk = keys[i:i + 100]
@@ -934,29 +739,37 @@ class Sniper:
                         curves[k] = c
             except Exception as e:
                 log(f"getMultipleAccounts hiba: {e}")
-        for mint, T in list(self.watch.items()):
-            c = curves.get(T["curve"])
-            if c and not c["done"] and c["rsol"] / 1e9 >= 0.3 * GRAD_SOL:
-                del self.watch[mint]
-                self.enter_later("S4_lendulet", T, 2)
         keep = []
         for p in self.positions:
-            c = curves.get(p["curve"])
+            c = p["last"] if p.get("amm") else curves.get(p["curve"])
             if c is None:
                 p["miss"] += 1
                 c = p["last"]
             done = bool(c["done"])
             if done and (c["vsol"] <= 0 or c["vtok"] <= 0):
                 c = dict(p["last"], done=True)       # graduacio utan a gorbe kiurul: az utolso ismert allapot
+            if done and p["strat"] == "S12_futtat" and not p.get("amm"):
+                p["amm"], p["grad_t"] = True, now     # S12: graduacio utan is tartjuk, az AMM-en
             own = p.get("net_lam", self.size * 1e9 * (1 - self.fee))   # regi allapotfajlban meg nincs
+            dex = self.dex_px.get(p["mint"]) if p.get("amm") else None
+            if p.get("amm"):
+                done = False                          # nem zarunk graduacional
+                if dex and now - dex[1] < 300:
+                    p["miss"] = 0
+                elif now - p.get("grad_t", now) > 120:
+                    p["miss"] += 1                    # nincs friss DexScreener-ar
 
             def sell_part(frac):
+                if p.get("amm"):
+                    if dex:
+                        return p["tokens"] / 1e6 * frac * dex[0] * (1 - self.amm_fee) - self.prio
+                    return sell_sol(dict(c, done=True), p["tokens"] * frac, self.fee, cap_real=False) / 1e9 - self.prio
                 return sell_sol(c, p["tokens"] * frac, self.fee, cap_real=not done, own_lam=own * frac) / 1e9 - self.prio
             ratio = sell_part(1.0) / p["cost"] if p["cost"] else 0    # a teljes pozicio erteke / koltseg
             hold = now - p["t_open"]
-            exits = p.setdefault("exits", self.new_exits())           # regi allapotfajl: minden valtozat most indul
+            exits = p.setdefault("exits", self.new_exits(p["strat"]))  # regi allapotfajl: minden valtozat most indul
             for name in list(exits):
-                e, rule = exits[name], self.exits.get(name)
+                e, rule = exits[name], self.rule(p, name)
                 if rule is None or (rule.get("leader") and not p.get("leader")):
                     del exits[name]                    # nincs ilyen valtozat / nincs kovetett tarca
                     continue
@@ -976,17 +789,19 @@ class Sniper:
                     reason = "SL" if not e["part"] else "reszl+SL"
                 elif rule.get("leader") and p.get("leader_sold") and now - p["leader_sold"] >= self.copy_lat:
                     reason = "masol"
-                elif rule.get("trail_x") and e["peak"] >= rule["trail_x"] and ratio <= e["peak"] * (1 - rule["trail_drop"]):
+                elif rule.get("trail_drop") and e["peak"] >= rule.get("trail_x", 0) and ratio <= e["peak"] * (1 - rule["trail_drop"]):
                     reason = "trail"
                 elif hold >= rule.get("max", 30) * 60:
                     reason = "ido"
-                elif p["miss"] >= 30:
+                elif p["miss"] >= (180 if p.get("amm") else 30):
                     reason = "nincs adat"
                 if reason:
+                    if p.get("amm") and reason != "nincs adat":
+                        reason += "+amm"                  # graduacio utan zarva
                     value = e["got"] + (sell_part(e["rem"]) if e["rem"] > 1e-9 else 0.0)
                     self.close(p, c, value, reason, now, name)
                     del exits[name]
-            if not done:
+            if not done and not p.get("amm"):
                 p["last"] = c
             if exits:
                 keep.append(p)
@@ -1111,8 +926,7 @@ class Sniper:
                                          "copyable": self.copyable_count()}
             if n % 10 == 0:                      # idosor a Telegram-jelentes ablakaihoz (48 ora)
                 h = self.stats.setdefault("hist", [])
-                h.append([round(time.time()), self.stats["seen"], self.stats["migrations"], self.stats["meta_ok"],
-                          self.stats["meta_fail"] + self.stats["meta_drop"], self.rpc.calls, self.rpc.errors])
+                h.append([round(time.time()), self.stats["seen"], self.stats["migrations"], 0, 0, self.rpc.calls, self.rpc.errors])
                 del h[:-288]
             self.save(db=(n % 10 == 0))          # allapot percenkent, a (nagyobb) dev-adatbazis 10 percenkent
             open_ = len(self.positions)
@@ -1120,7 +934,7 @@ class Sniper:
 
     async def main(self):
         log(f"Paper sniper indul. Strategiak: {', '.join(self.strats)}. Tetel {self.size} SOL, dij {self.fee*100:.2f}%/irany, prio {self.prio} SOL/tx, "
-            f"TP {self.tp}x, SL {self.sl}x, max {self.max_hold/60:.0f} perc, kiszallasok: {', '.join(self.exits)}. RPC: {urllib.parse.urlsplit(self.rpc.url).netloc}")
+            f"TP {self.tp}x, SL {self.sl}x, max {self.max_hold/60:.0f} perc, AMM-dij {self.amm_fee*100:.2f}%. RPC: {urllib.parse.urlsplit(self.rpc.url).netloc}")
         telegram("Paper sniper indul (valodi penz nelkul)")
         self.t_start = time.time()
         loop = asyncio.get_running_loop()
@@ -1130,7 +944,6 @@ class Sniper:
             except NotImplementedError:
                 pass
         tasks = [asyncio.create_task(self.ws_loop()), asyncio.create_task(self.poll_loop()), asyncio.create_task(self.periodic())]
-        tasks += [asyncio.create_task(self.meta_worker()) for _ in range(max(1, self.meta_workers))]
         try:
             while not self.stop:
                 await asyncio.sleep(1)
@@ -1154,22 +967,9 @@ def sim_costs():
     return cfg("PAPER_SNIPER_FEE_BPS", 125.0) / 1e4, cfg("PAPER_SNIPER_PRIO_SOL", 0.001)
 
 
-def fixed_rows(rows):
-    """a sorok ujraszamolva a javitott elszamolassal (sajat SOL a kiurult gorbeben); (sorok, kihagyott db)"""
-    fee, prio = sim_costs()
-    out, bad = [], 0
-    for r in rows:
-        if "~" in r.get("strat", ""):
-            out.append(r)                        # kiszallasi valtozat: mar javitott, es lehet reszleges eladas
-            continue
-        v = recompute_value(r, fee, prio, fixed=True)
-        cost = fnum(r.get("cost_sol"))
-        if v is None or cost <= 0:
-            bad += 1
-            continue
-        r = dict(r, proceeds_sol=f"{v:.6f}", pnl_sol=f"{v - cost:.6f}", ret_pct=f"{(v - cost) / cost * 100:.2f}")
-        out.append(r)
-    return out, bad
+def active_rows(rows):
+    """csak a mostani strategiak sorai (a regi, kivezetett strategiak a CSV-ben maradnak)"""
+    return [r for r in rows if split_strat(r.get("strat", ""))[0] in STRAT_DESC]
 
 
 def pct(xs, q):
@@ -1224,18 +1024,13 @@ def exit_compare(rows, compact=False):
     return lines if len(lines) > 1 else []
 
 
-def report_text(short=False, fixed=False):
-    rows = load_trades()
+def report_text(short=False):
+    rows = active_rows(load_trades())
     st = read_json(STATE_FILE, {}).get("stats", {})
     lines = []
     if st:
         days = max(1e-9, (time.time() - st.get("started", time.time())) / 86400)
         lines.append(f"Futasi ido: {days:.1f} nap, latott token: {st.get('seen', 0)}, graduacio (esemeny): {st.get('migrations', 0)}")
-    if fixed and rows:
-        rows, bad = fixed_rows(rows)
-        fee, prio = sim_costs()
-        lines.append(f"JAVITOTT ujraszamolas (dij {fee*100:.2f}%/irany, prio {prio} SOL/tx): a kiurult gorben a sajat SOL-unk is"
-                     f" visszajar." + (f" Nem szamolhato sor: {bad}." if bad else ""))
     if not rows:
         lines.append("Meg nincs lezart szimulalt pozicio.")
         return "\n".join(lines)
@@ -1274,7 +1069,7 @@ def report_text(short=False, fixed=False):
         if grad:
             g_pnl = sum(float(r["pnl_sol"]) for r in xs if r["graduated"] == "1")
             ng = [float(r["ret_pct"]) for r in xs if r["graduated"] != "1"]
-            lines.append(f"  ebbol a graduáltakon: {g_pnl:+.4f} SOL (OPTIMISTA: a gorbe vegso aran szamolva)")
+            lines.append(f"  ebbol graduacional zarva: {g_pnl:+.4f} SOL (OPTIMISTA: a gorbe vegso aran szamolva)")
             if ng:
                 lines.append(f"  graduáltak nelkul: atlag {sum(ng)/len(ng):+.1f}% / pozicio (n={len(ng)})")
     sk, mi = st.get("skipped", {}), st.get("missed", {})
@@ -1288,8 +1083,8 @@ def report_text(short=False, fixed=False):
         lines += cmp_
     if not short:
         lines.append("")
-        lines.append("Olvasat: legalabb 30 pozicio kell strategiankent. Csak akkor van eselye egy eles valtozatnak, ha az atlag a")
-        lines.append("hibahatarral egyutt is pozitiv, ES a graduáltak nelkul sem negativ (azok eladasa optimista).")
+        lines.append("Olvasat: legalabb 100 pozicio kell strategiankent (S12-nel tobb, nagy a szoras). Csak az szamit, ami a")
+        lines.append("hibahatarral egyutt is pozitiv; utana egy friss idoszakon is igazolni kell (docs/KISERLETEK.md).")
     return "\n".join(lines)
 
 
@@ -1320,19 +1115,13 @@ def telegram_report(hours=2.0):
     # ablak: a 10 percenkenti idosorbol (a legkorabbi pont az ablak elejen vagy utana)
     hist = [h for h in s.get("hist", []) if len(h) >= 7]
     base = next((h for h in hist if h[0] >= since - 300), None)
-    cur = [now, s.get("seen", 0), s.get("migrations", 0), s.get("meta_ok", 0), s.get("meta_fail", 0) + s.get("meta_drop", 0)]
+    cur = [now, s.get("seen", 0), s.get("migrations", 0)]
     if base and cur[1] >= base[1]:
         span = max(1e-9, (now - base[0]) / 3600)
         seen, mig = cur[1] - base[1], cur[2] - base[2]
-        mok, mbad = cur[3] - base[3], cur[4] - base[4]
-        if mok < 0 or mbad < 0:                  # szamlalo-valtas (regi allapotfajl): ne mutassunk hamis aranyt
-            mok = mbad = 0
-        out.append(f"Elmult {span:.1f} ora: {seen} uj token ({seen / span:.0f}/ora), {mig} graduacio"
-                   + (f", metaadat {mok / (mok + mbad) * 100:.0f}% ok" if mok + mbad else ""))
+        out.append(f"Elmult {span:.1f} ora: {seen} uj token ({seen / span:.0f}/ora), {mig} graduacio")
         if seen == 0:
             warn.append("nem jott uj token az ablakban (PumpPortal WebSocket?)")
-        if mok + mbad >= 20 and mok / (mok + mbad) < 0.5:
-            warn.append(f"metaadat csak {mok / (mok + mbad) * 100:.0f}% (S3/S4/S5 alig lep be)")
     else:
         out.append(f"Osszesen eddig: {s.get('seen', 0)} token, {s.get('migrations', 0)} graduacio (ablak-adat meg nincs)")
     wst = s.get("wallets")
@@ -1344,13 +1133,13 @@ def telegram_report(hours=2.0):
                    f" kovetett token {wst.get('tracked', 0)},"
                    f" kereskedes-uzenet {s.get('trade_msgs', 0)}")
         if s.get("trade_msgs", 0) == 0:
-            warn.append("nem jon kereskedes-uzenet (S6/S7 es a tarca-adatbazis nem tanul)")
+            warn.append("nem jon kereskedes-uzenet (a tarca-adatbazis nem tanul)")
     rpc = s.get("rpc") or {}
     if rpc.get("calls", 0) >= 100 and rpc.get("errors", 0) / rpc["calls"] > 0.1:
         warn.append(f"RPC hibaarany {rpc['errors'] / rpc['calls'] * 100:.0f}%")
 
-    all_rows = load_trades()
-    rows = base_rows(all_rows)                   # az osszesitok az alap kiszallassal; a valtozatok kulon
+    all_rows = active_rows(load_trades())
+    rows = base_rows(all_rows)                   # az osszesitok az alap kiszallassal; a masol kulon
     win = [r for r in rows if fnum(r.get("ts_close")) >= since]
     if win:
         w = strat_stats(win)
@@ -1380,7 +1169,7 @@ def telegram_report(hours=2.0):
         out.append(f"Ossz: {tot['n']} poz., PnL {tot['pnl']:+.3f} SOL ({tot['mean']:+.1f}%/poz.)")
         pos_ = [k for k in by if len(by[k]) >= 30 and strat_stats(by[k])["verdict"] == "+"]
         if pos_:
-            out.append("Statisztikailag pozitiv: " + ", ".join(pos_) + " (a graduáltak eladasa optimista!)")
+            out.append("Statisztikailag pozitiv: " + ", ".join(pos_) + " -> friss idoszakon is igazolni kell")
 
     cmp_ = exit_compare(all_rows, compact=True)
     if cmp_:
@@ -1601,7 +1390,7 @@ def wallets_report():
 
 
 def diag():
-    """mi torzithatja az eredmenyt: kiszallasi okok, kiurult gorbek, a modell egyezese, metaadat, RPC"""
+    """allapot, RPC, belepesek, tarca-kovetes, bennfentes-klaszterek"""
     fee, prio = sim_costs()
     st = read_json(STATE_FILE, {})
     s = st.get("stats", {})
@@ -1627,18 +1416,7 @@ def diag():
     for k in sorted(set(ent) | set(sk) | set(mi) | set(STRAT_DESC), key=strat_order):
         print(f"  {k:12s} {ent.get(k, '-')!s:>6} / {sk.get(k, 0):>5} / {mi.get(k, 0):>5}")
 
-    print("\n== Metaadat")
-    ok, fail, drop = s.get("meta_ok", 0), s.get("meta_fail", 0), s.get("meta_drop", 0)
-    tot = ok + fail + drop
-    print(f"ok {ok}  hiba {fail}  eldobva {drop}" + (f"  -> sikeres {ok / tot * 100:.0f}%" if tot else ""))
-    for name, key in (("hibaokok", "meta_err"), ("URI-hosztok", "meta_hosts")):
-        d = s.get(key) or {}
-        if d:
-            print(f"  {name}: " + ", ".join(f"{k} {v}" for k, v in sorted(d.items(), key=lambda kv: -kv[1])[:12]))
-    if tot and ok / tot < 0.5:
-        print("  FIGYELEM: a metaadat tobbnyire nem jon le -> S3/S4/S5 alig lep be. Lasd PAPER_SNIPER_IPFS / META_HOSTS.")
-
-    print("\n== Tarca-kovetes (S6/S7)")
+    print("\n== Tarca-kovetes (S6/S8/S10)")
     wst = s.get("wallets") or {}
     print(f"kereskedes-uzenet: {s.get('trade_msgs', 0)}  hibas: {s.get('trade_bad', 0)}  elszamolt tarca-pozicio: {s.get('wallet_closes', 0)}"
           f"  kovetett token most: {wst.get('tracked', '-')}")
@@ -1664,7 +1442,7 @@ def diag():
     for k, c in strong[:5]:
         a, b = k.split("|")
         print(f"  {a[:6]}..{a[-4:]} + {b[:6]}..{b[-4:]}: {c} tokenben egyutt korai")
-    print("  (a hatast az S9_klaszter_nelkul / S9_klaszteres es az S7_tiszta / S7_organikus osszevetese mutatja)")
+    print("  (a bennfentesek kovetesenek eredmenye: S10_bennfentes es S10_bennfentes~masol)")
 
     pos = st.get("positions", [])
     if pos:
@@ -1672,37 +1450,16 @@ def diag():
         print(f"\n== Nyitott poziciok: {len(pos)}, legregebbi {max(now - p['t_open'] for p in pos) / 60:.0f} perc,"
               f" adat nelkul (miss>0): {sum(1 for p in pos if p.get('miss'))}")
 
-    all_rows = load_trades()
-    rows = base_rows(all_rows)
-    print(f"\n== Lezart poziciok: {len(rows)} (alap kiszallas; a valtozatokkal egyutt {len(all_rows)} sor)")
-    if not rows:
-        return
-    diffs, by = [], {}
+    rows = base_rows(active_rows(load_trades()))
+    print(f"\n== Lezart poziciok (alap kiszallas): {len(rows)}")
+    by = {}
     for r in rows:
-        old = recompute_value(r, fee, prio, fixed=False)
-        new = recompute_value(r, fee, prio, fixed=True)
-        if old is not None:
-            diffs.append(abs(old - fnum(r.get("proceeds_sol"))))
-        by.setdefault(r["strat"], []).append((r, old, new))
-    if diffs:
-        md = pct(diffs, .5)
-        print(f"modell-ellenorzes: a CSV-bol ujraszamolt regi ertek elterese a rogzitettol: median {md:.6f}, p90 {pct(diffs, .9):.6f} SOL"
-              + ("  (rendben)" if md < 1e-3 else "  (ELTER: nem szabvanyos gorbe vagy mas dij/prio a futas alatt -> a --javitott pontatlan)"))
-    print("\nstrat         n   kiurult  -90%alatt   atlag regi -> javitott   kiszallasok")
+        by.setdefault(r["strat"], []).append(r)
     for k in sorted(by, key=strat_order):
-        xs = by[k]
-        n = len(xs)
-        empty = sum(1 for r, _, _ in xs if r["graduated"] != "1" and fnum(r["exit_vsol"]) - V0_SOL < 1.0)
-        deep = sum(1 for r, _, _ in xs if fnum(r["ret_pct"]) <= -90)
-        o = [fnum(r["ret_pct"]) for r, _, _ in xs]
-        nw = [(v - fnum(r["cost_sol"])) / fnum(r["cost_sol"]) * 100 for r, _, v in xs if v is not None and fnum(r["cost_sol"]) > 0]
         reasons = {}
-        for r, _, _ in xs:
+        for r in by[k]:
             reasons[r["reason"]] = reasons.get(r["reason"], 0) + 1
-        print(f"  {k:11s} {n:4d}   {empty:5d}    {deep:5d}      {sum(o)/n:+6.1f}% -> {(sum(nw)/len(nw) if nw else float('nan')):+6.1f}%    "
-              + ", ".join(f"{a} {b}" for a, b in sorted(reasons.items(), key=lambda kv: -kv[1])))
-    print("\nkiurult = nem graduált, es a kilepeskor < 1 SOL valodi SOL maradt a gorbeben (itt torzitott a regi elszamolas).")
-    print("-90%alatt = a rogzitett (regi) hozam -90% vagy rosszabb.")
+        print(f"  {k:15s} {len(by[k]):5d}  " + ", ".join(f"{a} {b}" for a, b in sorted(reasons.items(), key=lambda kv: -kv[1])))
 
 
 def status():
@@ -1711,7 +1468,7 @@ def status():
     s = st.get("stats", {})
     saved = st.get("saved")
     print(f"utolso mentes: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(saved)) if saved else '-'}")
-    print(f"latott token: {s.get('seen', 0)}   graduacio: {s.get('migrations', 0)}   metaadat ok/hiba/eldobva: {s.get('meta_ok', 0)}/{s.get('meta_fail', 0)}/{s.get('meta_drop', 0)}")
+    print(f"latott token: {s.get('seen', 0)}   graduacio: {s.get('migrations', 0)}   kereskedes-uzenet: {s.get('trade_msgs', 0)}")
     by = {}
     for p in pos:
         by[p["strat"]] = by.get(p["strat"], 0) + 1
@@ -1724,7 +1481,6 @@ def status():
 def main():
     ap = argparse.ArgumentParser(description="pump.fun papir-sniper (valodi penz nelkul)")
     ap.add_argument("cmd", choices=["run", "report", "status", "diag", "wallets", "reset"])
-    ap.add_argument("--javitott", action="store_true", help="report: a lezart sorok ujraszamolasa a javitott elszamolassal")
     ap.add_argument("--telegram", action="store_true", help="report: tomor jelentes a Telegram-vezerlonek")
     ap.add_argument("--kiszallas", action="store_true", help="report: a kiszallasi valtozatok parositott osszevetese")
     ap.add_argument("--ora", type=float, default=2.0, help="report --telegram: az ablak hossza oraban")
@@ -1732,9 +1488,9 @@ def main():
     load_env()
     if a.cmd == "report":
         if a.kiszallas:
-            print("\n".join(exit_compare(load_trades())) or "Meg nincs lezart kiszallasi valtozat.")
+            print("\n".join(exit_compare(active_rows(load_trades()))) or "Meg nincs lezart masol-pozicio.")
             return
-        print(telegram_report(a.ora) if a.telegram else report_text(fixed=a.javitott))
+        print(telegram_report(a.ora) if a.telegram else report_text())
         return
     if a.cmd == "diag":
         diag()
