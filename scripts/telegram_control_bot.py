@@ -19,6 +19,7 @@ Konfig (config/live.env, .env):
 """
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ import re
 import subprocess
 import sys
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -45,6 +47,14 @@ REPORT_STATE_FILE = STATE_DIR / "telegram_control_report.json"
 POLL_TIMEOUT_SECONDS = 25
 SERVICE_CHECK_SECONDS = 60
 MAX_MESSAGE_LEN = 3800
+MAX_EXPORT_BYTES = 45 * 1024 * 1024          # a Telegram bot API 50 MB-os feltoltesi korlatja alatt
+# csak ezek a fajlok kerulhetnek az exportba (kulcsot nem tartalmaznak; a .env soha)
+EXPORT_FILES = [
+    "state/paper_sniper_trades.csv",
+    "state/paper_sniper_state.json",
+    "state/paper_carry_log.csv",
+    "state/paper_carry_state.json",
+]
 logger = logging.getLogger(__name__)
 
 BOT_COMMANDS = [
@@ -62,6 +72,8 @@ BOT_COMMANDS = [
     {"command": "start_sniper", "description": "Sniper indítása"},
     {"command": "start_carry", "description": "Carry indítása"},
     {"command": "pull", "description": "Git pull + papír-szolgáltatások újraindítása"},
+    {"command": "version", "description": "Futó kódverzió, lemaradás a GitHubhoz képest"},
+    {"command": "export", "description": "Adatfájlok + diag egy zip-ben"},
     {"command": "menu", "description": "Gombos menü"},
     {"command": "help", "description": "Parancslista"},
 ]
@@ -78,6 +90,8 @@ HELP_TEXT = """🤖 PAPÍR-BOTOK VEZÉRLÉSE (valódi pénz nélkül)
 ⏸ /stop_sniper, /stop_carry - leállítás (megerősítéssel)
 ▶️ /start_sniper, /start_carry - indítás
 ⬇️ /pull - git pull --rebase + papír-szolgáltatások újraindítása
+📦 /version - melyik kód fut, van-e telepítetlen PR, kell-e újraindítás
+📤 /export - CSV-k, állapotfájlok és diag egy zip-ben (elemzéshez)
 🧭 /menu - gombos menü
 
 Rendszeres jelentés: {interval}. Riasztás, ha egy szolgáltatás leáll."""
@@ -139,6 +153,20 @@ def send_message(token: str, chat_id: str, text: str, reply_markup: dict[str, An
             logger.warning("sendMessage hiba: %s", type(exc).__name__)
             return False
     return True
+
+
+def send_document(token: str, chat_id: str, filename: str, data: bytes, caption: str = "") -> bool:
+    try:
+        requests.post(
+            telegram_api(token, "sendDocument"),
+            data={"chat_id": chat_id, "caption": caption[:1000]},
+            files={"document": (filename, data)},
+            timeout=120,
+        ).raise_for_status()
+        return True
+    except requests.exceptions.RequestException as exc:
+        logger.warning("sendDocument hiba: %s", type(exc).__name__)
+        return False
 
 
 def answer_callback(token: str, callback_query_id: str, text: str = "") -> None:
@@ -245,9 +273,112 @@ def status_text() -> str:
     return "\n".join(lines)
 
 
+def git_out(*args: str, timeout: int = 30) -> str:
+    rc, out = run_cmd(["git", *args], timeout=timeout)
+    return out.strip() if rc == 0 else ""
+
+
+def service_start_epoch(unit: str) -> float | None:
+    _, out = run_cmd(["systemctl", "show", unit, "-p", "ActiveEnterTimestampMonotonic", "--value"], timeout=10)
+    try:
+        mono = int(out.strip()) / 1e6
+    except ValueError:
+        return None
+    if mono <= 0:
+        return None
+    return time.time() - (time.monotonic() - mono)
+
+
+SERVICE_SCRIPTS = {"sniper": "scripts/paper_sniper", "carry": "scripts/paper_carry"}
+
+
+def version_info(fetch: bool = True) -> dict[str, Any]:
+    """futó commit, lemaradás az origin/main-hez, helyi commitok, és mely szolgáltatás fut régebbi kóddal"""
+    if fetch:
+        run_cmd(["git", "fetch", "-q", "origin", "main"], timeout=45)
+    info: dict[str, Any] = {
+        "head": git_out("log", "-1", "--format=%h %cd %s", "--date=format:%Y-%m-%d %H:%M"),
+        "behind": git_out("log", "--format=%h %s", "HEAD..origin/main").splitlines(),
+        "local": git_out("log", "--format=%h %s", "origin/main..HEAD").splitlines(),
+        "stale": [],
+    }
+    prs = []
+    for line in info["behind"]:
+        m = re.search(r"Merge pull request #(\d+)", line)
+        if m:
+            prs.append(f"#{m.group(1)}")
+    info["prs"] = prs
+    for label, unit in services().items():
+        script = PROJECT_ROOT / SERVICE_SCRIPTS[label]
+        started = service_start_epoch(unit) if service_state(unit) == "active" else None
+        if started and script.exists() and script.stat().st_mtime > started + 5:
+            info["stale"].append(label)
+    ctrl_started = service_start_epoch(control_service())
+    if ctrl_started and Path(__file__).resolve().stat().st_mtime > ctrl_started + 5:
+        info["stale"].append("vezérlő")
+    return info
+
+
+def version_text(fetch: bool = True) -> str:
+    v = version_info(fetch)
+    lines = ["📦 KÓDVERZIÓ", f"fut: {v['head'] or '?'}"]
+    if v["behind"]:
+        lines.append(f"⚠️ {len(v['behind'])} új commit a GitHubon" + (f" (PR {', '.join(v['prs'])})" if v["prs"] else "")
+                     + " — telepítés: /pull")
+        lines += [f"  {c}" for c in v["behind"][:8]]
+    else:
+        lines.append("✅ naprakész az origin/main-nel")
+    if v["local"]:
+        lines.append(f"helyi commit (csak a VPS-en): {len(v['local'])}")
+        lines += [f"  {c}" for c in v["local"][:3]]
+    if v["stale"]:
+        lines.append(f"⚠️ régebbi kóddal fut: {', '.join(v['stale'])} — /restart_sniper, /restart_carry vagy /pull")
+    return "\n".join(lines)
+
+
+def version_warning() -> str:
+    """egy sor a rendszeres jelentésbe, csak ha van teendő"""
+    v = version_info(fetch=True)
+    parts = []
+    if v["behind"]:
+        parts.append(f"{len(v['behind'])} telepítetlen commit" + (f" (PR {', '.join(v['prs'])})" if v["prs"] else "") + " — /pull")
+    if v["stale"]:
+        parts.append(f"régebbi kóddal fut: {', '.join(v['stale'])}")
+    return ("⚠️ " + "; ".join(parts)) if parts else f"📦 kód: {v['head'].split(' ')[0] if v['head'] else '?'}, naprakész"
+
+
+def build_export() -> tuple[str, bytes, str]:
+    """zip a papír-adatokkal + diag/riport szövegekkel; (fájlnév, tartalom, felirat)"""
+    buf = io.BytesIO()
+    included, skipped = [], []
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for rel in EXPORT_FILES:
+            path = PROJECT_ROOT / rel
+            if path.is_file():
+                z.write(path, rel)
+                included.append(rel.split("/")[-1])
+            else:
+                skipped.append(rel.split("/")[-1])
+        texts = {
+            "sniper_report.txt": paper_script("paper_sniper", "report"),
+            "sniper_kiszallas.txt": paper_script("paper_sniper", "report", "--kiszallas"),
+            "sniper_diag.txt": paper_script("paper_sniper", "diag"),
+            "carry_report.txt": paper_script("paper_carry", "report"),
+            "version.txt": version_text(fetch=False),
+        }
+        for name, text in texts.items():
+            z.writestr(name, redact_sensitive_output(text))
+    data = buf.getvalue()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    caption = f"📤 Papír-export {stamp}: {', '.join(included) or 'nincs adatfájl'} + diag/riportok"
+    if skipped:
+        caption += f" (hiányzik: {', '.join(skipped)})"
+    return f"paper_export_{stamp}.zip", data, caption
+
+
 def full_report(hours: float) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    parts = [f"📊 PAPÍR-JELENTÉS {now} (ablak: {hours:g} óra)", "", status_text()]
+    parts = [f"📊 PAPÍR-JELENTÉS {now} (ablak: {hours:g} óra)", "", status_text(), version_warning()]
     parts += ["", "🎯 SNIPER (pump.fun)", paper_script("paper_sniper", "report", "--telegram", "--ora", f"{hours:g}")]
     parts += ["", "💰 CARRY (HYPE funding)", paper_script("paper_carry", "telegram", "--ora", f"{hours:g}")]
     return "\n".join(parts)
@@ -297,6 +428,8 @@ def handle_command(text: str, *, confirmed: bool = False) -> tuple[str, dict[str
         return full_report(report_hours()), None
     if command == "/status":
         return status_text(), None
+    if command == "/version":
+        return version_text(), None
     if command == "/sniper":
         return "🎯 SNIPER\n" + paper_script("paper_sniper", "report"), None
     if command == "/diag":
@@ -439,6 +572,18 @@ def handle_update(token: str, chat: str, allowed: set[str], update: dict[str, An
         send_message(token, chat_id, "⏳ git pull --rebase + újraindítás...")
         send_message(token, chat_id, run_pull())
         run_cmd(["systemctl", "restart", "--no-block", control_service()], timeout=15)
+        return
+    if command == "/export":
+        send_message(token, chat_id, "⏳ Export készül...")
+        try:
+            name, data, caption = build_export()
+        except Exception as exc:
+            send_message(token, chat_id, f"❌ Export hiba: {type(exc).__name__}: {clip(str(exc), 300)}")
+            return
+        if len(data) > MAX_EXPORT_BYTES:
+            send_message(token, chat_id, f"❌ Az export túl nagy ({len(data) / 1e6:.1f} MB > {MAX_EXPORT_BYTES / 1e6:.0f} MB).")
+        elif not send_document(token, chat_id, name, data, caption):
+            send_message(token, chat_id, "❌ A fájl küldése nem sikerült (hálózat?).")
         return
     if command == "/report":
         send_message(token, chat_id, "⏳ Jelentés készül...")
