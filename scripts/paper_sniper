@@ -34,6 +34,17 @@ STRATEGIAK
     S5_tiszta    minden szuro egyutt: nem masolat, a dev elso inditasa 7 napon belul,
                  dev-vetel 0.5-3 SOL, dev < 10%, TG vagy X link — a metaadat utan
 
+KISZALLASI VALTOZATOK (ugyanazokon a belepeseken, parhuzamosan)
+  Minden poziciot tobb kiszallasi szabaly szerint is lezarunk; a CSV-ben a strategia
+  neve "S2_gyors" (alap) vagy "S2_gyors~trail". Mivel a belepes azonos, a kulonbseg
+  parositva merheto (report --kiszallas), ami sokkal kisebb mintan is eldontheto.
+    alap    TP / SL / idokorlat a PAPER_SNIPER_TP_X / SL_X / MAX_HOLD_MIN szerint
+    trail   1.3x felett a csucstol 25%-os visszaesesnel ki, SL 0.5x, max 30 perc
+    gyors   TP 1.5x, SL 0.7x, max 3 perc
+    reszl   2x-nel a fele el, a maradek: csucstol -30% vagy vissza 1.0x-ig, SL 0.5x, max 60 perc
+    szoros  TP 2x, SL 0.8x, max 30 perc
+    futtat  TP 5x, SL 0.4x, max 60 perc
+
 ELSZAMOLAS
   A papir-vetel nincs benne a valodi gorbeben, ezert eladaskor a valodi SOL-tartalek
   melle a sajat (dij utani) betetunket is hozzaadjuk. Enelkul egy "kiurult" gorben
@@ -43,6 +54,7 @@ PARANCSOK (a repo gyokereben, a venv pythonjaval):
     .venv/bin/python scripts/paper_sniper run       # figyeles + szimulacio (systemd alatt)
     .venv/bin/python scripts/paper_sniper report    # strategiankenti eredmeny
     .venv/bin/python scripts/paper_sniper report --javitott   # a regi sorok ujraszamolva a javitott elszamolassal
+    .venv/bin/python scripts/paper_sniper report --kiszallas  # kiszallasi valtozatok parositott osszevetese
     .venv/bin/python scripts/paper_sniper diag      # diagnosztika: kiszallasok, kiurult gorbek, metaadat, RPC
     .venv/bin/python scripts/paper_sniper report --telegram --ora 2   # tomor jelentes (a Telegram-vezerlo hivja)
     .venv/bin/python scripts/paper_sniper status    # mi fut most, nyitott poziciok
@@ -57,7 +69,8 @@ KONFIG (.env, mind opcionalis):
     PAPER_SNIPER_SL_X=0.5           # stop ennyiszeres erteknel
     PAPER_SNIPER_MAX_HOLD_MIN=30    # idokorlat
     PAPER_SNIPER_SAMPLE=0.02        # S0 minta aranya
-    PAPER_SNIPER_MAX_OPEN=60        # strategiankent egyszerre nyitott poziciok
+    PAPER_SNIPER_MAX_OPEN=120       # strategiankent egyszerre nyitott poziciok
+    PAPER_SNIPER_EXITS=             # ures = minden kiszallasi valtozat; pl. alap,trail (az alap mindig fut)
     PAPER_SNIPER_POLL_SEC=10        # gorbe-lekerdezes gyakorisaga
     PAPER_SNIPER_STRATS=            # ures = mind; pl. S0_minta,S2_gyors,S3_linkek
     PAPER_SNIPER_IPFS=https://ipfs.io/ipfs/,https://dweb.link/ipfs/,https://w3s.link/ipfs/   # IPFS-atjarok sorrendben
@@ -103,6 +116,36 @@ STRAT_DESC = {
     "S5_tiszta": "minden szuro + TG vagy X, a metaadat utan",
 }
 META_STRATS = ("S3_linkek", "S4_lendulet", "S5_tiszta")
+# kiszallasi valtozatok: tp/sl a pozicio ertekenek tobbszorose, max perc; trail: csucs folott trail_x,
+# kiszallas a csucstol trail_drop esesnel; part: part_x-nel part_frac eladasa, be: utana 1.0x alatt ki
+EXITS = {
+    "alap": {},                                                       # a konfigbol (TP_X / SL_X / MAX_HOLD_MIN)
+    "trail": {"sl": 0.5, "max": 30, "trail_x": 1.3, "trail_drop": 0.25},
+    "gyors": {"tp": 1.5, "sl": 0.7, "max": 3},
+    "reszl": {"sl": 0.5, "max": 60, "part_x": 2.0, "part_frac": 0.5, "be": True, "trail_x": 2.0, "trail_drop": 0.3},
+    "szoros": {"tp": 2.0, "sl": 0.8, "max": 30},
+    "futtat": {"tp": 5.0, "sl": 0.4, "max": 60},
+}
+EXIT_DESC = {
+    "alap": "a konfig TP/SL/idokorlatja",
+    "trail": "1.3x felett csucstol -25%",
+    "gyors": "TP 1.5x, SL 0.7x, 3 perc",
+    "reszl": "2x-nel fele el, maradek trail/1.0x",
+    "szoros": "TP 2x, SL 0.8x",
+    "futtat": "TP 5x, SL 0.4x, 60 perc",
+}
+
+
+def split_strat(k):
+    """'S2_gyors~trail' -> ('S2_gyors', 'trail'); 'S2_gyors' -> ('S2_gyors', 'alap')"""
+    base, _, ex = str(k).partition("~")
+    return base, ex or "alap"
+
+
+def strat_order(k):
+    base, ex = split_strat(k)
+    bi = list(STRAT_DESC).index(base) if base in STRAT_DESC else 99
+    return (bi, list(EXITS).index(ex) if ex in EXITS else 99, str(k))
 
 
 # ---------------------------------------------------------------- segedek
@@ -335,7 +378,10 @@ class Sniper:
         self.sl = cfg("PAPER_SNIPER_SL_X", 0.5)
         self.max_hold = cfg("PAPER_SNIPER_MAX_HOLD_MIN", 30.0) * 60
         self.sample = cfg("PAPER_SNIPER_SAMPLE", 0.02)
-        self.max_open = cfg("PAPER_SNIPER_MAX_OPEN", 60, int)
+        self.max_open = cfg("PAPER_SNIPER_MAX_OPEN", 120, int)
+        ex_only = [e.strip() for e in (os.getenv("PAPER_SNIPER_EXITS") or "").split(",") if e.strip()]
+        self.exits = {k: dict(v) for k, v in EXITS.items() if k == "alap" or not ex_only or k in ex_only}
+        self.exits["alap"] = {"tp": self.tp, "sl": self.sl, "max": self.max_hold / 60}
         self.poll = cfg("PAPER_SNIPER_POLL_SEC", 10.0)
         only = [s.strip() for s in (os.getenv("PAPER_SNIPER_STRATS") or "").split(",") if s.strip()]
         self.strats = [s for s in STRAT_DESC if not only or s in only]
@@ -483,7 +529,10 @@ class Sniper:
         self.positions.append({"strat": strat, "mint": T["mint"], "curve": T["curve"], "name": T["name"], "symbol": T["symbol"],
                                "t_open": time.time(), "born": T["t"], "latency": round(time.time() - T["t"], 2),
                                "entry_vsol": c["vsol"] / 1e9, "tokens": tokens, "net_lam": lam * (1 - self.fee),
-                               "cost": self.size + self.prio, "last": c, "miss": 0})
+                               "cost": self.size + self.prio, "last": c, "miss": 0, "exits": self.new_exits()})
+
+    def new_exits(self):
+        return {k: {"peak": 0.0, "rem": 1.0, "got": 0.0, "part": False} for k in self.exits}
 
     # ---- metaadat-feldolgozok
     async def meta_worker(self):
@@ -555,36 +604,56 @@ class Sniper:
             if done and (c["vsol"] <= 0 or c["vtok"] <= 0):
                 c = dict(p["last"], done=True)       # graduacio utan a gorbe kiurul: az utolso ismert allapot
             own = p.get("net_lam", self.size * 1e9 * (1 - self.fee))   # regi allapotfajlban meg nincs
-            value = sell_sol(c, p["tokens"], self.fee, cap_real=not done, own_lam=own) / 1e9 - self.prio
-            ratio = value / p["cost"] if p["cost"] else 0
+
+            def sell_part(frac):
+                return sell_sol(c, p["tokens"] * frac, self.fee, cap_real=not done, own_lam=own * frac) / 1e9 - self.prio
+            ratio = sell_part(1.0) / p["cost"] if p["cost"] else 0    # a teljes pozicio erteke / koltseg
             hold = now - p["t_open"]
-            reason = None
-            if done:
-                reason = "graduált"
-            elif ratio >= self.tp:
-                reason = "TP"
-            elif ratio <= self.sl:
-                reason = "SL"
-            elif hold >= self.max_hold:
-                reason = "ido"
-            elif p["miss"] >= 30:
-                reason = "nincs adat"
+            exits = p.setdefault("exits", self.new_exits())           # regi allapotfajl: minden valtozat most indul
+            for name in list(exits):
+                e, rule = exits[name], self.exits.get(name)
+                if rule is None:
+                    del exits[name]
+                    continue
+                e["peak"] = max(e["peak"], ratio)
+                if rule.get("part_x") and not e["part"] and not done and ratio >= rule["part_x"]:
+                    frac = rule.get("part_frac", 0.5)
+                    e["got"] += sell_part(frac)
+                    e["rem"] -= frac
+                    e["part"] = True
+                sl = max(rule.get("sl", 0.0), 1.0) if rule.get("be") and e["part"] else rule.get("sl", 0.0)
+                reason = None
+                if done:
+                    reason = "graduált"
+                elif rule.get("tp") and ratio >= rule["tp"]:
+                    reason = "TP"
+                elif ratio <= sl:
+                    reason = "SL" if not e["part"] else "reszl+SL"
+                elif rule.get("trail_x") and e["peak"] >= rule["trail_x"] and ratio <= e["peak"] * (1 - rule["trail_drop"]):
+                    reason = "trail"
+                elif hold >= rule.get("max", 30) * 60:
+                    reason = "ido"
+                elif p["miss"] >= 30:
+                    reason = "nincs adat"
+                if reason:
+                    value = e["got"] + (sell_part(e["rem"]) if e["rem"] > 1e-9 else 0.0)
+                    self.close(p, c, value, reason, now, name)
+                    del exits[name]
             if not done:
                 p["last"] = c
-            if reason:
-                self.close(p, c, value, reason, now)
-            else:
+            if exits:
                 keep.append(p)
         self.positions = keep
 
-    def close(self, p, c, value, reason, now):
+    def close(self, p, c, value, reason, now, exit_name="alap"):
         pnl = value - p["cost"]
+        strat = p["strat"] if exit_name == "alap" else f"{p['strat']}~{exit_name}"
         new = not TRADES_FILE.exists()
         with TRADES_FILE.open("a", newline="") as f:
             w = csv.writer(f)
             if new:
                 w.writerow(TRADE_FIELDS)
-            w.writerow([round(p["t_open"]), round(now), p["strat"], p["mint"], p["name"], p["symbol"], p["latency"],
+            w.writerow([round(p["t_open"]), round(now), strat, p["mint"], p["name"], p["symbol"], p["latency"],
                         round(p["entry_vsol"], 3), round(c["vsol"] / 1e9, 3), round(p["cost"], 6), round(value, 6),
                         round(pnl, 6), round(pnl / p["cost"] * 100, 2), reason, round(now - p["t_open"]), int(reason == "graduált")])
 
@@ -672,7 +741,7 @@ class Sniper:
 
     async def main(self):
         log(f"Paper sniper indul. Strategiak: {', '.join(self.strats)}. Tetel {self.size} SOL, dij {self.fee*100:.2f}%/irany, prio {self.prio} SOL/tx, "
-            f"TP {self.tp}x, SL {self.sl}x, max {self.max_hold/60:.0f} perc. RPC: {urllib.parse.urlsplit(self.rpc.url).netloc}")
+            f"TP {self.tp}x, SL {self.sl}x, max {self.max_hold/60:.0f} perc, kiszallasok: {', '.join(self.exits)}. RPC: {urllib.parse.urlsplit(self.rpc.url).netloc}")
         telegram("Paper sniper indul (valodi penz nelkul)")
         self.t_start = time.time()
         loop = asyncio.get_running_loop()
@@ -711,6 +780,9 @@ def fixed_rows(rows):
     fee, prio = sim_costs()
     out, bad = [], 0
     for r in rows:
+        if "~" in r.get("strat", ""):
+            out.append(r)                        # kiszallasi valtozat: mar javitott, es lehet reszleges eladas
+            continue
         v = recompute_value(r, fee, prio, fixed=True)
         cost = fnum(r.get("cost_sol"))
         if v is None or cost <= 0:
@@ -724,6 +796,53 @@ def fixed_rows(rows):
 def pct(xs, q):
     xs = sorted(xs)
     return xs[min(len(xs) - 1, max(0, int(round(q * (len(xs) - 1)))))] if xs else float("nan")
+
+
+def base_rows(rows):
+    return [r for r in rows if "~" not in r.get("strat", "")]
+
+
+def exit_compare(rows, compact=False):
+    """a kiszallasi valtozatok parositott osszevetese az alap-pal (ugyanaz a belepes: strat, mint, ts_open)"""
+    alap, by = {}, {}
+    for r in rows:
+        base, ex = split_strat(r["strat"])
+        key = (base, r["mint"], r["ts_open"])
+        if ex == "alap":
+            alap[key] = fnum(r["ret_pct"])
+        else:
+            by.setdefault(ex, []).append((key, fnum(r["ret_pct"])))
+    if not by:
+        return []
+    lines = ["Kiszallasi valtozatok (parositva az alap-hoz, ugyanazok a belepesek):"]
+    per_strat = {}
+    for ex in sorted(by, key=lambda e: list(EXITS).index(e) if e in EXITS else 99):
+        pairs = [(alap[k], v, k[0]) for k, v in by[ex] if k in alap]
+        if not pairs:
+            continue
+        d = [v - a for a, v, _ in pairs]
+        n = len(d)
+        md = sum(d) / n
+        sd = math.sqrt(sum((x - md) ** 2 for x in d) / (n - 1)) if n > 1 else 0.0
+        ci = 1.96 * sd / math.sqrt(n) if n > 1 else float("nan")
+        verdict = "JOBB" if n >= 30 and md - ci > 0 else ("ROSSZABB" if n >= 30 and md + ci < 0 else "?")
+        mv, ma = sum(v for _, v, _ in pairs) / n, sum(a for a, _, _ in pairs) / n
+        cis = "" if math.isnan(ci) else f" ±{ci:.1f}"
+        if compact:
+            lines.append(f"{ex}: {mv:+.1f}% (alap {ma:+.1f}%) -> {md:+.1f}{cis} {verdict}  n={n}")
+        else:
+            lines.append(f"  {ex:7s} {EXIT_DESC.get(ex, ''):34s} n={n:5d}  atlag {mv:+6.1f}%  alap {ma:+6.1f}%"
+                         f"  kulonbseg {md:+5.1f}{cis}  -> {verdict}")
+        for a, v, b in pairs:
+            per_strat.setdefault(b, {}).setdefault(ex, []).append(v - a)
+    if not compact and per_strat:
+        lines.append("  strategiankent (atlagos kulonbseg az alap-hoz, %-pont / pozicio):")
+        for b in sorted(per_strat, key=strat_order):
+            lines.append(f"    {b:11s} " + " | ".join(f"{ex} {sum(x) / len(x):+.1f} (n={len(x)})"
+                                                      for ex, x in sorted(per_strat[b].items(), key=lambda kv: strat_order("x~" + kv[0]))))
+    if len(lines) > 1:
+        lines.append("  (a kulonbseg statisztikailag eldontott, ha n >= 30 es a hibahatar nem metszi a 0-t)")
+    return lines if len(lines) > 1 else []
 
 
 def report_text(short=False, fixed=False):
@@ -741,10 +860,11 @@ def report_text(short=False, fixed=False):
     if not rows:
         lines.append("Meg nincs lezart szimulalt pozicio.")
         return "\n".join(lines)
+    all_rows, rows = rows, base_rows(rows)
     by = {}
     for r in rows:
         by.setdefault(r["strat"], []).append(r)
-    for s in [k for k in STRAT_DESC if k in by] + [k for k in by if k not in STRAT_DESC]:
+    for s in sorted(by, key=strat_order):
         xs = by[s]
         n = len(xs)
         pnl = [float(r["pnl_sol"]) for r in xs]
@@ -783,6 +903,10 @@ def report_text(short=False, fixed=False):
         lines.append("")
         lines.append("Kihagyva (tele volt a strategia): " + (", ".join(f"{k} {v}" for k, v in sk.items()) or "-")
                      + "   nem sikerult belepni: " + (", ".join(f"{k} {v}" for k, v in mi.items()) or "-"))
+    cmp_ = exit_compare(all_rows)
+    if cmp_ and not short:
+        lines.append("")
+        lines += cmp_
     if not short:
         lines.append("")
         lines.append("Olvasat: legalabb 30 pozicio kell strategiankent. Csak akkor van eselye egy eles valtozatnak, ha az atlag a")
@@ -836,7 +960,8 @@ def telegram_report(hours=2.0):
     if rpc.get("calls", 0) >= 100 and rpc.get("errors", 0) / rpc["calls"] > 0.1:
         warn.append(f"RPC hibaarany {rpc['errors'] / rpc['calls'] * 100:.0f}%")
 
-    rows = load_trades()
+    all_rows = load_trades()
+    rows = base_rows(all_rows)                   # az osszesitok az alap kiszallassal; a valtozatok kulon
     win = [r for r in rows if fnum(r.get("ts_close")) >= since]
     if win:
         w = strat_stats(win)
@@ -855,7 +980,7 @@ def telegram_report(hours=2.0):
             by.setdefault(r["strat"], []).append(r)
         for r in win:
             wby.setdefault(r["strat"], []).append(r)
-        for k in sorted(by, key=lambda k: list(STRAT_DESC).index(k) if k in STRAT_DESC else 99):
+        for k in sorted(by, key=strat_order):
             a = strat_stats(by[k])
             mark = {"+": "POZ", "-": "NEG", "?": "?"}[a["verdict"]]
             ws = strat_stats(wby[k]) if k in wby else None
@@ -868,6 +993,10 @@ def telegram_report(hours=2.0):
         if pos_:
             out.append("Statisztikailag pozitiv: " + ", ".join(pos_) + " (a graduáltak eladasa optimista!)")
 
+    cmp_ = exit_compare(all_rows, compact=True)
+    if cmp_:
+        out.append("")
+        out += cmp_
     pos = st.get("positions", [])
     if pos:
         cnt = {}
@@ -904,7 +1033,7 @@ def diag():
 
     print("\n== Belepesek strategiankent (belepett / tele volt / nem sikerult)")
     ent, sk, mi = s.get("entered", {}), s.get("skipped", {}), s.get("missed", {})
-    for k in sorted(set(ent) | set(sk) | set(mi) | set(STRAT_DESC), key=lambda k: list(STRAT_DESC).index(k) if k in STRAT_DESC else 99):
+    for k in sorted(set(ent) | set(sk) | set(mi) | set(STRAT_DESC), key=strat_order):
         print(f"  {k:12s} {ent.get(k, '-')!s:>6} / {sk.get(k, 0):>5} / {mi.get(k, 0):>5}")
 
     print("\n== Metaadat")
@@ -924,8 +1053,9 @@ def diag():
         print(f"\n== Nyitott poziciok: {len(pos)}, legregebbi {max(now - p['t_open'] for p in pos) / 60:.0f} perc,"
               f" adat nelkul (miss>0): {sum(1 for p in pos if p.get('miss'))}")
 
-    rows = load_trades()
-    print(f"\n== Lezart poziciok: {len(rows)}")
+    all_rows = load_trades()
+    rows = base_rows(all_rows)
+    print(f"\n== Lezart poziciok: {len(rows)} (alap kiszallas; a valtozatokkal egyutt {len(all_rows)} sor)")
     if not rows:
         return
     diffs, by = [], {}
@@ -940,7 +1070,7 @@ def diag():
         print(f"modell-ellenorzes: a CSV-bol ujraszamolt regi ertek elterese a rogzitettol: median {md:.6f}, p90 {pct(diffs, .9):.6f} SOL"
               + ("  (rendben)" if md < 1e-3 else "  (ELTER: nem szabvanyos gorbe vagy mas dij/prio a futas alatt -> a --javitott pontatlan)"))
     print("\nstrat         n   kiurult  -90%alatt   atlag regi -> javitott   kiszallasok")
-    for k in sorted(by, key=lambda k: list(STRAT_DESC).index(k) if k in STRAT_DESC else 99):
+    for k in sorted(by, key=strat_order):
         xs = by[k]
         n = len(xs)
         empty = sum(1 for r, _, _ in xs if r["graduated"] != "1" and fnum(r["exit_vsol"]) - V0_SOL < 1.0)
@@ -977,10 +1107,14 @@ def main():
     ap.add_argument("cmd", choices=["run", "report", "status", "diag", "reset"])
     ap.add_argument("--javitott", action="store_true", help="report: a lezart sorok ujraszamolasa a javitott elszamolassal")
     ap.add_argument("--telegram", action="store_true", help="report: tomor jelentes a Telegram-vezerlonek")
+    ap.add_argument("--kiszallas", action="store_true", help="report: a kiszallasi valtozatok parositott osszevetese")
     ap.add_argument("--ora", type=float, default=2.0, help="report --telegram: az ablak hossza oraban")
     a = ap.parse_args()
     load_env()
     if a.cmd == "report":
+        if a.kiszallas:
+            print("\n".join(exit_compare(load_trades())) or "Meg nincs lezart kiszallasi valtozat.")
+            return
         print(telegram_report(a.ora) if a.telegram else report_text(fixed=a.javitott))
         return
     if a.cmd == "diag":
