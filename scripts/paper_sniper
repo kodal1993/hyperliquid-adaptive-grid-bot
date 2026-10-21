@@ -23,6 +23,11 @@ STRATEGIAK
                     a nyerok futtatasa — graduacio UTAN is tartjuk (ar: DexScreener, AMM-dij),
                     kiszallas a csucstol -50%-nal, legfeljebb 24 ora; nincs TP-plafon
 
+    S13_amm         graduacio UTANI belepes (kesesfuggetlen, ingyenes): a PumpPortal graduacios
+                    esemenye utan S13_DELAY_MIN perccel a DexScreener-adatok alapjan (likviditas,
+                    5 perces forgalom, vevok/eladok, arvaltozas) a PumpSwap aron, AMM-dijjal es a
+                    pool meretebol szamolt csuszassal; kiszallas mint az S12 (csucstol -50%, max 24 ora)
+
 KISZALLAS
     alap    TP / SL / idokorlat (PAPER_SNIPER_TP_X / SL_X / MAX_HOLD_MIN); graduacional a gorbe
             vegso aran zar (optimista)
@@ -72,6 +77,8 @@ KONFIG (.env, mind opcionalis):
     PAPER_SNIPER_COPY_LAT=1.0       # koveto keses (mp)
     PAPER_SNIPER_COPY_MIN_N=8       # masolhato tarca: legalabb ennyi koveto-pozicio
     PAPER_SNIPER_SAMPLE_S10=0.3     # S10: a klaszteres tokenek ekkora reszebe lepunk be
+    PAPER_SNIPER_S13_DELAY_MIN=5    # S13: ennyi perccel a graduacio utan ertekel
+    PAPER_SNIPER_S13_MIN_LIQ_USD=8000 / S13_MIN_VOL5_USD=3000 / S13_BUY_RATIO=1.2   # S13 belepesi feltetelek
     PAPER_SNIPER_CLUSTER_MIN=3      # visszatero csoport: ennyi kozos korai token
     PAPER_SNIPER_WALLET_LOG=1 / WALLET_LOG_MB=300   # viselkedesnaplo
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # inditasi uzenet; a jelentest a telegram_control_bot.py kuldi
@@ -111,6 +118,7 @@ STRAT_DESC = {
     "S8_masol": "masolhato tarca vett (a mi kesesunkkel + dijainkkal mert)",
     "S10_bennfentes": "bennfentesek kovetese: be 4 mp-nel, ki az elso bennfentes eladasakor",
     "S12_futtat": "tapadas (gorbe >= 50%, >= 60 mp, tiszta, nem bundle): graduacio utan is, csucstol -50%, max 24 ora",
+    "S13_amm": "graduacio utan 5 perccel, DexScreener-tapadas eseten, a PumpSwap-on; csucstol -50%, max 24 ora",
 }
 TOTAL_SUPPLY = 1e9                     # pump.fun tokenek teljes kinalata
 EARLY_SEC = 2.0                        # ennyi mp-en beluli vetel "korai" (bundle / gyors sniper)
@@ -332,6 +340,12 @@ def decode_create_event(b):
 
 def dex_prices(mints):
     """graduacio utani SOL-ar mintenkent a DexScreener nyilvanos API-jabol (30-asaval); {mint: ar}"""
+    return {m: d["px"] for m, d in dex_pairs(mints).items()}
+
+
+def dex_pairs(mints):
+    """a legnagyobb likviditasu SOL-par adatai mintenkent: ar (SOL), likviditas (USD, SOL-tartalek), 5 perces
+    forgalom (USD), vetelek/eladasok (5 perc), 5 perces arvaltozas (%), dex"""
     out = {}
     for i in range(0, len(mints), 30):
         chunk = [m for m in mints[i:i + 30] if BASE58.match(m)]
@@ -341,13 +355,15 @@ def dex_prices(mints):
                                      headers={"User-Agent": "paper-sniper/1.0", "Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as r:
             pairs = json.loads(r.read(2_000_001))
-        best = {}
         for pr in pairs if isinstance(pairs, list) else []:
             base, quote = (pr.get("baseToken") or {}).get("address"), (pr.get("quoteToken") or {}).get("address")
             px, liq = fnum(pr.get("priceNative")), fnum((pr.get("liquidity") or {}).get("usd"))
-            if base in chunk and quote == WSOL and px > 0 and liq >= best.get(base, (0, -1))[1]:
-                best[base] = (px, liq)
-        out.update({m: v[0] for m, v in best.items()})
+            if base in chunk and quote == WSOL and px > 0 and liq >= out.get(base, {}).get("liq", -1):
+                tx5 = (pr.get("txns") or {}).get("m5") or {}
+                out[base] = {"px": px, "liq": liq, "q": fnum((pr.get("liquidity") or {}).get("quote")),
+                             "vol5": fnum((pr.get("volume") or {}).get("m5")), "buys5": fnum(tx5.get("buys")),
+                             "sells5": fnum(tx5.get("sells")), "chg5": fnum((pr.get("priceChange") or {}).get("m5")),
+                             "dex": str(pr.get("dexId") or "")[:20]}
     return out
 
 
@@ -370,7 +386,12 @@ class Sniper:
         self.exits = {k: dict(v) for k, v in EXITS.items()}
         self.exits["alap"] = {"tp": self.tp, "sl": self.sl, "max": self.max_hold / 60}
         self.amm_fee = cfg("PAPER_SNIPER_AMM_FEE_BPS", 30.0) / 1e4
-        self.dex_px = {}                                     # mint -> (SOL-ar graduacio utan, ido)
+        self.dex_px = {}                                     # mint -> (SOL-ar graduacio utan, ido, pool SOL-tartalek)
+        self.amm_due = {}                                    # S13: mint -> ertekeles ideje (graduacio + DELAY)
+        self.s13_delay = cfg("PAPER_SNIPER_S13_DELAY_MIN", 5.0) * 60
+        self.s13_liq = cfg("PAPER_SNIPER_S13_MIN_LIQ_USD", 8000.0)
+        self.s13_vol5 = cfg("PAPER_SNIPER_S13_MIN_VOL5_USD", 3000.0)
+        self.s13_ratio = cfg("PAPER_SNIPER_S13_BUY_RATIO", 1.2)
         self.dex_last = 0.0
         self.poll = cfg("PAPER_SNIPER_POLL_SEC", 10.0)
         only = [s.strip() for s in (os.getenv("PAPER_SNIPER_STRATS") or "").split(",") if s.strip()]
@@ -739,9 +760,57 @@ class Sniper:
         if not BASE58.match(mint):
             return
         self.stats["migrations"] += 1
+        if "S13_amm" in self.strats and mint not in self.amm_due:
+            self.amm_due[mint] = [time.time() + self.s13_delay, 0]     # [mikor, hanyadik probalkozas]
         d = self.mint_dev.get(mint)
         if d and d[0] in self.creators:
             self.creators[d[0]]["g"] = self.creators[d[0]].get("g", 0) + 1
+
+    def eval_amm(self, mint, d, now):
+        """S13: graduacio utan DELAY perccel — belepes, ha a DexScreener szerint van tapadas"""
+        t, tries = self.amm_due.get(mint, (now, 0))
+        sk = self.stats.setdefault("s13_skip", {})
+        reason = None
+        if not d:
+            if tries < 2:
+                self.amm_due[mint] = [now + 180, tries + 1]   # meg nincs indexelve: 3 perc mulva ujra
+                return
+            reason = "nincs_par"
+        elif d["liq"] < self.s13_liq:
+            reason = "kicsi_likviditas"
+        elif d["vol5"] < self.s13_vol5:
+            reason = "kicsi_forgalom"
+        elif d["buys5"] < self.s13_ratio * max(1.0, d["sells5"]):
+            reason = "tobb_elado"
+        elif d["chg5"] <= 0:
+            reason = "eso_ar"
+        else:
+            T0 = self.tokens.get(mint) or {}
+            if T0.get("clustered") or T0.get("copy"):
+                reason = "klaszteres_vagy_masolat"
+        del self.amm_due[mint]
+        if reason:
+            sk[reason] = sk.get(reason, 0) + 1
+            return
+        self.enter_amm(mint, d, now)
+
+    def enter_amm(self, mint, d, now):
+        strat = "S13_amm"
+        if strat not in self.strats or any(p["mint"] == mint and p["strat"] == strat for p in self.positions):
+            return
+        if self.open_count(strat) >= self.max_open:
+            self.stats["skipped"][strat] = self.stats["skipped"].get(strat, 0) + 1
+            return
+        net = self.size * (1 - self.amm_fee)
+        tokens = net / d["px"] * (d["q"] / (d["q"] + net) if d["q"] > 0 else 1.0)   # csuszassal
+        T0 = self.tokens.get(mint) or {}
+        self.stats["entered"][strat] = self.stats["entered"].get(strat, 0) + 1
+        self.positions.append({"strat": strat, "mint": mint, "curve": T0.get("curve", ""), "name": T0.get("name", ""),
+                               "symbol": T0.get("symbol", ""), "t_open": now, "born": T0.get("t", now),
+                               "latency": round(now - T0.get("t", now), 2), "entry_vsol": 0.0, "tokens": tokens * 1e6,
+                               "net_lam": 0.0, "cost": self.size + self.prio, "miss": 0, "exits": self.new_exits(strat),
+                               "last": {"vsol": 0.0, "vtok": 0.0, "rsol": 0.0, "done": True}, "amm": True, "grad_t": now,
+                               "last_px": d["px"]})
 
     # ---- belepes
     def enter_later(self, strat, T, delay):
@@ -790,11 +859,11 @@ class Sniper:
                 p["leader_sold"] = time.time()          # a kovetett tarca mar a belepes elott elkezdett eladni
 
     def new_exits(self, strat=""):
-        names = ["alap"] if strat == "S12_futtat" else list(self.exits)
+        names = ["alap"] if strat in ("S12_futtat", "S13_amm") else list(self.exits)
         return {k: {"peak": 0.0, "rem": 1.0, "got": 0.0, "part": False} for k in names}
 
     def rule(self, p, name):
-        return S12_RULE if p["strat"] == "S12_futtat" and name == "alap" else self.exits.get(name)
+        return S12_RULE if p["strat"] in ("S12_futtat", "S13_amm") and name == "alap" else self.exits.get(name)
 
     # ---- gorbe-lekerdezes: kiszallasok
     async def poll_loop(self):
@@ -812,13 +881,19 @@ class Sniper:
     async def poll_once(self):
         now = time.time()
         amm = [p["mint"] for p in self.positions if p.get("amm")]
-        if amm and now - self.dex_last >= 30:
+        due = [m for m, (t, _) in self.amm_due.items() if t <= now]
+        if (amm or due) and now - self.dex_last >= 30:
             self.dex_last = now
             try:
-                for mint, px in (await asyncio.to_thread(dex_prices, list(dict.fromkeys(amm)))).items():
-                    self.dex_px[mint] = (px, now)
+                data = await asyncio.to_thread(dex_pairs, list(dict.fromkeys(amm + due)))
             except Exception as e:
+                data = None
                 log(f"DexScreener hiba: {e}")
+            if data is not None:
+                for mint, d in data.items():
+                    self.dex_px[mint] = (d["px"], now, d["q"])
+                for mint in due:
+                    self.eval_amm(mint, data.get(mint), now)
         keys = list(dict.fromkeys(p["curve"] for p in self.positions if not p.get("amm")))
         curves = {}
         for i in range(0, len(keys), 100):
@@ -851,10 +926,18 @@ class Sniper:
                 elif now - p.get("grad_t", now) > 120:
                     p["miss"] += 1                    # nincs friss DexScreener-ar
 
+            if dex:
+                p["last_px"] = dex[0]
+
             def sell_part(frac):
                 if p.get("amm"):
-                    if dex:
-                        return p["tokens"] / 1e6 * frac * dex[0] * (1 - self.amm_fee) - self.prio
+                    px = dex[0] if dex else p.get("last_px")
+                    if px:
+                        v = p["tokens"] / 1e6 * frac * px * (1 - self.amm_fee)
+                        q = dex[2] if dex and len(dex) > 2 else 0.0
+                        if q > 0:
+                            v *= q / (q + v)                # csuszas: allando szorzatu pool, q SOL-tartalek
+                        return v - self.prio
                     return sell_sol(dict(c, done=True), p["tokens"] * frac, self.fee, cap_real=False) / 1e9 - self.prio
                 return sell_sol(c, p["tokens"] * frac, self.fee, cap_real=not done, own_lam=own * frac) / 1e9 - self.prio
             ratio = sell_part(1.0) / p["cost"] if p["cost"] else 0    # a teljes pozicio erteke / koltseg
@@ -1607,6 +1690,10 @@ def diag():
     ent, sk, mi = s.get("entered", {}), s.get("skipped", {}), s.get("missed", {})
     for k in sorted(STRAT_DESC, key=strat_order):
         print(f"  {k:12s} {ent.get(k, '-')!s:>6} / {sk.get(k, 0):>5} / {mi.get(k, 0):>5}")
+
+    s13 = s.get("s13_skip") or {}
+    if s13:
+        print("  S13 kihagyva: " + ", ".join(f"{k} {v}" for k, v in sorted(s13.items(), key=lambda kv: -kv[1])))
 
     print("\n== Tarca-kovetes (S6/S8/S10)")
     wst = s.get("wallets") or {}
