@@ -38,10 +38,6 @@ STRATEGIAK
     S7_tiszta    S7_organikus, de csak bennfentes-klaszter nelkuli tokenben (lasd lent)
     S9_klaszter_nelkul  10 mp-nel, veletlen minta (PAPER_SNIPER_SAMPLE_S9) a klaszter nelkuli tokenekbol
     S9_klaszteres       ugyanez a klaszteres tokenekbol (kontroll: rosszabbnak kell lennie)
-    S11_lista           sajat listas tarcak (state/seed_wallets.txt, pl. nyilvanos ranglistakrol:
-                        Kolscan, GMGN, Solana Tracker) kovetese BARMELY pump.fun tokenen
-                        (PumpPortal subscribeAccountTrade): be COPY_LAT mp-cel a veteluk utan,
-                        a "masol" kiszallas az eladasukra zar; tarcankenti eredmeny: wallets 5. pont
     S10_bennfentes      a bennfentesek kovetese: belepes, amint a token klaszteres (3 mp + COPY_LAT),
                         ha meg egyik bennfentes sem adott el; a "masol" kiszallas az ELSO bennfentes
                         eladasara zar (a minta aranya: PAPER_SNIPER_SAMPLE_S10)
@@ -128,7 +124,6 @@ KONFIG (.env, mind opcionalis):
     PAPER_SNIPER_COPY_MIN_N=8       # masolhato tarca: legalabb ennyi koveto-pozicio
     PAPER_SNIPER_SAMPLE_S9=0.1      # S9 minta aranya csoportonkent
     PAPER_SNIPER_SAMPLE_S10=0.3     # S10: a klaszteres tokenek ekkora reszebe lepunk be
-    (state/seed_wallets.txt: soronkent "cim [nev]", # megjegyzes; percenkent ujraolvasva — Telegram /seed_add)
     PAPER_SNIPER_CLUSTER_MIN=3      # visszatero csoport: ennyi kozos korai token
     PAPER_SNIPER_WALLET_LOG=1       # 0 = nincs viselkedesnaplo
     PAPER_SNIPER_WALLET_LOG_MB=300  # e folott a naplo archivalodik (.bak) es ujraindul
@@ -151,7 +146,6 @@ STATE_DIR = ROOT / "state"
 STATE_FILE = STATE_DIR / "paper_sniper_state.json"
 DB_FILE = STATE_DIR / "paper_sniper_db.json"
 TRADES_FILE = STATE_DIR / "paper_sniper_trades.csv"
-SEED_FILE = STATE_DIR / "seed_wallets.txt"                # kovetendo tarcak listaja (cim [nev])
 WALLET_LOG = STATE_DIR / "paper_sniper_wallet_trades.csv"   # tarca-pozicio viselkedesnaplo (wallets elemzes)
 WALLET_FIELDS = ["ts", "mint", "wallet", "prior_n", "prior_smart", "minta", "entry_age_s", "entry_rsol", "sol_in", "sol_out",
                  "rem_val", "pnl", "ret_pct", "hold_s", "sold_frac", "n_buys", "n_sells", "tok_buyers", "tok_early_pct"]
@@ -182,7 +176,6 @@ STRAT_DESC = {
     "S9_klaszter_nelkul": "10 mp, minta a klaszter nelkuli tokenekbol",
     "S9_klaszteres": "10 mp, minta a klaszteres tokenekbol (kontroll)",
     "S10_bennfentes": "bennfentesek kovetese: be 4 mp-nel, ki az elso bennfentes eladasakor",
-    "S11_lista": "sajat listas (ranglista) tarcak kovetese barmely tokenen",
 }
 TOTAL_SUPPLY = 1e9                     # pump.fun tokenek teljes kinalata
 EARLY_SEC = 2.0                        # ennyi mp-en beluli vetel "korai" (bundle / gyors sniper)
@@ -364,20 +357,6 @@ def recompute_value(r, fee, prio, fixed=True):
 IPFS_GATEWAYS = ["https://ipfs.io/ipfs/", "https://dweb.link/ipfs/", "https://w3s.link/ipfs/"]
 
 
-def load_seeds():
-    """seed_wallets.txt -> {cim: nev}; ervenytelen sorok kimaradnak"""
-    out = {}
-    try:
-        lines = SEED_FILE.read_text().splitlines()
-    except OSError:
-        return out
-    for ln in lines:
-        parts = ln.split("#", 1)[0].split()
-        if parts and BASE58.match(parts[0]):
-            out[parts[0]] = re.sub(r"[^\w.\-]", "", " ".join(parts[1:]))[:30]
-    return dict(list(out.items())[:500])
-
-
 def uri_host(uri):
     uri = str(uri or "").strip()
     if uri.startswith("ipfs://"):
@@ -505,9 +484,6 @@ class Sniper:
         self.led = {}                                        # (mint, kovetett tarca) -> poziciok (masol kiszallas)
         self.sample_s9 = cfg("PAPER_SNIPER_SAMPLE_S9", 0.1)
         self.sample_s10 = cfg("PAPER_SNIPER_SAMPLE_S10", 0.3)
-        self.seeds = {}                                      # listas tarcak (percenkent ujraolvasva)
-        self.acc_sub_q, self.acc_unsub_q = [], []
-        self.seed_loaded = 0.0
         self.cluster_min = cfg("PAPER_SNIPER_CLUSTER_MIN", 3, int)
         self.pairs = db.get("pairs", {})                     # "a|b" (rendezve) -> [kozos korai tokenek, utolso ido]
         self.dev_assoc = db.get("dev_assoc", {})             # "dev|tarca" -> [korai a dev tokenjeiben, utolso ido]
@@ -676,15 +652,10 @@ class Sniper:
         return bool(r) and r[0] >= self.smart_n and r[1] / r[0] >= self.smart_win and r[2] >= self.smart_pnl
 
     def on_trade(self, m):
-        mint, w = str(m.get("mint") or ""), str(m.get("traderPublicKey") or "")
-        if m.get("txType") == "sell":
-            for p in self.led.get((mint, w), ()):
-                p.setdefault("leader_sold", time.time())   # a kovetett tarca elad (barmely tokenen)
-        if w in self.seeds and m.get("txType") == "buy":
-            self.on_seed_buy(m, mint, w)
-        T = self.tracked.get(mint)
+        T = self.tracked.get(str(m.get("mint") or ""))
         if T is None:
             return
+        w = str(m.get("traderPublicKey") or "")
         sol, tok = fnum(m.get("solAmount")), fnum(m.get("tokenAmount"))
         if not BASE58.match(w) or sol < 0 or tok < 0:
             self.stats["trade_bad"] += 1
@@ -724,33 +695,11 @@ class Sniper:
             rec[7] += 1
             if len(rec) >= 10 and not rec[9]:
                 rec[9] = now
+            for p in self.led.get((T["mint"], w), ()):
+                p.setdefault("leader_sold", now)
             T["n_sell"] += 1
             if w == T["dev"]:
                 T["dev_sold"] = True
-
-    def on_seed_buy(self, m, mint, w):
-        """listas tarca vett: S11_lista belepes (akkor is, ha a tokent nem kovetjuk)"""
-        if "S11_lista" not in self.strats or not BASE58.match(mint):
-            return
-        T = self.tracked.get(mint) or self.tokens.get(mint)
-        if T is None:
-            curve = str(m.get("bondingCurveKey") or "")
-            if not BASE58.match(curve):
-                return
-            T = {"mint": mint, "curve": curve, "t": time.time(), "name": "", "symbol": "", "done": set(), "dev": None}
-            self.tokens[mint] = T
-        T.setdefault("leaders", {})["S11_lista"] = w
-        self.enter_later("S11_lista", T, self.copy_lat)
-
-    def reload_seeds(self):
-        new = load_seeds()
-        added = [w for w in new if w not in self.seeds]
-        removed = [w for w in self.seeds if w not in new]
-        if added or removed:
-            log(f"listas tarcak: +{len(added)} / -{len(removed)} (osszesen {len(new)})")
-        self.acc_sub_q += added
-        self.acc_unsub_q += removed
-        self.seeds = new
 
     def eval_cluster(self, T):
         """3 mp-nel: a korai vevok klaszter-jele a KORABBI tokenekbol, utana a statisztika frissitese"""
@@ -1049,11 +998,6 @@ class Sniper:
 
     def close(self, p, c, value, reason, now, exit_name="alap"):
         pnl = value - p["cost"]
-        if p["strat"] == "S11_lista" and p.get("leader"):
-            d = self.stats.setdefault("seed_perf", {}).setdefault(p["leader"], {}).setdefault(exit_name, [0, 0.0, 0])
-            d[0] += 1
-            d[1] = round(d[1] + pnl / p["cost"] * 100, 3)
-            d[2] += int(pnl > 0)
         strat = p["strat"] if exit_name == "alap" else f"{p['strat']}~{exit_name}"
         new = not TRADES_FILE.exists()
         with TRADES_FILE.open("a", newline="") as f:
@@ -1108,8 +1052,6 @@ class Sniper:
         # ujrakapcsolodaskor az osszes kovetett tokenre ujra feliratkozunk
         self.sub_q = list(self.tracked)
         self.unsub_q = []
-        self.seed_loaded = 0.0                               # azonnali ujraolvasas
-        self.acc_sub_q, self.acc_unsub_q = list(self.seeds), []
         if websockets:
             async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=30, max_size=2 ** 20) as ws:
                 for s in subs:
@@ -1151,11 +1093,7 @@ class Sniper:
             await asyncio.sleep(1)
             if self.trades_on:
                 self.finalize_tracked()
-            if time.time() - self.seed_loaded >= 60:
-                self.seed_loaded = time.time()
-                self.reload_seeds()
-            for method, q in (("unsubscribeTokenTrade", "unsub_q"), ("subscribeTokenTrade", "sub_q"),
-                              ("unsubscribeAccountTrade", "acc_unsub_q"), ("subscribeAccountTrade", "acc_sub_q")):
+            for method, q in (("unsubscribeTokenTrade", "unsub_q"), ("subscribeTokenTrade", "sub_q")):
                 keys = getattr(self, q)
                 setattr(self, q, [])
                 for i in range(0, len(keys), 100):
@@ -1521,32 +1459,8 @@ def copy_stats(r, n_min):
     return n, mean, mean - 2 * math.sqrt(var / n), r[5] / n
 
 
-def seed_report_lines():
-    seeds = load_seeds()
-    perf = read_json(STATE_FILE, {}).get("stats", {}).get("seed_perf", {})
-    if not seeds and not perf:
-        return []
-    out = ["", f"5. Listas tarcak (state/seed_wallets.txt: {len(seeds)} tarca) — S11_lista kovetve, a mi kesesunkkel es dijainkkal"]
-    rows = []
-    for w in set(seeds) | set(perf):
-        d = perf.get(w, {})
-        a, m_ = d.get("alap", [0, 0.0, 0]), d.get("masol", [0, 0.0, 0])
-        rows.append((m_[1] / m_[0] if m_[0] else float("-inf"), w, a, m_))
-    for _, w, a, m_ in sorted(rows, reverse=True):
-        name = seeds.get(w, "(torolve)") or "-"
-        if not a[0] and not m_[0]:
-            out.append(f"  {w[:6]}..{w[-4:]} {name:12s} meg nincs lezart pozicio")
-            continue
-        out.append(f"  {w[:6]}..{w[-4:]} {name:12s} masol: n={m_[0]:4d} atlag {m_[1] / max(1, m_[0]):+6.1f}% nyero {m_[2] / max(1, m_[0]) * 100:3.0f}%"
-                   f" | alap: n={a[0]:4d} atlag {a[1] / max(1, a[0]):+6.1f}%")
-    out.append("  (egy tarca akkor kovetheto, ha a 'masol' atlaga legalabb 30 pozicion is jol a dij-padlo felett van)")
-    return out
-
-
 def wallets_report():
     rows = load_wallet_log()
-    if not rows and load_seeds():
-        return "\n".join(["Meg nincs viselkedesnaplo (a tobbi pont kesobb jon)."] + seed_report_lines())
     if not rows:
         return "Meg nincs viselkedesnaplo (state/paper_sniper_wallet_trades.csv). Az uj kod indulasa utan ~15 perc mulva jon az elso."
     db = read_json(DB_FILE, {}).get("wallets", {})
@@ -1670,13 +1584,11 @@ def wallets_report():
     else:
         out.append(f"  meg nincs tarca >= {cn} koveto-pozicioval")
 
-    out += seed_report_lines()
-
     # 4. a legjobb okos tarcak viselkedese
     top = sorted(smart_now, key=lambda w: -db[w][2])[:10]
     if top:
         out.append("")
-        out.append("6. A legjobb okos tarcak (adatbazis szerint) — medianok a naplobol")
+        out.append("5. A legjobb okos tarcak (adatbazis szerint) — medianok a naplobol")
         for w in top:
             xs = by_w.get(w, [])
             r = db[w]
