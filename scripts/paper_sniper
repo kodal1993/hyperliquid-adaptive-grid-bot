@@ -918,19 +918,21 @@ class Sniper:
 
     # ---- WebSocket
     async def ws_loop(self):
-        backoff = 5
+        backoff = 1
         while not self.stop:
+            t0 = time.time()
             try:
                 await self._ws_session()
-                backoff = 5
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                if time.time() - t0 >= 60:
+                    backoff = 1                        # egy jo kapcsolat utani bontas: gyorsan vissza
                 log(f"WebSocket megszakadt: {e} — ujra {backoff} mp mulva")
             if self.stop:
                 break
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 120)
+            backoff = min(backoff * 2, 30)
 
     def handle(self, raw):
         if isinstance(raw, (bytes, bytearray)):
@@ -1021,22 +1023,25 @@ class Sniper:
 
     # ---- kereskedesek a Solana RPC-rol (logsSubscribe a pump.fun programra)
     async def rpc_ws_loop(self):
-        backoff = 5
+        backoff = 1
         while not self.stop:
+            t0 = time.time()
             try:
                 await self._rpc_ws_session()
-                backoff = 5
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 st = self.stats.setdefault("rpc_ws", {})
                 st["reconnects"] = st.get("reconnects", 0) + 1
                 st["last_error"] = redact(f"{type(e).__name__}: {str(e)[:150]}")
+                if time.time() - t0 >= 60:
+                    backoff = 1                        # egy jo kapcsolat utani bontas: gyorsan vissza
+                st["down_s"] = round(st.get("down_s", 0) + backoff, 1)
                 log(f"RPC WebSocket megszakadt: {st['last_error']} — ujra {backoff} mp mulva")
             if self.stop:
                 break
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 120)
+            backoff = min(backoff * 2, 30)
 
     def handle_rpc_log(self, raw):
         st = self.stats.setdefault("rpc_ws", {})
@@ -1611,7 +1616,8 @@ def diag():
     if rw.get("last_error"):
         rw["last_error"] = redact(rw["last_error"])
     print(f"Solana RPC logsSubscribe: ertesites {rw.get('notifications', 0)}, TradeEvent {rw.get('events', 0)},"
-          f" CreateEvent {rw.get('creates', 0)}, visszajatszott korai {rw.get('replayed', 0)}, ujrakapcsolodas {rw.get('reconnects', 0)},"
+          f" CreateEvent {rw.get('creates', 0)}, visszajatszott korai {rw.get('replayed', 0)}, ujrakapcsolodas {rw.get('reconnects', 0)}"
+          f" (kiesett ~{rw.get('down_s', 0):.0f} mp),"
           f" atlagos keses {rw.get('lag', '-')} mp"
           + (f", utolso hiba: {rw['last_error']}" if rw.get("last_error") else ""))
     if not rw.get("events"):
