@@ -51,10 +51,16 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
     negatív: a saját PnL szerint okos tárcák késve követve veszítenek. **Lezárva: kudarc.**
   - A `masol` kiszállás +10,2 ±7,3 százalékponttal jobb az alapnál (n=172), de átlagban még így is
     −11,4%. Tanulság: tárcakövetésnél a vezető eladására kell kiszállni.
-- **Felfüggesztve, valós idejű adat nélkül nem mérhető:** S8_masol, S10_bennfentes. A PumpPortal
-  kereskedés-adata fizetős; a nyilvános Solana RPC kb. 33 mp-et késik; a Helius ingyenes kerete
-  a teljes pump.fun-forgalomra kb. 16 óra alatt elfogy.
-- **Aktív:**
+- **Felfüggesztve, valós idejű adat nélkül nem mérhető:** S8_masol. A PumpPortal kereskedés-adata
+  fizetős (0,02 SOL minimális egyenleg, 10 000 kereskedésenként 0,01 SOL; a teljes követés kb. 0,75 SOL/nap),
+  a nyilvános Solana RPC kb. 33 mp-et késik, a Helius ingyenes kerete a teljes pump.fun-forgalomra kb. 16 óra
+  alatt elfogy.
+- **Fut, késleltetett adattal: `S10_bennfentes`.** A klaszter-felismerés slot alapú, ezért a késés nem
+  rontja el. A bennfentesek eladását viszont kb. 33 mp-cel később látjuk, így az eredmény pesszimista.
+  - Első adat (2026-10-21): +34,3% ±72,4, n=6 (egy +182%-os nyerő viszi); ez még nem bizonyíték.
+  - Ha legalább 50 pozíción a hibahatárral együtt is pozitív → pontos teszt valós idejű adattal: PumpPortal-kulcs,
+    csak a klaszteres tokenekre szűkítve, kb. 0,15 SOL/nap.
+- **Aktív** (`PAPER_SNIPER_STRATS=S10_bennfentes,S12_futtat,S13_amm`):
   - `S12_futtat`: tapadást mutató, nem bundle-os token a görbén, graduáció után is tartva;
   - `S13_amm`: belépés graduáció után 5 perccel, ha a DexScreener szerint van tapadás (likviditás
     ≥ 8000 $, 5 perces forgalom ≥ 3000 $, vevők ≥ 1,2 × eladók, emelkedő ár). Késés-független és
