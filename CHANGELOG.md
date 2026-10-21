@@ -1,5 +1,10 @@
 # Changelog
 
+## Paper sniper: a create előtt érkező korai kereskedések pufferelése
+
+- A Solana RPC gyorsabb a PumpPortalnál: egy új token első vételei (bundle-ök, korai sniperek) a PumpPortal create üzenete előtt érkeznek, és eddig elvesztek. Ezért nem lett egyetlen klaszter sem (`tarca-parok: 0`).
+- A még ismeretlen tokenek TradeEvent-jei 30 mp-ig pufferben maradnak (tokenenként legfeljebb 50). A create után az eredeti érkezési idővel visszajátszódnak, így a korai vevők és a klaszter-felismerés helyesen működnek. A `diag` kiírja a visszajátszott események számát.
+
 ## Paper sniper: kereskedések a Solana RPC-ről (a PumpPortal kereskedés-adata fizetős lett)
 
 - A PumpPortal `subscribeTokenTrade` / `subscribeAccountTrade` csak legalább 0,02 SOL-lal feltöltött API-kulccsal működik. Ezért eddig egyetlen kereskedés-üzenet sem jött, és a tárcakövetés adat nélkül futott.
