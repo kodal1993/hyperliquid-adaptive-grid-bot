@@ -1740,7 +1740,7 @@ def test_control_bot_export_only_whitelisted_files(tmp_path, monkeypatch):
     telegram_bot = load_telegram_control_bot_module()
     (tmp_path / "state").mkdir()
     (tmp_path / "state" / "paper_sniper_trades.csv").write_text("ts_open,strat\n1,S0_minta\n")
-    (tmp_path / "state" / "paper_carry_state.json").write_text("{}")
+    (tmp_path / "state" / "paper_carry_state.json").write_text('{"err": "wss://mainnet.helius-rpc.com/?api-key=abcd-1234-efgh"}')
     (tmp_path / ".env").write_text("HL_PRIVATE_KEY=0x" + "b" * 64)
     (tmp_path / "state" / "secret.txt").write_text("x")
     monkeypatch.setattr(telegram_bot, "PROJECT_ROOT", tmp_path)
@@ -1756,6 +1756,8 @@ def test_control_bot_export_only_whitelisted_files(tmp_path, monkeypatch):
     diag = zipfile.ZipFile(io.BytesIO(data)).read("sniper_diag.txt").decode()
     assert "abcdefghijklmnopqrstuvwxyzABCDEF" not in diag
     assert "hiányzik" in caption
+    carry = zipfile.ZipFile(io.BytesIO(data)).read("state/paper_carry_state.json").decode()
+    assert "abcd-1234-efgh" not in carry and "[REDACTED]" in carry
 
 
 def test_control_bot_version_reports_pending_prs(monkeypatch):
