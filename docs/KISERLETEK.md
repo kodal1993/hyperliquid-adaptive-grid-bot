@@ -60,7 +60,12 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
   - a hipotézis: 1 mp-en belül a bennfentesek után kiszállva még nyerünk;
   - siker: az `S10_bennfentes~masol` legalább 100 pozíción a hibahatárral együtt pozitív;
   - ellenhipotézis: a bennfentesek a követőknek adnak el, és mire kiszállunk, az ár már leesett.
-- **Mérés:** Telegram `/report`, `/wallets` (4. pont: követhetőség), `/diag` (bennfentes-klaszterek),
+- **Nyilvános ranglistás tárcák (S11_lista, 2026-10-21-től):**
+  - a tulajdonos által megadott címek (Kolscan, GMGN, Solana Tracker), Telegramon `/seed_add`;
+  - követés bármely pump.fun tokenen;
+  - siker: egy tárca `masol` átlaga legalább 30 pozíción jól a díjpadló (kb. −5%) fölött;
+  - kockázat: a népszerű ranglistás tárcákat sokan másolják, és ők is a követőiknek adhatnak el.
+- **Mérés:** Telegram `/report`, `/wallets` (4. pont: követhetőség, 5. pont: listás tárcák), `/diag` (bennfentes-klaszterek),
   `report --kiszallas`, `/export`.
 - **Siker (határidőig):** az S8_masol vagy az S7_organikus legalább 100 pozíción a hibahatárral
   együtt pozitív, 1,25%-os díjjal. Ezután egy második, friss 3 napos időszakon is.

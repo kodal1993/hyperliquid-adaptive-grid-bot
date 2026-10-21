@@ -54,6 +54,7 @@ EXPORT_FILES = [
     "state/paper_sniper_state.json",
     "state/paper_carry_log.csv",
     "state/paper_carry_state.json",
+    "state/seed_wallets.txt",
 ]
 WALLET_LOG_REL = "state/paper_sniper_wallet_trades.csv"   # nagy lehet: csak a fejléc + az utolsó sorok
 WALLET_LOG_EXPORT_LINES = 200_000
@@ -65,6 +66,9 @@ BOT_COMMANDS = [
     {"command": "sniper", "description": "Sniper: részletes eredmény"},
     {"command": "diag", "description": "Sniper: diagnosztika"},
     {"command": "wallets", "description": "Sniper: okos tárcák viselkedése"},
+    {"command": "seed_list", "description": "Követett listás tárcák"},
+    {"command": "seed_add", "description": "Tárca hozzáadása: /seed_add <cím> [név]"},
+    {"command": "seed_del", "description": "Tárca törlése: /seed_del <cím>"},
     {"command": "carry", "description": "Carry: állapot és összesítő"},
     {"command": "logs_sniper", "description": "Sniper: utolsó naplósorok"},
     {"command": "logs_carry", "description": "Carry: utolsó naplósorok"},
@@ -88,6 +92,7 @@ HELP_TEXT = """🤖 PAPÍR-BOTOK VEZÉRLÉSE (valódi pénz nélkül)
 🎯 /sniper - sniper: stratégiánkénti részletes eredmény
 🔬 /diag - sniper: diagnosztika (metaadat, RPC, kiürült görbék)
 👛 /wallets - okos tárcák viselkedése: mi működik, szerencse vagy tudás
+📋 /seed_list, /seed_add <cím> [név], /seed_del <cím> - nyilvános ranglistás tárcák követése (S11_lista)
 💰 /carry - carry: állapot és összesítő
 📜 /logs_sniper, /logs_carry - utolsó naplósorok
 🔄 /restart_sniper, /restart_carry - újraindítás
@@ -430,6 +435,56 @@ def run_pull() -> str:
 CONFIRM_LABELS = {"stop_sniper": "⏸ A sniper leállítása", "stop_carry": "⏸ A carry leállítása"}
 
 
+SEED_FILE_REL = "state/seed_wallets.txt"
+BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+MAX_SEEDS = 500
+
+
+def read_seed_lines() -> list[str]:
+    try:
+        return (PROJECT_ROOT / SEED_FILE_REL).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+
+
+def write_seed_lines(lines: list[str]) -> None:
+    path = PROJECT_ROOT / SEED_FILE_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def seed_command(text: str) -> str:
+    """listás tárcák kezelése: a sniper percenként újraolvassa a fájlt"""
+    parts = text.split()
+    command = parts[0].split("@")[0].lower()
+    lines = read_seed_lines()
+    entries = {ln.split()[0]: ln for ln in lines if ln.strip() and not ln.lstrip().startswith("#") and BASE58_RE.match(ln.split()[0])}
+    if command == "/seed_list":
+        if not entries:
+            return "📋 Nincs listás tárca. Hozzáadás: /seed_add <cím> [név] (pl. Kolscan / GMGN ranglistáról)"
+        body = "\n".join(f"  {ln}" for ln in entries.values())
+        return f"📋 Listás tárcák ({len(entries)}):\n{body}\n\nEredmény: /wallets (5. pont)"
+    if len(parts) < 2 or not BASE58_RE.match(parts[1]):
+        return "❌ Érvénytelen cím. Használat: /seed_add <solana-cím> [név]  vagy  /seed_del <solana-cím>"
+    addr = parts[1]
+    if command == "/seed_add":
+        if addr in entries:
+            return f"ℹ️ Már a listán: {addr}"
+        if len(entries) >= MAX_SEEDS:
+            return f"❌ Legfeljebb {MAX_SEEDS} tárca lehet a listán."
+        name = re.sub(r"[^\w.\-]", "", "_".join(parts[2:]))[:30]
+        write_seed_lines(lines + [f"{addr} {name}".strip()])
+        return f"✅ Hozzáadva: {addr} {name}\nA sniper 1 percen belül feliratkozik a kereskedéseire (S11_lista)."
+    if command == "/seed_del":
+        if addr not in entries:
+            return f"ℹ️ Nincs a listán: {addr}"
+        write_seed_lines([ln for ln in lines if not (ln.split() and ln.split()[0] == addr)])
+        return f"✅ Törölve: {addr}"
+    return "Ismeretlen parancs. /help"
+
+
 def handle_command(text: str, *, confirmed: bool = False) -> tuple[str, dict[str, Any] | None]:
     command = text.strip().split()[0].split("@")[0].lower()
     interval = report_interval_seconds()
@@ -452,6 +507,8 @@ def handle_command(text: str, *, confirmed: bool = False) -> tuple[str, dict[str
         return "🔬 SNIPER DIAG\n" + paper_script("paper_sniper", "diag"), None
     if command == "/carry":
         return "💰 CARRY\n" + paper_script("paper_carry", "status") + "\n" + paper_script("paper_carry", "report"), None
+    if command in {"/seed_list", "/seed_add", "/seed_del"}:
+        return seed_command(text), None
     m = re.fullmatch(r"/(logs|restart|stop|start)_(sniper|carry)", command)
     if m:
         action, label = m.groups()
