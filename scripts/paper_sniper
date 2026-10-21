@@ -157,9 +157,14 @@ def cfg(key, default, cast=float):
     return cast(v) if v not in (None, "") else default
 
 
+def redact(text):
+    """API-kulcsok kitakarasa (pl. Helius: ...?api-key=...) naplo, allapotfajl es export elott"""
+    return re.sub(r"(?i)(api[-_]?key=)[^&\s'\"]+", r"\1[REDACTED]", str(text))
+
+
 def log(msg):
     try:
-        print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), redact(msg), flush=True)
     except (BrokenPipeError, OSError):
         pass
 
@@ -374,6 +379,8 @@ class Sniper:
         self.stats = st.get("stats", {"started": time.time()})
         for k, v in (("seen", 0), ("migrations", 0), ("skipped", {}), ("missed", {}), ("entered", {})):
             self.stats.setdefault(k, v)
+        if (self.stats.get("rpc_ws") or {}).get("last_error"):
+            self.stats["rpc_ws"]["last_error"] = redact(self.stats["rpc_ws"]["last_error"])   # regi allapotfajlbol
         db = read_json(DB_FILE, {})
         self.creators = db.get("creators", {})               # dev -> {"t": [ido...], "g": graduáltak}
         self.names = db.get("names", {})                     # "n:nev" / "s:ticker" -> [mint, ido]
@@ -1020,7 +1027,7 @@ class Sniper:
             except Exception as e:
                 st = self.stats.setdefault("rpc_ws", {})
                 st["reconnects"] = st.get("reconnects", 0) + 1
-                st["last_error"] = f"{type(e).__name__}: {str(e)[:150]}"
+                st["last_error"] = redact(f"{type(e).__name__}: {str(e)[:150]}")
                 log(f"RPC WebSocket megszakadt: {st['last_error']} — ujra {backoff} mp mulva")
             if self.stop:
                 break
@@ -1035,7 +1042,7 @@ class Sniper:
             return
         if m.get("method") != "logsNotification":
             if "error" in m:
-                st["last_error"] = str(m["error"])[:200]
+                st["last_error"] = redact(str(m["error"])[:200])
                 log(f"RPC logsSubscribe hiba: {st['last_error']}")
             return
         res = (m.get("params") or {}).get("result") or {}
@@ -1596,7 +1603,9 @@ def diag():
     wst = s.get("wallets") or {}
     print(f"kereskedes-uzenet: {s.get('trade_msgs', 0)}  hibas: {s.get('trade_bad', 0)}  elszamolt tarca-pozicio: {s.get('wallet_closes', 0)}"
           f"  kovetett token most: {wst.get('tracked', '-')}  feliratkozas elkuldve: {s.get('subs_sent', 0)} token")
-    rw = s.get("rpc_ws") or {}
+    rw = dict(s.get("rpc_ws") or {})
+    if rw.get("last_error"):
+        rw["last_error"] = redact(rw["last_error"])
     print(f"Solana RPC logsSubscribe: ertesites {rw.get('notifications', 0)}, TradeEvent {rw.get('events', 0)},"
           f" CreateEvent {rw.get('creates', 0)}, visszajatszott korai {rw.get('replayed', 0)}, ujrakapcsolodas {rw.get('reconnects', 0)},"
           f" atlagos keses {rw.get('lag', '-')} mp"

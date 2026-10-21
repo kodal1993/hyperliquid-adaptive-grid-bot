@@ -359,7 +359,8 @@ def build_export() -> tuple[str, bytes, str]:
         for rel in EXPORT_FILES:
             path = PROJECT_ROOT / rel
             if path.is_file():
-                z.write(path, rel)
+                # kitakart szoveg, nem a nyers fajl: egy hibauzenetben se maradhasson API-kulcs
+                z.writestr(rel, redact_sensitive_output(path.read_text(encoding="utf-8", errors="replace")))
                 included.append(rel.split("/")[-1])
             else:
                 skipped.append(rel.split("/")[-1])
