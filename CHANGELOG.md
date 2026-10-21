@@ -1,5 +1,17 @@
 # Changelog
 
+## Paper sniper: token-napló és `tokens` elemzés — a nyerő tokenek korai jelei
+
+- Minden új tokenről pillanatkép 30 és 60 mp-es korban, láncon mérve (75 és 150 slot a `CreateEvent` után), így az RPC-késés nem torzítja.
+  - **A pillanatkép tartalma:** görbe, vevők, vételek és eladások, vásárolt SOL, a legnagyobb vevő aránya, dev-vétel és -részesedés, dev eladott-e, bundle-arány, klaszteres-e, másolt név, a dev korábbi indításai és graduációi, okos és ismert vesztes tárcák száma.
+  - **Kimenetel:** a pillanatkép árától mért legnagyobb és végső szorzó a követési ablak végéig.
+  - A naplók: `state/paper_sniper_tokens.csv` és a graduációk a `state/paper_sniper_migrations.csv`-ben.
+- `paper_sniper tokens [--h 30|60]` és Telegram `/tokens`:
+  - jelenként és sávonként a nyerő arány (legalább 3x vagy graduáció) a tanító (első 70%) és az ellenőrző (utolsó 30%) részen, az emelés és a 15 perces átlagos végső szorzó;
+  - csillag csak akkor, ha mindkét részen legalább 1,5-szörös az emelés;
+  - a legjobb 3 tanító sáv eredménye az ellenőrző részen.
+- A `/export` tartalmazza a token-elemzést, a token-napló utolsó 200 ezer sorát és a graduációs naplót.
+
 ## Paper sniper: S13_amm — graduáció utáni belépés (késés-független, ingyenes)
 
 - A PumpPortal graduációs eseménye után `PAPER_SNIPER_S13_DELAY_MIN` (5) perccel a DexScreener-adatok alapján dönt a belépésről.
