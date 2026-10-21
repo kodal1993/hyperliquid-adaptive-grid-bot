@@ -45,6 +45,10 @@ TARCA-ADATBAZIS (informacios elony)
   az sem, aki az elso 2 mp-ben vett (bundle / gyors sniper: ot ugysem tudnank kovetni).
   "Okos" a tarca, ha legalabb SMART_MIN_N tokenen kereskedett, a nyero arany >= SMART_MIN_WIN
   es az osszes PnL >= SMART_MIN_PNL SOL. Csak a mar lezart ablakok szamitanak (nincs elorelatas).
+  Viselkedesnaplo (state/paper_sniper_wallet_trades.csv): a legalabb 2 korabbi tokennel rendelkezo
+  tarcak minden pozicioja + 5% veletlen minta a tobbibol (minta=1, alapvonal). A 'wallets' parancs
+  ebbol mutatja meg, milyen belepesi idozites / tartas mukodik, es hogy az okos tarcak eredmenye
+  kitart-e (elso fele alapjan okos -> a masodik feleben is jo?).
 
 KISZALLASI VALTOZATOK (ugyanazokon a belepeseken, parhuzamosan)
   Minden poziciot tobb kiszallasi szabaly szerint is lezarunk; a CSV-ben a strategia
@@ -67,6 +71,7 @@ PARANCSOK (a repo gyokereben, a venv pythonjaval):
     .venv/bin/python scripts/paper_sniper report    # strategiankenti eredmeny
     .venv/bin/python scripts/paper_sniper report --javitott   # a regi sorok ujraszamolva a javitott elszamolassal
     .venv/bin/python scripts/paper_sniper report --kiszallas  # kiszallasi valtozatok parositott osszevetese
+    .venv/bin/python scripts/paper_sniper wallets   # okos tarcak viselkedese: mi mukodik, szerencse vagy tudas
     .venv/bin/python scripts/paper_sniper diag      # diagnosztika: kiszallasok, kiurult gorbek, metaadat, RPC
     .venv/bin/python scripts/paper_sniper report --telegram --ora 2   # tomor jelentes (a Telegram-vezerlo hivja)
     .venv/bin/python scripts/paper_sniper status    # mi fut most, nyitott poziciok
@@ -93,6 +98,8 @@ KONFIG (.env, mind opcionalis):
     PAPER_SNIPER_SMART_MIN_N=5      # okos tarca: legalabb ennyi elszamolt token
     PAPER_SNIPER_SMART_MIN_WIN=0.5  #   nyero arany
     PAPER_SNIPER_SMART_MIN_PNL=0.5  #   osszes PnL (SOL)
+    PAPER_SNIPER_WALLET_LOG=1       # 0 = nincs viselkedesnaplo
+    PAPER_SNIPER_WALLET_LOG_MB=300  # e folott a naplo archivalodik (.bak) es ujraindul
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # inditasi uzenet; a rendszeres jelentest a
                                            # scripts/telegram_control_bot.py kuldi
 
@@ -112,6 +119,9 @@ STATE_DIR = ROOT / "state"
 STATE_FILE = STATE_DIR / "paper_sniper_state.json"
 DB_FILE = STATE_DIR / "paper_sniper_db.json"
 TRADES_FILE = STATE_DIR / "paper_sniper_trades.csv"
+WALLET_LOG = STATE_DIR / "paper_sniper_wallet_trades.csv"   # tarca-pozicio viselkedesnaplo (wallets elemzes)
+WALLET_FIELDS = ["ts", "mint", "wallet", "prior_n", "prior_smart", "minta", "entry_age_s", "entry_rsol", "sol_in", "sol_out",
+                 "rem_val", "pnl", "ret_pct", "hold_s", "sold_frac", "n_buys", "n_sells", "tok_buyers", "tok_early_pct"]
 STOP_FILE = STATE_DIR / "STOP_SNIPER"
 LOCK_FILE = Path("/tmp/paper_sniper.lock")
 
@@ -430,6 +440,9 @@ class Sniper:
         self.wallets = db.get("wallets", {})                 # tarca -> [tokenek, nyero, PnL SOL, utolso ido]
         self.tracked = {}                                    # kovetett tokenek (kereskedes-feliratkozas): mint -> token
         self.sub_q, self.unsub_q = [], []                    # elkuldendo (le)iratkozasok
+        self.wallet_log_on = cfg("PAPER_SNIPER_WALLET_LOG", 1, int) == 1
+        self.wallet_log_max = cfg("PAPER_SNIPER_WALLET_LOG_MB", 300.0) * 1e6
+        self.wallet_rows = []
         for k, v in (("trade_msgs", 0), ("trade_bad", 0), ("wallet_closes", 0)):
             self.stats.setdefault(k, v)
 
@@ -561,10 +574,14 @@ class Sniper:
         if vs > 0 and vt > 0:
             T["px"] = vs / vt
         now = time.time()
-        rec = T["tr"].setdefault(w, [0.0, 0.0, 0.0, now])      # befizetett SOL, kapott SOL, token, elso vetel ideje
+        # befizetett SOL, kapott SOL, token, elso vetel ideje, valodi SOL a gorbeben az elso veteledkor,
+        # utolso eladas ideje, vetelek, eladasok, legtobb tartott token
+        rec = T["tr"].setdefault(w, [0.0, 0.0, 0.0, now, (vs - V0_SOL) if vs > 0 else -1.0, 0.0, 0, 0, 0.0])
         if m.get("txType") == "buy":
             rec[0] += sol
             rec[2] += tok
+            rec[6] += 1
+            rec[8] = max(rec[8], rec[2])
             T["n_buy"] += 1
             T["buyers"].add(w)
             if now - T["t"] <= EARLY_SEC and w != T["dev"]:
@@ -577,6 +594,8 @@ class Sniper:
         else:
             rec[1] += sol
             rec[2] = max(0.0, rec[2] - tok)
+            rec[5] = now
+            rec[7] += 1
             T["n_sell"] += 1
             if w == T["dev"]:
                 T["dev_sold"] = True
@@ -599,16 +618,45 @@ class Sniper:
             del self.tracked[mint]
             self.unsub_q.append(mint)
             px = T["px"]
-            for w, (si, so, tk, t0) in T["tr"].items():
+            early_pct = round(T["early_tok"] / TOTAL_SUPPLY * 100, 2)
+            for w, rec in T["tr"].items():
+                si, so, tk, t0 = rec[:4]
                 if w == T["dev"] or t0 - T["t"] <= EARLY_SEC or si < 0.02:
                     continue                          # dev, korai (nem kovetheto) vagy por-meretu
-                pnl = so + (tk * px * (1 - self.fee) if px else 0.0) - si
+                rem = tk * px * (1 - self.fee) if px else 0.0
+                pnl = so + rem - si
+                prior = self.wallets.get(w)
+                if self.wallet_log_on and len(rec) >= 9:
+                    minta = random.random() < 0.05
+                    if minta or (prior and prior[0] >= 2):
+                        e_rsol, t_sell, nb, ns, mx = rec[4:9]
+                        self.wallet_rows.append([round(now), mint, w, prior[0] if prior else 0, int(self.is_smart(w)), int(minta),
+                                                 round(t0 - T["t"], 1), round(e_rsol, 2), round(si, 4), round(so, 4), round(rem, 4),
+                                                 round(pnl, 4), round(pnl / si * 100, 1), round((t_sell or now) - t0) if t_sell else -1,
+                                                 round(1 - tk / mx, 3) if mx > 0 else 0.0, nb, ns, len(T["buyers"]), early_pct])
                 r = self.wallets.setdefault(w, [0, 0, 0.0, now])
                 r[0] += 1
                 r[1] += int(pnl > 0)
                 r[2] = round(r[2] + pnl, 4)
                 r[3] = round(now)
                 self.stats["wallet_closes"] += 1
+        self.flush_wallet_log()
+
+    def flush_wallet_log(self):
+        if not self.wallet_rows:
+            return
+        rows, self.wallet_rows = self.wallet_rows, []
+        try:
+            if WALLET_LOG.exists() and WALLET_LOG.stat().st_size > self.wallet_log_max:
+                WALLET_LOG.rename(WALLET_LOG.with_suffix(f".csv.bak{int(time.time())}"))
+            new = not WALLET_LOG.exists()
+            with WALLET_LOG.open("a", newline="") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(WALLET_FIELDS)
+                w.writerows(rows)
+        except OSError as e:
+            log(f"tarca-naplo hiba: {e}")
 
     def smart_count(self):
         return sum(1 for w in self.wallets if self.is_smart(w))
@@ -1165,6 +1213,143 @@ def telegram_report(hours=2.0):
     return "\n".join(out)
 
 
+def load_wallet_log(limit=2_000_000):
+    """a viselkedesnaplo sorai szamkent (a legujabb `limit` sor)"""
+    if not WALLET_LOG.exists():
+        return []
+    rows = []
+    with WALLET_LOG.open() as f:
+        for r in csv.DictReader(f):
+            try:
+                rows.append({k: (r[k] if k in ("mint", "wallet") else float(r[k])) for k in WALLET_FIELDS})
+            except (KeyError, TypeError, ValueError):
+                continue
+            if len(rows) > limit:
+                del rows[: len(rows) // 2]
+    return rows
+
+
+def _bucket_table(rows, title, key, edges, fmt):
+    """sorok csoportositasa egy mezo szerint: n, atlag/median hozam, nyero arany, PnL"""
+    out = [f"  {title}:"]
+    groups = {}
+    for r in rows:
+        v = key(r)
+        if v is None:
+            continue
+        lab = next((fmt(lo, hi) for lo, hi in zip(edges, edges[1:]) if lo <= v < hi), None)
+        if lab:
+            groups.setdefault(lab, []).append(r)
+    labels = [fmt(lo, hi) for lo, hi in zip(edges, edges[1:])]
+    for lab in labels:
+        xs = groups.get(lab, [])
+        if len(xs) < 5:
+            continue
+        ret = [x["ret_pct"] for x in xs]
+        out.append(f"    {lab:>14s}  n={len(xs):6d}  atlag {sum(ret) / len(ret):+7.1f}%  median {pct(ret, .5):+6.1f}%"
+                   f"  nyero {sum(1 for x in ret if x > 0) / len(ret) * 100:3.0f}%  PnL {sum(x['pnl'] for x in xs):+9.2f} SOL")
+    return out if len(out) > 1 else []
+
+
+def _profile(rows):
+    sold = [r["hold_s"] for r in rows if r["hold_s"] >= 0]
+    return {"n": len(rows),
+            "kor": pct([r["entry_age_s"] for r in rows], .5),
+            "gorbe": pct([r["entry_rsol"] for r in rows if r["entry_rsol"] >= 0], .5),
+            "tetel": pct([r["sol_in"] for r in rows], .5),
+            "tartas": pct(sold, .5) if sold else float("nan"),
+            "eladott": sum(1 for r in rows if r["sold_frac"] >= 0.99) / max(1, len(rows)) * 100,
+            "nyero": sum(1 for r in rows if r["pnl"] > 0) / max(1, len(rows)) * 100,
+            "atlag": sum(r["ret_pct"] for r in rows) / max(1, len(rows)),
+            "median": pct([r["ret_pct"] for r in rows], .5)}
+
+
+def wallets_report():
+    rows = load_wallet_log()
+    if not rows:
+        return "Meg nincs viselkedesnaplo (state/paper_sniper_wallet_trades.csv). Az uj kod indulasa utan ~15 perc mulva jon az elso."
+    db = read_json(DB_FILE, {}).get("wallets", {})
+    mn, mw, mp = cfg("PAPER_SNIPER_SMART_MIN_N", 5, int), cfg("PAPER_SNIPER_SMART_MIN_WIN", 0.5), cfg("PAPER_SNIPER_SMART_MIN_PNL", 0.5)
+    smart_now = {w for w, r in db.items() if r[0] >= mn and r[1] / r[0] >= mw and r[2] >= mp}
+    hours = (max(r["ts"] for r in rows) - min(r["ts"] for r in rows)) / 3600
+    out = [f"TARCA-VISELKEDES — {len(rows)} tarca-pozicio, {len({r['wallet'] for r in rows})} tarca, {hours:.1f} ora",
+           "(a hozam a tarca sajat eredmenye a kovetesi ablak vegeig, a mi dijaink es kesesunk NELKUL)", ""]
+
+    # 1. profil: okos vs tobbi
+    groups = [("okos (most)", [r for r in rows if r["wallet"] in smart_now]),
+              ("okos (akkor)", [r for r in rows if r["prior_smart"] == 1]),
+              ("visszatero", [r for r in rows if r["wallet"] not in smart_now and r["minta"] == 0]),
+              ("veletlen minta", [r for r in rows if r["minta"] == 1])]
+    out.append("1. Ki hogyan kereskedik (medianok)")
+    out.append(f"  {'csoport':15s} {'n':>7s} {'kor mp':>7s} {'gorbe SOL':>9s} {'tetel':>6s} {'tartas mp':>9s} {'mind el%':>8s}"
+               f" {'nyero%':>6s} {'atlag%':>7s} {'median%':>7s}")
+    for name, g in groups:
+        if len(g) < 5:
+            out.append(f"  {name:15s} {len(g):7d}  (keves adat)")
+            continue
+        q = _profile(g)
+        out.append(f"  {name:15s} {q['n']:7d} {q['kor']:7.0f} {q['gorbe']:9.1f} {q['tetel']:6.2f} {q['tartas']:9.0f} {q['eladott']:8.0f}"
+                   f" {q['nyero']:6.0f} {q['atlag']:+7.1f} {q['median']:+7.1f}")
+    out.append("  kor = a token kora a tarca elso veteleig; gorbe = valodi SOL a gorbeben akkor; tartas = elso vetel -> utolso eladas")
+
+    # 2. mi mukodik (minden sor)
+    out.append("")
+    out.append("2. Mi mukodik — minden naplozott pozicio")
+    out += _bucket_table(rows, "belepes: a token kora", lambda r: r["entry_age_s"], [2, 5, 15, 60, 180, 600, 1e9],
+                         lambda lo, hi: f"{lo:.0f}-{hi:.0f} mp" if hi < 1e9 else f"{lo:.0f}+ mp")
+    out += _bucket_table(rows, "belepes: valodi SOL a gorbeben", lambda r: r["entry_rsol"] if r["entry_rsol"] >= 0 else None,
+                         [0, 2, 5, 15, 40, 1e9], lambda lo, hi: f"{lo:.0f}-{hi:.0f} SOL" if hi < 1e9 else f"{lo:.0f}+ SOL")
+    out += _bucket_table(rows, "tartas (elso vetel -> utolso eladas)", lambda r: r["hold_s"] if r["hold_s"] >= 0 else 1e8,
+                         [0, 30, 120, 300, 900, 1e8, 1e9],
+                         lambda lo, hi: "nem adott el" if lo >= 1e8 else (f"{lo:.0f}+ mp" if hi >= 1e8 else f"{lo:.0f}-{hi:.0f} mp"))
+    out += _bucket_table(rows, "tetel", lambda r: r["sol_in"], [0.02, 0.1, 0.5, 2, 10, 1e9],
+                         lambda lo, hi: f"{lo:g}-{hi:g} SOL" if hi < 1e9 else f"{lo:g}+ SOL")
+    out += _bucket_table(rows, "a token korai (bundle) resze", lambda r: r["tok_early_pct"], [0, 5, 15, 30, 101],
+                         lambda lo, hi: f"{lo:.0f}-{hi:.0f}%")
+
+    # 3. szerencse vagy tudas: elso fele alapjan okos -> masodik fele?
+    out.append("")
+    out.append("3. Szerencse vagy tudas? (tarcak >= 10 pozicioval: az elso fele alapjan cimkezve, a masodik felet merve)")
+    by_w = {}
+    for r in rows:
+        by_w.setdefault(r["wallet"], []).append(r)
+    good, rest = [], []
+    for xs in by_w.values():
+        if len(xs) < 10:
+            continue
+        xs.sort(key=lambda r: r["ts"])
+        h = len(xs) // 2
+        first, second = xs[:h], xs[h:]
+        win1 = sum(1 for r in first if r["pnl"] > 0) / len(first)
+        (good if win1 >= 0.5 and sum(r["pnl"] for r in first) > 0 else rest).extend(second)
+    for name, g in (("elso feleben jo", good), ("tobbi", rest)):
+        if g:
+            st_ = strat_stats([{"pnl_sol": r["pnl"], "ret_pct": r["ret_pct"]} for r in g])
+            ci = "" if math.isnan(st_["ci"]) else f" ±{st_['ci']:.1f}"
+            out.append(f"  {name:16s} masodik fele: n={st_['n']:6d}  atlag {st_['mean']:+.1f}%{ci}  median {st_['median']:+.1f}%"
+                       f"  nyero {st_['win']:.0f}%  PnL {st_['pnl']:+.2f} SOL")
+    if good and rest:
+        a = sum(r["ret_pct"] for r in good) / len(good) - sum(r["ret_pct"] for r in rest) / len(rest)
+        out.append(f"  -> a 'jo' tarcak a masodik felben {a:+.1f}%-ponttal " + ("jobbak: van kitarto tudas." if a > 0 else "nem jobbak: inkabb szerencse."))
+    else:
+        out.append("  (meg keves a 10+ pozicios tarca)")
+
+    # 4. a legjobb okos tarcak viselkedese
+    top = sorted(smart_now, key=lambda w: -db[w][2])[:10]
+    if top:
+        out.append("")
+        out.append("4. A legjobb okos tarcak (adatbazis szerint) — medianok a naplobol")
+        for w in top:
+            xs = by_w.get(w, [])
+            r = db[w]
+            line = f"  {w[:6]}..{w[-4:]}  {r[0]:4d} token, nyero {r[1] / r[0] * 100:3.0f}%, PnL {r[2]:+7.2f} SOL"
+            if len(xs) >= 3:
+                q = _profile(xs)
+                line += f" | kor {q['kor']:.0f} mp, gorbe {q['gorbe']:.1f} SOL, tetel {q['tetel']:.2f}, tartas {q['tartas']:.0f} mp, mind el {q['eladott']:.0f}%"
+            out.append(line)
+    return "\n".join(out)
+
+
 def diag():
     """mi torzithatja az eredmenyt: kiszallasi okok, kiurult gorbek, a modell egyezese, metaadat, RPC"""
     fee, prio = sim_costs()
@@ -1274,7 +1459,7 @@ def status():
 
 def main():
     ap = argparse.ArgumentParser(description="pump.fun papir-sniper (valodi penz nelkul)")
-    ap.add_argument("cmd", choices=["run", "report", "status", "diag", "reset"])
+    ap.add_argument("cmd", choices=["run", "report", "status", "diag", "wallets", "reset"])
     ap.add_argument("--javitott", action="store_true", help="report: a lezart sorok ujraszamolasa a javitott elszamolassal")
     ap.add_argument("--telegram", action="store_true", help="report: tomor jelentes a Telegram-vezerlonek")
     ap.add_argument("--kiszallas", action="store_true", help="report: a kiszallasi valtozatok parositott osszevetese")
@@ -1289,6 +1474,9 @@ def main():
         return
     if a.cmd == "diag":
         diag()
+        return
+    if a.cmd == "wallets":
+        print(wallets_report())
         return
     if a.cmd == "status":
         status()
