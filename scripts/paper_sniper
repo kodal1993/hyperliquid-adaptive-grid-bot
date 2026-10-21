@@ -840,6 +840,8 @@ class Sniper:
             backoff = min(backoff * 2, 120)
 
     def handle(self, raw):
+        if isinstance(raw, (bytes, bytearray)):
+            raw = bytes(raw).decode("utf-8", "ignore")    # binaris keret is lehet
         if not isinstance(raw, str) or len(raw) > 20000:
             return
         try:
@@ -849,6 +851,16 @@ class Sniper:
         if not isinstance(m, dict):
             return
         tx = str(m.get("txType") or "")
+        wt = self.stats.setdefault("ws_types", {})
+        k = tx or ("message" if "message" in m else ("errors" if "errors" in m else "egyeb"))
+        if k in wt or len(wt) < 20:
+            wt[k] = wt.get(k, 0) + 1
+        if not tx and ("message" in m or "errors" in m):
+            pm = self.stats.setdefault("pp_msgs", [])
+            txt = str(m.get("message") or m.get("errors"))[:200]
+            if not pm or pm[-1][1] != txt:
+                pm.append([round(time.time()), txt])
+                del pm[:-5]
         if tx == "create":
             self.on_create(m)
         elif tx in ("buy", "sell"):
@@ -911,6 +923,8 @@ class Sniper:
             for method, q in (("unsubscribeTokenTrade", "unsub_q"), ("subscribeTokenTrade", "sub_q")):
                 keys = getattr(self, q)
                 setattr(self, q, [])
+                if keys and method == "subscribeTokenTrade":
+                    self.stats["subs_sent"] = self.stats.get("subs_sent", 0) + len(keys)
                 for i in range(0, len(keys), 100):
                     await send(json.dumps({"method": method, "keys": keys[i:i + 100]}))
 
@@ -1413,13 +1427,18 @@ def diag():
 
     print("\n== Belepesek strategiankent (belepett / tele volt / nem sikerult)")
     ent, sk, mi = s.get("entered", {}), s.get("skipped", {}), s.get("missed", {})
-    for k in sorted(set(ent) | set(sk) | set(mi) | set(STRAT_DESC), key=strat_order):
+    for k in sorted(STRAT_DESC, key=strat_order):
         print(f"  {k:12s} {ent.get(k, '-')!s:>6} / {sk.get(k, 0):>5} / {mi.get(k, 0):>5}")
 
     print("\n== Tarca-kovetes (S6/S8/S10)")
     wst = s.get("wallets") or {}
     print(f"kereskedes-uzenet: {s.get('trade_msgs', 0)}  hibas: {s.get('trade_bad', 0)}  elszamolt tarca-pozicio: {s.get('wallet_closes', 0)}"
-          f"  kovetett token most: {wst.get('tracked', '-')}")
+          f"  kovetett token most: {wst.get('tracked', '-')}  feliratkozas elkuldve: {s.get('subs_sent', 0)} token")
+    wt = s.get("ws_types") or {}
+    if wt:
+        print("WebSocket-uzenetek tipus szerint: " + ", ".join(f"{k} {v}" for k, v in sorted(wt.items(), key=lambda kv: -kv[1])))
+    for t, txt in s.get("pp_msgs") or []:
+        print(f"  PumpPortal ({time.strftime('%m-%d %H:%M', time.localtime(t))}): {txt}")
     wl = read_json(DB_FILE, {}).get("wallets", {})
     if wl:
         mn, mw, mp = cfg("PAPER_SNIPER_SMART_MIN_N", 5, int), cfg("PAPER_SNIPER_SMART_MIN_WIN", 0.5), cfg("PAPER_SNIPER_SMART_MIN_PNL", 0.5)
