@@ -35,6 +35,9 @@ STRATEGIAK
                  dev-vetel 0.5-3 SOL, dev < 10%, TG vagy X link — a metaadat utan
     S6_okos      egy "okos tarca" vett (sajat tarca-adatbazis, lasd lent), 1 mp kesessel
     S6_okos2     legalabb 2 okos tarca vett ugyanabbol
+    S8_masol     kovethetoen nyero tarca vett: a tarcat azon mertuk, mennyit hozott volna NEKUNK
+                 kovetve (1 mp keses, a mi dijaink, kiszallas a tarca eladasakor), es ennek az
+                 also hibahatara is pozitiv — 1 mp kesessel
     S7_organikus 60 mp-nel: >= 15 kulon vevo, a korai (2 mp-en beluli) vevok < 15%-ot
                  vettek, a dev nem adott el, eladas/vetel < 0.6 — a bundle-os tokenek kimaradnak
 
@@ -45,6 +48,12 @@ TARCA-ADATBAZIS (informacios elony)
   az sem, aki az elso 2 mp-ben vett (bundle / gyors sniper: ot ugysem tudnank kovetni).
   "Okos" a tarca, ha legalabb SMART_MIN_N tokenen kereskedett, a nyero arany >= SMART_MIN_WIN
   es az osszes PnL >= SMART_MIN_PNL SOL. Csak a mar lezart ablakok szamitanak (nincs elorelatas).
+  Kovethetoseg ("okosabbak az okosaknal"): a tarca sajat PnL-je felrevezet — egy gyors bot mindig
+  nyerni latszik, de mire mi utana lepunk, az ar elment. Ezert minden tarca-poziciohoz kiszamoljuk a
+  KOVETO hozamat is: belepes a tarca vetele utan COPY_LAT mp-cel az akkori aron, kiszallas a tarca
+  elso eladasa utan COPY_LAT mp-cel (vagy az ablak vegen), a mi dijainkkal es prio-dijunkkal. A hozam
+  +500%-nal le van vagva, hogy egyetlen szerencses token ne vigye el. Masolhato a tarca, ha legalabb
+  COPY_MIN_N ilyen pozicioja van, es az atlagos koveto hozam - 2 * standard hiba > 0.
   Viselkedesnaplo (state/paper_sniper_wallet_trades.csv): a legalabb 2 korabbi tokennel rendelkezo
   tarcak minden pozicioja + 5% veletlen minta a tobbibol (minta=1, alapvonal). A 'wallets' parancs
   ebbol mutatja meg, milyen belepesi idozites / tartas mukodik, es hogy az okos tarcak eredmenye
@@ -60,6 +69,7 @@ KISZALLASI VALTOZATOK (ugyanazokon a belepeseken, parhuzamosan)
     reszl   2x-nel a fele el, a maradek: csucstol -30% vagy vissza 1.0x-ig, SL 0.5x, max 60 perc
     szoros  TP 2x, SL 0.8x, max 30 perc
     futtat  TP 5x, SL 0.4x, max 60 perc
+    masol   (csak S6/S8) ki, amikor a kovetett tarca elad; SL 0.5x, max 30 perc
 
 ELSZAMOLAS
   A papir-vetel nincs benne a valodi gorbeben, ezert eladaskor a valodi SOL-tartalek
@@ -98,6 +108,8 @@ KONFIG (.env, mind opcionalis):
     PAPER_SNIPER_SMART_MIN_N=5      # okos tarca: legalabb ennyi elszamolt token
     PAPER_SNIPER_SMART_MIN_WIN=0.5  #   nyero arany
     PAPER_SNIPER_SMART_MIN_PNL=0.5  #   osszes PnL (SOL)
+    PAPER_SNIPER_COPY_LAT=1.0       # koveto keses (mp) a kovethetosegi pontszamhoz
+    PAPER_SNIPER_COPY_MIN_N=8       # masolhato tarca: legalabb ennyi koveto-pozicio
     PAPER_SNIPER_WALLET_LOG=1       # 0 = nincs viselkedesnaplo
     PAPER_SNIPER_WALLET_LOG_MB=300  # e folott a naplo archivalodik (.bak) es ujraindul
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # inditasi uzenet; a rendszeres jelentest a
@@ -144,6 +156,7 @@ STRAT_DESC = {
     "S6_okos": "okos tarca vett (sajat tarca-adatbazis), 1 mp keses",
     "S6_okos2": "legalabb 2 okos tarca vett",
     "S7_organikus": "60 mp: sok vevo, kevés korai/bundle, a dev tart",
+    "S8_masol": "kovethetoen nyero tarca vett (a mi kesesunkkel + dijainkkal mert)",
 }
 TOTAL_SUPPLY = 1e9                     # pump.fun tokenek teljes kinalata
 EARLY_SEC = 2.0                        # ennyi mp-en beluli vetel "korai" (bundle / gyors sniper)
@@ -157,6 +170,7 @@ EXITS = {
     "reszl": {"sl": 0.5, "max": 60, "part_x": 2.0, "part_frac": 0.5, "be": True, "trail_x": 2.0, "trail_drop": 0.3},
     "szoros": {"tp": 2.0, "sl": 0.8, "max": 30},
     "futtat": {"tp": 5.0, "sl": 0.4, "max": 60},
+    "masol": {"leader": True, "sl": 0.5, "max": 30},                  # csak kovetett tarcas poziciokon
 }
 EXIT_DESC = {
     "alap": "a konfig TP/SL/idokorlatja",
@@ -165,6 +179,7 @@ EXIT_DESC = {
     "reszl": "2x-nel fele el, maradek trail/1.0x",
     "szoros": "TP 2x, SL 0.8x",
     "futtat": "TP 5x, SL 0.4x, 60 perc",
+    "masol": "ki, amikor a kovetett tarca elad",
 }
 
 
@@ -443,6 +458,9 @@ class Sniper:
         self.wallet_log_on = cfg("PAPER_SNIPER_WALLET_LOG", 1, int) == 1
         self.wallet_log_max = cfg("PAPER_SNIPER_WALLET_LOG_MB", 300.0) * 1e6
         self.wallet_rows = []
+        self.copy_lat = cfg("PAPER_SNIPER_COPY_LAT", 1.0)
+        self.copy_n = cfg("PAPER_SNIPER_COPY_MIN_N", 8, int)
+        self.led = {}                                        # (mint, kovetett tarca) -> poziciok (masol kiszallas)
         for k, v in (("trade_msgs", 0), ("trade_bad", 0), ("wallet_closes", 0)):
             self.stats.setdefault(k, v)
 
@@ -547,14 +565,48 @@ class Sniper:
 
     # ---- kereskedes-kovetes es tarca-adatbazis
     def track(self, T, m):
-        T.update({"tr": {}, "buyers": set(), "early_tok": 0.0, "n_buy": 0, "n_sell": 0, "dev_sold": False, "px": None, "smart": set()})
+        T.update({"tr": {}, "buyers": set(), "early_tok": 0.0, "n_buy": 0, "n_sell": 0, "dev_sold": False, "px": None, "smart": set(),
+                  "pt": [], "pp": [], "leaders": {}})
         vs, vt = fnum(m.get("vSolInBondingCurve")), fnum(m.get("vTokensInBondingCurve"))
         if vs > 0 and vt > 0:
-            T["px"] = vs / vt
+            self.add_px(T, time.time(), vs / vt)
         self.tracked[T["mint"]] = T
         self.sub_q.append(T["mint"])
         if "S7_organikus" in self.strats:
             asyncio.get_running_loop().call_later(60, self.eval_organic, T)
+
+    @staticmethod
+    def add_px(T, t, px):
+        """ar-idosor a koveto-szimulaciohoz (legfeljebb ~4000 pont, utana ritkitva)"""
+        T["px"] = px
+        T["pt"].append(t)
+        T["pp"].append(px)
+        if len(T["pt"]) > 4000:
+            T["pt"], T["pp"] = T["pt"][::2], T["pp"][::2]
+
+    @staticmethod
+    def px_at(T, t):
+        """a t idopontban ervenyes ar: az addigi utolso kereskedes utani ar (None, ha meg nincs)"""
+        import bisect
+        i = bisect.bisect_right(T["pt"], t) - 1
+        return T["pp"][i] if i >= 0 else None
+
+    def copy_lcb(self, w):
+        """a koveto hozam atlaga - 2 * standard hiba (None, ha keves az adat)"""
+        r = self.wallets.get(w)
+        if not r or len(r) < 8 or r[4] < self.copy_n:
+            return None
+        n = r[4]
+        mean = r[6] / n
+        var = max(0.0, (r[7] - n * mean * mean) / (n - 1))
+        return mean - 2 * math.sqrt(var / n)
+
+    def is_copyable(self, w):
+        lcb = self.copy_lcb(w)
+        return lcb is not None and lcb > 0
+
+    def copyable_count(self):
+        return sum(1 for w in self.wallets if self.is_copyable(w))
 
     def is_smart(self, w):
         r = self.wallets.get(w)
@@ -571,12 +623,13 @@ class Sniper:
             return
         self.stats["trade_msgs"] += 1
         vs, vt = fnum(m.get("vSolInBondingCurve")), fnum(m.get("vTokensInBondingCurve"))
-        if vs > 0 and vt > 0:
-            T["px"] = vs / vt
         now = time.time()
+        if vs > 0 and vt > 0:
+            self.add_px(T, now, vs / vt)
         # befizetett SOL, kapott SOL, token, elso vetel ideje, valodi SOL a gorbeben az elso veteledkor,
         # utolso eladas ideje, vetelek, eladasok, legtobb tartott token
-        rec = T["tr"].setdefault(w, [0.0, 0.0, 0.0, now, (vs - V0_SOL) if vs > 0 else -1.0, 0.0, 0, 0, 0.0])
+        # ..., elso eladas ideje (a koveto ekkor szall ki)
+        rec = T["tr"].setdefault(w, [0.0, 0.0, 0.0, now, (vs - V0_SOL) if vs > 0 else -1.0, 0.0, 0, 0, 0.0, 0.0])
         if m.get("txType") == "buy":
             rec[0] += sol
             rec[2] += tok
@@ -588,14 +641,23 @@ class Sniper:
                 T["early_tok"] += tok
             if w != T["dev"] and self.is_smart(w):
                 T["smart"].add(w)
+                T["leaders"].setdefault("S6_okos", w)
                 self.enter_later("S6_okos", T, 1)
                 if len(T["smart"]) >= 2:
+                    T["leaders"].setdefault("S6_okos2", w)
                     self.enter_later("S6_okos2", T, 1)
+            if w != T["dev"] and self.is_copyable(w):
+                T["leaders"].setdefault("S8_masol", w)
+                self.enter_later("S8_masol", T, self.copy_lat)
         else:
             rec[1] += sol
             rec[2] = max(0.0, rec[2] - tok)
             rec[5] = now
             rec[7] += 1
+            if len(rec) >= 10 and not rec[9]:
+                rec[9] = now
+            for p in self.led.get((T["mint"], w), ()):
+                p.setdefault("leader_sold", now)
             T["n_sell"] += 1
             if w == T["dev"]:
                 T["dev_sold"] = True
@@ -635,6 +697,18 @@ class Sniper:
                                                  round(pnl, 4), round(pnl / si * 100, 1), round((t_sell or now) - t0) if t_sell else -1,
                                                  round(1 - tk / mx, 3) if mx > 0 else 0.0, nb, ns, len(T["buyers"]), early_pct])
                 r = self.wallets.setdefault(w, [0, 0, 0.0, now])
+                while len(r) < 8:
+                    r.append(0)                       # koveto: poziciok, nyero, hozam-osszeg, negyzetosszeg
+                entry = self.px_at(T, t0 + self.copy_lat)
+                if entry:
+                    t_sell = rec[9] if len(rec) >= 10 else 0.0
+                    ex = (self.px_at(T, t_sell + self.copy_lat) if t_sell else None) or T["px"]
+                    cr = (ex / entry) * (1 - self.fee) ** 2 - 1 - 2 * self.prio / self.size
+                    cr = max(-1.0, min(5.0, cr))
+                    r[4] += 1
+                    r[5] += int(cr > 0)
+                    r[6] = round(r[6] + cr, 5)
+                    r[7] = round(r[7] + cr * cr, 5)
                 r[0] += 1
                 r[1] += int(pnl > 0)
                 r[2] = round(r[2] + pnl, 4)
@@ -701,6 +775,11 @@ class Sniper:
                                "t_open": time.time(), "born": T["t"], "latency": round(time.time() - T["t"], 2),
                                "entry_vsol": c["vsol"] / 1e9, "tokens": tokens, "net_lam": lam * (1 - self.fee),
                                "cost": self.size + self.prio, "last": c, "miss": 0, "exits": self.new_exits()})
+        leader = T.get("leaders", {}).get(strat)
+        if leader:
+            p = self.positions[-1]
+            p["leader"] = leader
+            self.led.setdefault((T["mint"], leader), []).append(p)
 
     def new_exits(self):
         return {k: {"peak": 0.0, "rem": 1.0, "got": 0.0, "part": False} for k in self.exits}
@@ -783,8 +862,8 @@ class Sniper:
             exits = p.setdefault("exits", self.new_exits())           # regi allapotfajl: minden valtozat most indul
             for name in list(exits):
                 e, rule = exits[name], self.exits.get(name)
-                if rule is None:
-                    del exits[name]
+                if rule is None or (rule.get("leader") and not p.get("leader")):
+                    del exits[name]                    # nincs ilyen valtozat / nincs kovetett tarca
                     continue
                 e["peak"] = max(e["peak"], ratio)
                 if rule.get("part_x") and not e["part"] and not done and ratio >= rule["part_x"]:
@@ -800,6 +879,8 @@ class Sniper:
                     reason = "TP"
                 elif ratio <= sl:
                     reason = "SL" if not e["part"] else "reszl+SL"
+                elif rule.get("leader") and p.get("leader_sold") and now - p["leader_sold"] >= self.copy_lat:
+                    reason = "masol"
                 elif rule.get("trail_x") and e["peak"] >= rule["trail_x"] and ratio <= e["peak"] * (1 - rule["trail_drop"]):
                     reason = "trail"
                 elif hold >= rule.get("max", 30) * 60:
@@ -815,6 +896,10 @@ class Sniper:
             if exits:
                 keep.append(p)
         self.positions = keep
+        self.led = {}
+        for p in keep:
+            if p.get("leader"):
+                self.led.setdefault((p["mint"], p["leader"]), []).append(p)
 
     def close(self, p, c, value, reason, now, exit_name="alap"):
         pnl = value - p["cost"]
@@ -927,7 +1012,8 @@ class Sniper:
             n += 1
             self.stats["rpc"] = {"calls": self.rpc.calls, "errors": self.rpc.errors, "since": self.t_start}
             if n % 10 == 0 and self.trades_on:
-                self.stats["wallets"] = {"n": len(self.wallets), "smart": self.smart_count(), "tracked": len(self.tracked)}
+                self.stats["wallets"] = {"n": len(self.wallets), "smart": self.smart_count(), "tracked": len(self.tracked),
+                                         "copyable": self.copyable_count()}
             if n % 10 == 0:                      # idosor a Telegram-jelentes ablakaihoz (48 ora)
                 h = self.stats.setdefault("hist", [])
                 h.append([round(time.time()), self.stats["seen"], self.stats["migrations"], self.stats["meta_ok"],
@@ -1156,7 +1242,8 @@ def telegram_report(hours=2.0):
         out.append(f"Osszesen eddig: {s.get('seen', 0)} token, {s.get('migrations', 0)} graduacio (ablak-adat meg nincs)")
     wst = s.get("wallets")
     if wst:
-        out.append(f"Tarca-adatbazis: {wst.get('n', 0)} tarca, okos {wst.get('smart', 0)}, kovetett token {wst.get('tracked', 0)},"
+        out.append(f"Tarca-adatbazis: {wst.get('n', 0)} tarca, okos {wst.get('smart', 0)}, masolhato {wst.get('copyable', 0)},"
+                   f" kovetett token {wst.get('tracked', 0)},"
                    f" kereskedes-uzenet {s.get('trade_msgs', 0)}")
         if s.get("trade_msgs", 0) == 0:
             warn.append("nem jon kereskedes-uzenet (S6/S7 es a tarca-adatbazis nem tanul)")
@@ -1264,6 +1351,16 @@ def _profile(rows):
             "median": pct([r["ret_pct"] for r in rows], .5)}
 
 
+def copy_stats(r, n_min):
+    """(n, atlag, also hatar, nyero arany) a koveto hozamra egy tarca-rekordbol; None, ha keves"""
+    if len(r) < 8 or r[4] < max(2, n_min):
+        return None
+    n = r[4]
+    mean = r[6] / n
+    var = max(0.0, (r[7] - n * mean * mean) / (n - 1))
+    return n, mean, mean - 2 * math.sqrt(var / n), r[5] / n
+
+
 def wallets_report():
     rows = load_wallet_log()
     if not rows:
@@ -1334,11 +1431,36 @@ def wallets_report():
     else:
         out.append("  (meg keves a 10+ pozicios tarca)")
 
+    # 5. kovethetoseg: mennyit hoz a tarca NEKUNK kovetve (keses + dijak), es masolhato-e
+    cn = cfg("PAPER_SNIPER_COPY_MIN_N", 8, int)
+    cs = {w: copy_stats(r, cn) for w, r in db.items()}
+    cs = {w: v for w, v in cs.items() if v}
+    out.append("")
+    out.append(f"4. Kovethetoseg — mennyit hozott volna NEKUNK a tarca kovetese (1 mp keses, a mi dijaink, kiszallas az o eladasakor)")
+    if cs:
+        def avg(ws):
+            xs = [cs[w] for w in ws if w in cs]
+            return (sum(v[1] * v[0] for v in xs) / max(1, sum(v[0] for v in xs)) * 100, sum(v[0] for v in xs)) if xs else (float("nan"), 0)
+        a_s, n_s = avg(smart_now)
+        a_o, n_o = avg([w for w in cs if w not in smart_now])
+        copyable = sorted((w for w, v in cs.items() if v[2] > 0), key=lambda w: -cs[w][2])
+        out.append(f"  tarcak >= {cn} koveto-pozicioval: {len(cs)}, ebbol masolhato (also hatar > 0): {len(copyable)}")
+        out.append(f"  az 'okos' (sajat PnL szerint) tarcak kovetve: {a_s:+.1f}% / pozicio (n={n_s});  a tobbi: {a_o:+.1f}% (n={n_o})")
+        if n_s and a_s <= 0:
+            out.append("  -> a sajat PnL alapjan okos tarcak kovetve NEM hoznak: oket nem szabad masolni (S6), csak a masolhatokat (S8).")
+        for w in copyable[:10]:
+            n, mean, lcb, win = cs[w]
+            r = db[w]
+            out.append(f"  {w[:6]}..{w[-4:]}  koveto {n:4d} poz., atlag {mean * 100:+6.1f}%, also hatar {lcb * 100:+6.1f}%, nyero {win * 100:3.0f}%"
+                       f" | sajat PnL {r[2]:+.2f} SOL")
+    else:
+        out.append(f"  meg nincs tarca >= {cn} koveto-pozicioval")
+
     # 4. a legjobb okos tarcak viselkedese
     top = sorted(smart_now, key=lambda w: -db[w][2])[:10]
     if top:
         out.append("")
-        out.append("4. A legjobb okos tarcak (adatbazis szerint) — medianok a naplobol")
+        out.append("5. A legjobb okos tarcak (adatbazis szerint) — medianok a naplobol")
         for w in top:
             xs = by_w.get(w, [])
             r = db[w]
