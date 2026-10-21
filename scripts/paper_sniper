@@ -377,6 +377,7 @@ class Sniper:
         self.copy_n = cfg("PAPER_SNIPER_COPY_MIN_N", 8, int)
         self.led = {}                                        # (mint, kovetett tarca) -> poziciok (masol kiszallas)
         self.led_wallets = set()
+        self.pending = {}                                    # mint -> [(erkezes, esemeny)]: a PumpPortal create elott jott kereskedesek
         self.sample_s10 = cfg("PAPER_SNIPER_SAMPLE_S10", 0.3)
         self.cluster_min = cfg("PAPER_SNIPER_CLUSTER_MIN", 3, int)
         self.pairs = db.get("pairs", {})                     # "a|b" (rendezve) -> [kozos korai tokenek, utolso ido]
@@ -475,10 +476,18 @@ class Sniper:
     def track(self, T, m):
         T.update({"tr": {}, "buyers": set(), "early_tok": 0.0, "n_buy": 0, "n_sell": 0, "dev_sold": False, "px": None, "smart": set(),
                   "pt": [], "pp": [], "leaders": {}})
-        vs, vt = fnum(m.get("vSolInBondingCurve")), fnum(m.get("vTokensInBondingCurve"))
-        if vs > 0 and vt > 0:
-            self.add_px(T, time.time(), vs / vt)
         self.tracked[T["mint"]] = T
+        # a Solana RPC gyorsabb a PumpPortalnal: a token elso (korai) kereskedesei mar a create elott
+        # megjohettek -> visszajatszas az eredeti erkezesi idovel (ezek a bundle-ok / korai vevok)
+        early = sorted(self.pending.pop(T["mint"], []), key=lambda x: x[0])
+        for t, ev in early:
+            self.on_trade(ev, t)
+        if early:
+            st = self.stats.setdefault("rpc_ws", {})
+            st["replayed"] = st.get("replayed", 0) + len(early)
+        vs, vt = fnum(m.get("vSolInBondingCurve")), fnum(m.get("vTokensInBondingCurve"))
+        if vs > 0 and vt > 0 and not T["pt"]:
+            self.add_px(T, time.time(), vs / vt)
         self.sub_q.append(T["mint"])
         asyncio.get_running_loop().call_later(CLUSTER_SEC, self.eval_cluster, T)
 
@@ -519,11 +528,12 @@ class Sniper:
         r = self.wallets.get(w)
         return bool(r) and r[0] >= self.smart_n and r[1] / r[0] >= self.smart_win and r[2] >= self.smart_pnl
 
-    def on_trade(self, m):
+    def on_trade(self, m, now=None):
+        now = now or time.time()
         mint, w = str(m.get("mint") or ""), str(m.get("traderPublicKey") or "")
         if m.get("txType") == "sell":
             for p in self.led.get((mint, w), ()):
-                p.setdefault("leader_sold", time.time())   # a kovetett tarca elad (a masol kiszallashoz)
+                p.setdefault("leader_sold", now)          # a kovetett tarca elad (a masol kiszallashoz)
         T = self.tracked.get(mint)
         if T is None:
             return
@@ -533,7 +543,6 @@ class Sniper:
             return
         self.stats["trade_msgs"] += 1
         vs, vt = fnum(m.get("vSolInBondingCurve")), fnum(m.get("vTokensInBondingCurve"))
-        now = time.time()
         if vs > 0 and vt > 0:
             self.add_px(T, now, vs / vt)
         # befizetett SOL, kapott SOL, token, elso vetel ideje, valodi SOL a gorbeben az elso veteledkor,
@@ -959,6 +968,9 @@ class Sniper:
             if self.trades_on:
                 self.finalize_tracked()
             self.sub_q, self.unsub_q = [], []
+            cut = time.time() - 30
+            for k in [k for k, v in self.pending.items() if v[0][0] < cut]:
+                del self.pending[k]                   # 30 mp utan sem jott create: regi vagy nem kovetett token
 
     # ---- kereskedesek a Solana RPC-rol (logsSubscribe a pump.fun programra)
     async def rpc_ws_loop(self):
@@ -999,8 +1011,13 @@ class Sniper:
                 ev = decode_trade_event(ln[14:])
                 if ev:
                     st["events"] = st.get("events", 0) + 1
-                    if ev["mint"] in self.tracked or ev["traderPublicKey"] in self.led_wallets:
+                    mint = ev["mint"]
+                    if mint in self.tracked or ev["traderPublicKey"] in self.led_wallets:
                         self.on_trade(ev)
+                    elif mint not in self.tokens and mint not in self.mint_dev:
+                        buf = self.pending.setdefault(mint, [])   # meg nem lattuk a create-et: puffer
+                        if len(buf) < 50:
+                            buf.append((time.time(), ev))
 
     async def _rpc_ws_session(self):
         sub = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
@@ -1523,7 +1540,8 @@ def diag():
           f"  kovetett token most: {wst.get('tracked', '-')}  feliratkozas elkuldve: {s.get('subs_sent', 0)} token")
     rw = s.get("rpc_ws") or {}
     print(f"Solana RPC logsSubscribe: ertesites {rw.get('notifications', 0)}, TradeEvent {rw.get('events', 0)},"
-          f" ujrakapcsolodas {rw.get('reconnects', 0)}" + (f", utolso hiba: {rw['last_error']}" if rw.get("last_error") else ""))
+          f" visszajatszott korai {rw.get('replayed', 0)}, ujrakapcsolodas {rw.get('reconnects', 0)}"
+          + (f", utolso hiba: {rw['last_error']}" if rw.get("last_error") else ""))
     if not rw.get("events"):
         print("  FIGYELEM: nem jon TradeEvent a Solana RPC-rol (SOLANA_WS_URL / a nyilvanos RPC korlatozhat — Helius-kulcs ajanlott)")
     wt = s.get("ws_types") or {}
