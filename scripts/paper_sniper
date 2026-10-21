@@ -44,6 +44,7 @@ PARANCSOK (a repo gyokereben, a venv pythonjaval):
     .venv/bin/python scripts/paper_sniper report    # strategiankenti eredmeny
     .venv/bin/python scripts/paper_sniper report --javitott   # a regi sorok ujraszamolva a javitott elszamolassal
     .venv/bin/python scripts/paper_sniper diag      # diagnosztika: kiszallasok, kiurult gorbek, metaadat, RPC
+    .venv/bin/python scripts/paper_sniper report --telegram --ora 2   # tomor jelentes (a Telegram-vezerlo hivja)
     .venv/bin/python scripts/paper_sniper status    # mi fut most, nyitott poziciok
     .venv/bin/python scripts/paper_sniper reset     # szimulalt eredmenyek torlese (a dev-adatbazis marad)
 
@@ -62,7 +63,8 @@ KONFIG (.env, mind opcionalis):
     PAPER_SNIPER_IPFS=https://ipfs.io/ipfs/,https://dweb.link/ipfs/,https://w3s.link/ipfs/   # IPFS-atjarok sorrendben
     PAPER_SNIPER_META_HOSTS=        # nem-IPFS metaadat-hosztok (https, pontos egyezes), vesszovel
     PAPER_SNIPER_META_WORKERS=8     # parhuzamos metaadat-letoltok
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # opcionalis napi osszesito
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # inditasi uzenet; a rendszeres jelentest a
+                                           # scripts/telegram_control_bot.py kuldi
 
 LEALLITAS: systemctl stop hyperliquid-paper-sniper   vagy   touch state/STOP_SNIPER
 """
@@ -654,18 +656,19 @@ class Sniper:
 
     # ---- futtatas
     async def periodic(self):
-        last_daily = time.time()
         n = 0
         while not self.stop:
             await asyncio.sleep(60)
             n += 1
             self.stats["rpc"] = {"calls": self.rpc.calls, "errors": self.rpc.errors, "since": self.t_start}
+            if n % 10 == 0:                      # idosor a Telegram-jelentes ablakaihoz (48 ora)
+                h = self.stats.setdefault("hist", [])
+                h.append([round(time.time()), self.stats["seen"], self.stats["migrations"], self.stats["meta_ok"],
+                          self.stats["meta_fail"] + self.stats["meta_drop"], self.rpc.calls, self.rpc.errors])
+                del h[:-288]
             self.save(db=(n % 10 == 0))          # allapot percenkent, a (nagyobb) dev-adatbazis 10 percenkent
             open_ = len(self.positions)
             log(f"latott {self.stats['seen']} token, {self.stats['migrations']} graduacio, nyitott {open_}, RPC hivas {self.rpc.calls} (hiba {self.rpc.errors})")
-            if time.time() - last_daily > 86400:
-                telegram("Napi:\n" + report_text(short=True))
-                last_daily = time.time()
 
     async def main(self):
         log(f"Paper sniper indul. Strategiak: {', '.join(self.strats)}. Tetel {self.size} SOL, dij {self.fee*100:.2f}%/irany, prio {self.prio} SOL/tx, "
@@ -787,6 +790,96 @@ def report_text(short=False, fixed=False):
     return "\n".join(lines)
 
 
+def strat_stats(xs):
+    n = len(xs)
+    pnl = [fnum(r["pnl_sol"]) for r in xs]
+    ret = [fnum(r["ret_pct"]) for r in xs]
+    mean = sum(ret) / n
+    sd = math.sqrt(sum((x - mean) ** 2 for x in ret) / (n - 1)) if n > 1 else 0.0
+    ci = 1.96 * sd / math.sqrt(n) if n > 1 else float("nan")
+    verdict = "+" if n >= 30 and mean - ci > 0 else ("-" if n >= 30 and mean + ci < 0 else "?")
+    return {"n": n, "pnl": sum(pnl), "mean": mean, "ci": ci, "win": sum(1 for p in pnl if p > 0) / n * 100,
+            "verdict": verdict, "median": pct(ret, .5)}
+
+
+def telegram_report(hours=2.0):
+    """tomor, Telegram-meretu jelentes: az elmult `hours` ora + osszesen, figyelmeztetesekkel"""
+    now = time.time()
+    since = now - hours * 3600
+    st = read_json(STATE_FILE, {})
+    s = st.get("stats", {})
+    out, warn = [], []
+    saved = st.get("saved")
+    if not saved or now - saved > 300:
+        warn.append(f"az allapot {((now - saved) / 60 if saved else float('inf')):.0f} perce nem frissult")
+    days = (now - s.get("started", now)) / 86400
+
+    # ablak: a 10 percenkenti idosorbol (a legkorabbi pont az ablak elejen vagy utana)
+    hist = [h for h in s.get("hist", []) if len(h) >= 7]
+    base = next((h for h in hist if h[0] >= since - 300), None)
+    cur = [now, s.get("seen", 0), s.get("migrations", 0), s.get("meta_ok", 0), s.get("meta_fail", 0) + s.get("meta_drop", 0)]
+    if base and cur[1] >= base[1]:
+        span = max(1e-9, (now - base[0]) / 3600)
+        seen, mig = cur[1] - base[1], cur[2] - base[2]
+        mok, mbad = cur[3] - base[3], cur[4] - base[4]
+        if mok < 0 or mbad < 0:                  # szamlalo-valtas (regi allapotfajl): ne mutassunk hamis aranyt
+            mok = mbad = 0
+        out.append(f"Elmult {span:.1f} ora: {seen} uj token ({seen / span:.0f}/ora), {mig} graduacio"
+                   + (f", metaadat {mok / (mok + mbad) * 100:.0f}% ok" if mok + mbad else ""))
+        if seen == 0:
+            warn.append("nem jott uj token az ablakban (PumpPortal WebSocket?)")
+        if mok + mbad >= 20 and mok / (mok + mbad) < 0.5:
+            warn.append(f"metaadat csak {mok / (mok + mbad) * 100:.0f}% (S3/S4/S5 alig lep be)")
+    else:
+        out.append(f"Osszesen eddig: {s.get('seen', 0)} token, {s.get('migrations', 0)} graduacio (ablak-adat meg nincs)")
+    rpc = s.get("rpc") or {}
+    if rpc.get("calls", 0) >= 100 and rpc.get("errors", 0) / rpc["calls"] > 0.1:
+        warn.append(f"RPC hibaarany {rpc['errors'] / rpc['calls'] * 100:.0f}%")
+
+    rows = load_trades()
+    win = [r for r in rows if fnum(r.get("ts_close")) >= since]
+    if win:
+        w = strat_stats(win)
+        out.append(f"Lezarva az ablakban: {w['n']} poz., PnL {w['pnl']:+.3f} SOL, atlag {w['mean']:+.1f}%, nyero {w['win']:.0f}%")
+        best = max(win, key=lambda r: fnum(r["ret_pct"]))
+        if fnum(best["ret_pct"]) > 0:
+            out.append(f"  legjobb: {best['symbol'] or best['mint'][:6]} {fnum(best['ret_pct']):+.0f}% ({best['strat']}, {best['reason']})")
+    else:
+        out.append("Lezarva az ablakban: 0 pozicio")
+
+    if rows:
+        out.append("")
+        out.append(f"Strategiak ({days:.1f} nap) — n | atlag ±CI | PnL SOL | nyero | itelet  [ablak n / atlag]")
+        by, wby = {}, {}
+        for r in rows:
+            by.setdefault(r["strat"], []).append(r)
+        for r in win:
+            wby.setdefault(r["strat"], []).append(r)
+        for k in sorted(by, key=lambda k: list(STRAT_DESC).index(k) if k in STRAT_DESC else 99):
+            a = strat_stats(by[k])
+            mark = {"+": "POZ", "-": "NEG", "?": "?"}[a["verdict"]]
+            ws = strat_stats(wby[k]) if k in wby else None
+            ci = "" if math.isnan(a["ci"]) else f"±{a['ci']:.1f}"
+            out.append(f"{k}: {a['n']} | {a['mean']:+.1f}%{ci} | {a['pnl']:+.2f} | {a['win']:.0f}% | {mark}"
+                       + (f"  [{ws['n']} / {ws['mean']:+.1f}%]" if ws else "  [-]"))
+        tot = strat_stats(rows)
+        out.append(f"Ossz: {tot['n']} poz., PnL {tot['pnl']:+.3f} SOL ({tot['mean']:+.1f}%/poz.)")
+        pos_ = [k for k in by if len(by[k]) >= 30 and strat_stats(by[k])["verdict"] == "+"]
+        if pos_:
+            out.append("Statisztikailag pozitiv: " + ", ".join(pos_) + " (a graduáltak eladasa optimista!)")
+
+    pos = st.get("positions", [])
+    if pos:
+        cnt = {}
+        for p in pos:
+            cnt[p["strat"]] = cnt.get(p["strat"], 0) + 1
+        out.append(f"Nyitott: {len(pos)} (" + ", ".join(f"{k} {v}" for k, v in cnt.items()) + ")")
+    if warn:
+        out.append("")
+        out += ["FIGYELEM: " + w for w in warn]
+    return "\n".join(out)
+
+
 def diag():
     """mi torzithatja az eredmenyt: kiszallasi okok, kiurult gorbek, a modell egyezese, metaadat, RPC"""
     fee, prio = sim_costs()
@@ -883,10 +976,12 @@ def main():
     ap = argparse.ArgumentParser(description="pump.fun papir-sniper (valodi penz nelkul)")
     ap.add_argument("cmd", choices=["run", "report", "status", "diag", "reset"])
     ap.add_argument("--javitott", action="store_true", help="report: a lezart sorok ujraszamolasa a javitott elszamolassal")
+    ap.add_argument("--telegram", action="store_true", help="report: tomor jelentes a Telegram-vezerlonek")
+    ap.add_argument("--ora", type=float, default=2.0, help="report --telegram: az ablak hossza oraban")
     a = ap.parse_args()
     load_env()
     if a.cmd == "report":
-        print(report_text(fixed=a.javitott))
+        print(telegram_report(a.ora) if a.telegram else report_text(fixed=a.javitott))
         return
     if a.cmd == "diag":
         diag()

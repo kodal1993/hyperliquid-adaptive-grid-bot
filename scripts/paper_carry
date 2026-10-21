@@ -24,6 +24,7 @@ PARANCSOK (a repo gyokereben, a venv pythonjaval):
     .venv/bin/python scripts/paper_carry.py report     # osszesito: hozam, funding, dijak
     .venv/bin/python scripts/paper_carry.py close      # virtualis zaras
     .venv/bin/python scripts/paper_carry.py reset      # virtualis szamla nullazasa
+    .venv/bin/python scripts/paper_carry.py telegram --ora 2   # tomor jelentes (a Telegram-vezerlo hivja)
 
 KONFIG (.env, mind opcionalis):
     CARRY_COIN=HYPE
@@ -37,7 +38,8 @@ KONFIG (.env, mind opcionalis):
     PAPER_PERP_FEE_BPS=4.5       # perp taker dij
     PAPER_SPOT_FEE_BPS=7.0       # spot taker dij — ELLENORIZD a sajat tieredet
     PAPER_MMR=0.05               # karbantartasi margin arany (konzervativ)
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # opcionalis
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # esemeny-riasztasok; a rendszeres jelentest a
+                                           # scripts/telegram_control_bot.py kuldi
 """
 import argparse, csv, fcntl, json, math, os, sys, time, urllib.parse, urllib.request
 from pathlib import Path
@@ -383,15 +385,63 @@ class PaperCarry:
         print(f"  szimulalt likvidalasok: {self.st['liquidations']}")
         print(f"  naplo: {LOG_FILE}")
 
+    def telegram_report(self, hours=2.0):
+        """tomor jelentes: allapot, az elmult `hours` ora valtozasa, piaci funding, figyelmeztetesek"""
+        mk = self.market()
+        eq = self.equity(mk)
+        start = self.st["start_usd"]
+        pnl = eq - start
+        days = (time.time() * 1000 - self.st["created_ms"]) / 86400000
+        out, warn = [], []
+        line = f"Equity {eq:.2f} $ (PnL {pnl:+.3f} $, {pnl / start * 100:+.2f}%"
+        out.append(line + (f", evesitve {pnl / start * 365 / days * 100:+.1f}%)" if days >= 1 else ")"))
+        rows = []
+        try:
+            with LOG_FILE.open() as f:
+                rows = list(csv.DictReader(f))
+        except OSError:
+            pass
+        since = time.time() - hours * 3600
+
+        def ts(r):
+            try:
+                return time.mktime(time.strptime(r["ts"], "%Y-%m-%d %H:%M:%S"))
+            except (KeyError, ValueError):
+                return 0.0
+        base = next((r for r in rows if ts(r) >= since - 600), None)
+        if base:
+            d_eq = eq - float(base["equity"] or 0)
+            d_f = self.st["funding_cum"] - float(base["funding_cum"] or 0)
+            d_fee = self.st["fees_cum"] - float(base["fees_cum"] or 0)
+            out.append(f"Elmult {hours:g} ora: equity {d_eq:+.3f} $, funding {d_f:+.4f} $, dij {-d_fee:+.4f} $")
+        if rows and time.time() - ts(rows[-1]) > 3 * self.interval + 120 and self.st["short_sz"] > 0:
+            warn.append(f"a naplo {(time.time() - ts(rows[-1])) / 60:.0f} perce nem frissult (fut a ciklus?)")
+        if self.st["short_sz"] > 0:
+            lp = self.liq_px()
+            dist = (lp - mk["mark"]) / mk["mark"] if lp else math.inf
+            delta = (self.st["spot_sz"] - self.st["short_sz"]) * mk["mark"]
+            out.append(f"Pozicio: {self.st['spot_sz']} {self.coin} spot + {self.st['short_sz']} short @ {self.st['short_entry']:.4f}"
+                       f" (ar {mk['mark']:.4f}), delta {delta:+.2f} $, likv. tav. {dist * 100:.0f}%")
+            if dist < self.liq_warn:
+                warn.append(f"likvidalasi tavolsag {dist * 100:.0f}% (< {self.liq_warn * 100:.0f}%)")
+        else:
+            out.append("Pozicio: nincs nyitva")
+        f1, f7 = self.market_funding_ann(1), self.market_funding_ann(7)
+        fmt = lambda x: "-" if x is None else f"{x:.1f}"
+        out.append(f"Piaci funding: 24 ora {fmt(f1)}%/ev, 7 nap {fmt(f7)}%/ev (zaras {self.min_funding:g} alatt)")
+        if f7 is not None and self.st["short_sz"] > 0 and f7 < self.min_funding * 1.5:
+            warn.append(f"a 7 napos funding ({f7:.1f}%/ev) kozel a zarasi kuszobhoz")
+        basis = pnl - self.st["funding_cum"] + self.st["fees_cum"]
+        out.append(f"Osszesen ({days:.1f} nap): funding {self.st['funding_cum']:+.4f} $, dijak {-self.st['fees_cum']:+.4f} $,"
+                   f" bazis {basis:+.4f} $, likvidalas {self.st['liquidations']}")
+        out += ["FIGYELEM: " + w for w in warn]
+        print("\n".join(out))
+
     def run(self):
         telegram("Paper felugyeleti ciklus indul")
-        last_daily = 0
         while True:
             try:
                 self.tick()
-                if time.time() - last_daily > 86400:
-                    telegram(f"Napi: {self.summary_line(self.market())}")
-                    last_daily = time.time()
             except Exception as e:
                 log(f"HIBA: {e}")
             time.sleep(self.interval)
@@ -404,7 +454,8 @@ class PaperCarry:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["status", "open", "run", "report", "close", "reset"])
+    ap.add_argument("cmd", choices=["status", "open", "run", "report", "close", "reset", "telegram"])
+    ap.add_argument("--ora", type=float, default=2.0, help="telegram: az ablak hossza oraban")
     a = ap.parse_args()
     lock = LOCK_FILE.open("w")
     try:
@@ -413,6 +464,8 @@ def main():
         if a.cmd in ("run", "open", "close", "reset"):
             sys.exit("HIBA: mar fut egy paper carry peldany (a 'status' es 'report' ettol meg hasznalhato)")
     b = PaperCarry()
+    if a.cmd == "telegram":
+        return b.telegram_report(a.ora)
     {"status": b.status, "open": b.open, "run": b.run, "report": b.report,
      "close": b.close, "reset": b.reset}[a.cmd]()
 

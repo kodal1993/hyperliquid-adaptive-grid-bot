@@ -1665,105 +1665,72 @@ def load_telegram_control_bot_module():
     return module
 
 
-def test_edge_maker_classification_uses_fee_rate():
+def test_control_bot_has_only_paper_commands():
     telegram_bot = load_telegram_control_bot_module()
-    # Fee rate is ground truth: maker ~0.015%, taker ~0.045% of notional.
-    maker = {"notional": 20.0, "fee": 0.003}          # 0.015% -> maker
-    taker = {"notional": 20.0, "fee": 0.009}           # 0.045% -> taker
-    assert telegram_bot._is_maker_fill(maker) is True
-    assert telegram_bot._is_maker_fill(taker) is False
-    # Old rows without fee/notional fall back to the liquidity field.
-    assert telegram_bot._is_maker_fill({"fill_liquidity": "maker"}) is True
+    names = {c["command"] for c in telegram_bot.BOT_COMMANDS}
+    assert {"report", "status", "sniper", "diag", "carry", "pull"} <= names
+    # a leallitott grid bot parancsai torolve
+    assert not names & {"orders", "position", "trades", "performance", "cancelall", "panic", "closeposition", "startbot", "stopbot"}
+    reply, _ = telegram_bot.handle_command("/panic")
+    assert reply.startswith("Ismeretlen parancs")
 
 
-def test_edge_breakdown_splits_maker_taker_and_regime():
-    telegram_bot = load_telegram_control_bot_module()
-    trades = [
-        {"fill_liquidity": "maker", "realized_pnl_delta": 0.0, "fee": 0.0015, "regime": "RANGE"},
-        {"fill_liquidity": "maker", "realized_pnl_delta": 0.09, "fee": 0.0015, "regime": "RANGE"},
-        {"fill_liquidity": "taker", "realized_pnl_delta": -0.11, "fee": 0.011, "regime": "TREND_UP"},
-    ]
-    text = "\n".join(telegram_bot._edge_breakdown(trades))
-    # maker net = (0 - 0.0015) + (0.09 - 0.0015) = 0.087; taker net = -0.11 - 0.011 = -0.121
-    assert "Maker net: $0.0870 (2 fill)" in text
-    assert "Taker net: $-0.1210 (1 fill)" in text
-    assert "Maker arány: 66.7%" in text
-    assert "TREND_UP: $-0.1210" in text
-    assert "RANGE: $0.0870" in text
-
-
-def test_pull_restart_script_uses_fixed_command_and_timeout(monkeypatch):
+def test_control_bot_stop_requires_confirmation(monkeypatch):
     telegram_bot = load_telegram_control_bot_module()
     calls = []
+    monkeypatch.setattr(telegram_bot, "run_cmd", lambda args, timeout=60: (calls.append(args), (0, "active"))[1])
 
-    def fake_run(args, capture_output, text, timeout, check):
-        calls.append(
-            {
-                "args": args,
-                "capture_output": capture_output,
-                "text": text,
-                "timeout": timeout,
-                "check": check,
-            }
-        )
-        return subprocess.CompletedProcess(args, 0, stdout="ok", stderr="")
+    reply, markup = telegram_bot.handle_command("/stop_sniper")
+    assert "MEGERŐSÍTÉS" in reply
+    assert markup["inline_keyboard"][0][0]["callback_data"] == "do:stop_sniper"
+    assert calls == []
 
-    monkeypatch.setattr(telegram_bot.subprocess, "run", fake_run)
-
-    rc, reply = telegram_bot.run_pull_restart_script()
-
-    assert rc == 0
-    assert reply == "✅ Git pull kész, LIVE bot újraindítva."
-    assert calls == [
-        {
-            "args": ["/usr/local/bin/hyperliquid_pull_restart.sh"],
-            "capture_output": True,
-            "text": True,
-            "timeout": 60,
-            "check": False,
-        }
-    ]
+    reply, _ = telegram_bot.handle_callback("do:stop_sniper")
+    assert ["systemctl", "stop", "hyperliquid-paper-sniper"] in calls
+    assert "kész" in reply
 
 
-def test_pull_restart_script_failure_summarizes_and_redacts_secrets(monkeypatch):
+def test_control_bot_service_alerts_on_change(monkeypatch):
+    telegram_bot = load_telegram_control_bot_module()
+    states = {"hyperliquid-paper-sniper": "active", "hyperliquid-paper-carry": "active"}
+    monkeypatch.setattr(telegram_bot, "service_state", lambda unit: states[unit])
+
+    alerts, prev = telegram_bot.service_alerts({})
+    assert alerts == []                      # az elso ellenorzes csak felveszi az allapotot
+    states["hyperliquid-paper-carry"] = "failed"
+    alerts, prev = telegram_bot.service_alerts(prev)
+    assert len(alerts) == 1 and "carry" in alerts[0] and "failed" in alerts[0]
+    states["hyperliquid-paper-carry"] = "active"
+    alerts, _ = telegram_bot.service_alerts(prev)
+    assert len(alerts) == 1 and "újra fut" in alerts[0]
+
+
+def test_control_bot_pull_aborts_rebase_on_failure_and_redacts(monkeypatch):
     telegram_bot = load_telegram_control_bot_module()
     secret_key = "0x" + "a" * 64
+    calls = []
 
-    def fake_run(args, capture_output, text, timeout, check):
-        return subprocess.CompletedProcess(
-            args,
-            7,
-            stdout=f"HL_PRIVATE_KEY={secret_key}\nstdout detail",
-            stderr="TELEGRAM_BOT_TOKEN=123456:abcdefghijklmnopqrstuvwxyzABCDEF\nstderr detail",
-        )
+    def fake_run(args, timeout=60):
+        calls.append(args)
+        if args[:2] == ["git", "pull"]:
+            return 1, f"CONFLICT HL_PRIVATE_KEY={secret_key} TELEGRAM_BOT_TOKEN=123456:abcdefghijklmnopqrstuvwxyzABCDEF"
+        return 0, ""
 
-    monkeypatch.setattr(telegram_bot.subprocess, "run", fake_run)
-
-    rc, reply = telegram_bot.run_pull_restart_script()
-
-    assert rc == 7
-    assert "rc=7" in reply
-    assert "stdout detail" in reply
-    assert "stderr detail" in reply
-    assert secret_key not in reply
-    assert "123456:abcdefghijklmnopqrstuvwxyzABCDEF" not in reply
+    monkeypatch.setattr(telegram_bot, "run_cmd", fake_run)
+    reply = telegram_bot.run_pull()
+    assert calls[0] == ["git", "pull", "--rebase", "origin", "main"]
+    assert ["git", "rebase", "--abort"] in calls
+    assert not any(c[0] == "systemctl" for c in calls)
+    assert secret_key not in reply and "123456:abcdefghijklmnopqrstuvwxyzABCDEF" not in reply
     assert "[REDACTED]" in reply
 
 
-def test_pull_restart_script_timeout_returns_timeout_message(monkeypatch):
+def test_control_bot_report_interval_default_two_hours(monkeypatch):
     telegram_bot = load_telegram_control_bot_module()
-
-    def fake_run(args, capture_output, text, timeout, check):
-        raise subprocess.TimeoutExpired(args, timeout, output="partial stdout", stderr="partial stderr")
-
-    monkeypatch.setattr(telegram_bot.subprocess, "run", fake_run)
-
-    rc, reply = telegram_bot.run_pull_restart_script()
-
-    assert rc == 124
-    assert "timeout (60s)" in reply
-    assert "partial stdout" in reply
-    assert "partial stderr" in reply
+    monkeypatch.delenv("TELEGRAM_REPORT_INTERVAL_HOURS", raising=False)
+    assert telegram_bot.report_interval_seconds() == 7200
+    monkeypatch.setenv("TELEGRAM_REPORT_INTERVAL_HOURS", "0")
+    assert telegram_bot.report_interval_seconds() == 0
 
 
 def _cfg_for_grid_tests(monkeypatch):
