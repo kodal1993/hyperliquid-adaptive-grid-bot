@@ -18,7 +18,8 @@ STRATEGIAK
                     az also hibahatara is pozitiv
     S10_bennfentes  bennfentes-klaszter (lasd lent) vett: belepes a felismeres utan
                     (3 mp + COPY_LAT), ha meg egyik bennfentes sem adott el
-    S12_futtat      tapadast mutato token (gorbe >= 50%, klaszter nelkul, sok vevo):
+    S12_futtat      tapadast mutato token (gorbe >= 50%, klaszter nelkul, >= 25 vevo, legalabb 60 mp-es,
+                    a korai vevok < 20%, a dev < 15% — a bundle-os, mp-ek alatt felhuzott inditas kimarad):
                     a nyerok futtatasa — graduacio UTAN is tartjuk (ar: DexScreener, AMM-dij),
                     kiszallas a csucstol -50%-nal, legfeljebb 24 ora; nincs TP-plafon
 
@@ -109,7 +110,7 @@ STRAT_DESC = {
     "S6_okos2": "legalabb 2 okos tarca vett",
     "S8_masol": "masolhato tarca vett (a mi kesesunkkel + dijainkkal mert)",
     "S10_bennfentes": "bennfentesek kovetese: be 4 mp-nel, ki az elso bennfentes eladasakor",
-    "S12_futtat": "tapadas (gorbe >= 50%, tiszta): graduacio utan is, csucstol -50%, max 24 ora",
+    "S12_futtat": "tapadas (gorbe >= 50%, >= 60 mp, tiszta, nem bundle): graduacio utan is, csucstol -50%, max 24 ora",
 }
 TOTAL_SUPPLY = 1e9                     # pump.fun tokenek teljes kinalata
 EARLY_SEC = 2.0                        # ennyi mp-en beluli vetel "korai" (bundle / gyors sniper)
@@ -605,9 +606,12 @@ class Sniper:
             if w != T["dev"] and self.is_copyable(w):
                 T["leaders"].setdefault("S8_masol", w)
                 self.enter_later("S8_masol", T, self.copy_lat)
+            # tapadas: gorbe >= 50%, tiszta, sok vevo — es IDOBEN kibontakozo: egy 5 mp alatt 80%-ig toltott
+            # gorbe bundle-os inditas (friss tarcakkal, ezert a klaszter-szuro nem latja), graduacio utan dump
             if (vs - V0_SOL >= 0.5 * GRAD_SOL and T.get("clustered") is False and not T["copy"]
-                    and len(T["buyers"]) >= 25 and T["n_sell"] < 0.7 * T["n_buy"]):
-                self.enter_later("S12_futtat", T, self.copy_lat)   # tapadas: gorbe >= 50%, tiszta, sok vevo
+                    and len(T["buyers"]) >= 25 and T["n_sell"] < 0.7 * T["n_buy"]
+                    and now - T["t"] >= 60 and T["early_tok"] / TOTAL_SUPPLY < 0.20 and T.get("dev_share", 0) < 15):
+                self.enter_later("S12_futtat", T, self.copy_lat)
         else:
             rec[1] += sol
             rec[2] = max(0.0, rec[2] - tok)
