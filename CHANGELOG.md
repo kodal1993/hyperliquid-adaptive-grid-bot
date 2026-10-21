@@ -1,5 +1,12 @@
 # Changelog
 
+## Paper sniper: korai vevők láncon mért idővel (slot), RPC-késésmérés
+
+- A nyilvános Solana RPC lassabb a PumpPortalnál, ezért a korai vételek az érkezési idő szerinti 3 mp-es ablakon túl jöttek meg. Emiatt nem lett klaszter, és a tárca-pontozás korai kizárása is pontatlan volt.
+- A „korai” mostantól láncon mért: legfeljebb `EARLY_SLOTS` (7, ~2,8 mp) slot a token létrehozása után. A létrehozás slotját a pump.fun `CreateEvent` (`1b72a94ddeeb6376`) adja a Solana RPC-ről. Ha nincs slot, a régi, érkezési idős szabály a tartalék.
+- A klaszter-elemzés megvárja, hogy a stream túljusson a korai ablakon (legfeljebb 30 mp). A tárca-pontozás a korai vevőket slot szerint zárja ki.
+- A `diag` kiírja a CreateEvent-ek számát és az RPC átlagos késését (a blokkidőhöz képest).
+
 ## Paper sniper: a create előtt érkező korai kereskedések pufferelése
 
 - A Solana RPC gyorsabb a PumpPortalnál: egy új token első vételei (bundle-ök, korai sniperek) a PumpPortal create üzenete előtt érkeznek, és eddig elvesztek. Ezért nem lett egyetlen klaszter sem (`tarca-parok: 0`).

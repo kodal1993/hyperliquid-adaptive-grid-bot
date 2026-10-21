@@ -113,10 +113,13 @@ STRAT_DESC = {
 }
 TOTAL_SUPPLY = 1e9                     # pump.fun tokenek teljes kinalata
 EARLY_SEC = 2.0                        # ennyi mp-en beluli vetel "korai" (bundle / gyors sniper)
-CLUSTER_SEC = 3.0                      # a klaszter-elemzes korai ablaka
+CLUSTER_SEC = 3.0                      # a klaszter-elemzes elso probalkozasa (mp a create utan)
+EARLY_SLOTS = 7                        # "korai" vetel: legfeljebb ennyi slot (~0.4 mp) a letrehozas utan — lancon mert,
+                                       # az RPC kesesetol fuggetlen; slot nelkul az EARLY_SEC (erkezesi ido) a tartalek
 CLUSTER_MAX_EARLY = 15                 # legfeljebb ennyi korai vevo parjait szamoljuk tokenenkent
 WSOL = "So11111111111111111111111111111111111111112"
 TRADE_EVENT_DISC = bytes.fromhex("bddb7fd34ee661ee")   # sha256("event:TradeEvent")[:8] (Anchor esemeny)
+CREATE_EVENT_DISC = bytes.fromhex("1b72a94ddeeb6376")  # sha256("event:CreateEvent")[:8]
 B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 S12_RULE = {"trail_x": 0.0, "trail_drop": 0.5, "max": 24 * 60, "hold_grad": True}   # csucstol -50%, 24 ora
 # kiszallasi valtozatok: alap a konfigbol; masol a kovetett tarca eladasara (csak kovetett tarcas pozicion)
@@ -301,9 +304,24 @@ def decode_trade_event(data):
         return None
     sol, tok = struct.unpack_from("<QQ", b, 40)
     is_buy = b[56] == 1
+    ts, = struct.unpack_from("<q", b, 89)
     vsol, vtok = struct.unpack_from("<QQ", b, 97)
     return {"txType": "buy" if is_buy else "sell", "mint": b58encode(b[8:40]), "traderPublicKey": b58encode(b[57:89]),
-            "solAmount": sol / 1e9, "tokenAmount": tok / 1e6, "vSolInBondingCurve": vsol / 1e9, "vTokensInBondingCurve": vtok / 1e6}
+            "solAmount": sol / 1e9, "tokenAmount": tok / 1e6, "vSolInBondingCurve": vsol / 1e9, "vTokensInBondingCurve": vtok / 1e6,
+            "ts": ts}
+
+
+def decode_create_event(b):
+    """pump.fun CreateEvent: disc(8), name, symbol, uri (borsh string: u32 hossz + bajtok), mint(32), ... -> mint vagy None"""
+    if len(b) < 8 + 12 + 32 or b[:8] != CREATE_EVENT_DISC:
+        return None
+    o = 8
+    for _ in range(3):
+        (n,) = struct.unpack_from("<I", b, o)
+        o += 4 + n
+        if n > 1000 or o + 32 > len(b):
+            return None
+    return b58encode(b[o:o + 32])
 
 
 def dex_prices(mints):
@@ -378,6 +396,8 @@ class Sniper:
         self.led = {}                                        # (mint, kovetett tarca) -> poziciok (masol kiszallas)
         self.led_wallets = set()
         self.pending = {}                                    # mint -> [(erkezes, esemeny)]: a PumpPortal create elott jott kereskedesek
+        self.create_slot = {}                                # mint -> a letrehozas slotja (CreateEvent a Solana RPC-rol)
+        self.last_slot = 0
         self.sample_s10 = cfg("PAPER_SNIPER_SAMPLE_S10", 0.3)
         self.cluster_min = cfg("PAPER_SNIPER_CLUSTER_MIN", 3, int)
         self.pairs = db.get("pairs", {})                     # "a|b" (rendezve) -> [kozos korai tokenek, utolso ido]
@@ -477,7 +497,8 @@ class Sniper:
         T.update({"tr": {}, "buyers": set(), "early_tok": 0.0, "n_buy": 0, "n_sell": 0, "dev_sold": False, "px": None, "smart": set(),
                   "pt": [], "pp": [], "leaders": {}})
         self.tracked[T["mint"]] = T
-        # a Solana RPC gyorsabb a PumpPortalnal: a token elso (korai) kereskedesei mar a create elott
+        T["cslot"] = self.create_slot.get(T["mint"])
+        # ha a Solana RPC gyorsabb a PumpPortalnal: a token elso (korai) kereskedesei mar a create elott
         # megjohettek -> visszajatszas az eredeti erkezesi idovel (ezek a bundle-ok / korai vevok)
         early = sorted(self.pending.pop(T["mint"], []), key=lambda x: x[0])
         for t, ev in early:
@@ -524,6 +545,13 @@ class Sniper:
     def copyable_count(self):
         return sum(1 for w in self.wallets if self.is_copyable(w))
 
+    @staticmethod
+    def is_early(T, t, slot):
+        """korai vetel: lancon merve (slot a letrehozashoz kepest), ha van; kulonben erkezesi ido"""
+        if T.get("cslot") is not None and slot is not None and slot >= 0:
+            return slot - T["cslot"] <= EARLY_SLOTS
+        return t - T["t"] <= EARLY_SEC
+
     def is_smart(self, w):
         r = self.wallets.get(w)
         return bool(r) and r[0] >= self.smart_n and r[1] / r[0] >= self.smart_win and r[2] >= self.smart_pnl
@@ -548,7 +576,9 @@ class Sniper:
         # befizetett SOL, kapott SOL, token, elso vetel ideje, valodi SOL a gorbeben az elso veteledkor,
         # utolso eladas ideje, vetelek, eladasok, legtobb tartott token
         # ..., elso eladas ideje (a koveto ekkor szall ki)
-        rec = T["tr"].setdefault(w, [0.0, 0.0, 0.0, now, (vs - V0_SOL) if vs > 0 else -1.0, 0.0, 0, 0, 0.0, 0.0])
+        slot = m.get("slot")
+        rec = T["tr"].setdefault(w, [0.0, 0.0, 0.0, now, (vs - V0_SOL) if vs > 0 else -1.0, 0.0, 0, 0, 0.0, 0.0,
+                                     slot if slot is not None else -1])   # ..., az elso vetel slotja
         if m.get("txType") == "buy":
             rec[0] += sol
             rec[2] += tok
@@ -556,7 +586,7 @@ class Sniper:
             rec[8] = max(rec[8], rec[2])
             T["n_buy"] += 1
             T["buyers"].add(w)
-            if now - T["t"] <= EARLY_SEC and w != T["dev"]:
+            if w != T["dev"] and self.is_early(T, now, slot):
                 T["early_tok"] += tok
             if w != T["dev"] and self.is_smart(w):
                 T["smart"].add(w)
@@ -583,13 +613,19 @@ class Sniper:
                 T["dev_sold"] = True
 
     def eval_cluster(self, T):
-        """3 mp-nel: a korai vevok klaszter-jele a KORABBI tokenekbol, utana a statisztika frissitese"""
+        """a korai vevok klaszter-jele a KORABBI tokenekbol, utana a statisztika frissitese. Megvarja, hogy a
+        Solana RPC stream tuljusson a korai ablakon (slot), hogy a kesve erkezo korai vetelek is bent legyenek."""
         if self.tracked.get(T["mint"]) is not T:
+            return
+        waited = T.get("cl_wait", 0)
+        if waited < 30 and (T.get("cslot") is None or self.last_slot < T["cslot"] + EARLY_SLOTS + 2):
+            T["cl_wait"] = waited + 1                  # meg nem jott meg a CreateEvent / a korai ablak vege
+            asyncio.get_running_loop().call_later(1, self.eval_cluster, T)
             return
         now = time.time()
         dev = T["dev"]
         early = sorted((rec[3], w) for w, rec in T["tr"].items()
-                       if w != dev and rec[0] > 0 and rec[3] - T["t"] <= CLUSTER_SEC)
+                       if w != dev and rec[0] > 0 and self.is_early(T, rec[3], rec[10] if len(rec) > 10 else None))
         early = [w for _, w in early[:CLUSTER_MAX_EARLY]]
         group, friends = set(), set()
         for i, a in enumerate(early):
@@ -635,7 +671,7 @@ class Sniper:
             early_pct = round(T["early_tok"] / TOTAL_SUPPLY * 100, 2)
             for w, rec in T["tr"].items():
                 si, so, tk, t0 = rec[:4]
-                if w == T["dev"] or t0 - T["t"] <= EARLY_SEC or si < 0.02:
+                if w == T["dev"] or self.is_early(T, t0, rec[10] if len(rec) > 10 else None) or si < 0.02:
                     continue                          # dev, korai (nem kovetheto) vagy por-meretu
                 rem = tk * px * (1 - self.fee) if px else 0.0
                 pnl = so + rem - si
@@ -1002,15 +1038,37 @@ class Sniper:
                 st["last_error"] = str(m["error"])[:200]
                 log(f"RPC logsSubscribe hiba: {st['last_error']}")
             return
-        v = ((m.get("params") or {}).get("result") or {}).get("value") or {}
+        res = (m.get("params") or {}).get("result") or {}
+        v = res.get("value") or {}
+        slot = (res.get("context") or {}).get("slot")
+        if isinstance(slot, int) and slot > self.last_slot:
+            self.last_slot = slot
         st["notifications"] = st.get("notifications", 0) + 1
         if v.get("err") is not None:
             return                                     # sikertelen tranzakcio
         for ln in v.get("logs") or ():
             if ln.startswith("Program data: "):
                 ev = decode_trade_event(ln[14:])
+                if not ev:
+                    try:
+                        cm = decode_create_event(base64.b64decode(ln[14:]))
+                    except Exception:
+                        cm = None
+                    if cm and isinstance(slot, int):
+                        st["creates"] = st.get("creates", 0) + 1
+                        self.create_slot[cm] = slot
+                        if cm in self.tracked:
+                            self.tracked[cm]["cslot"] = slot
+                        if len(self.create_slot) > 20000:
+                            for k in list(self.create_slot)[:10000]:
+                                del self.create_slot[k]
+                    continue
                 if ev:
                     st["events"] = st.get("events", 0) + 1
+                    ev["slot"] = slot if isinstance(slot, int) else None
+                    lag = time.time() - ev["ts"]
+                    if 0 <= lag < 600:                 # RPC keses: a blokk ideje -> nalunk (mozgo atlag)
+                        st["lag"] = round(lag if "lag" not in st else 0.99 * st["lag"] + 0.01 * lag, 2)
                     mint = ev["mint"]
                     if mint in self.tracked or ev["traderPublicKey"] in self.led_wallets:
                         self.on_trade(ev)
@@ -1540,7 +1598,8 @@ def diag():
           f"  kovetett token most: {wst.get('tracked', '-')}  feliratkozas elkuldve: {s.get('subs_sent', 0)} token")
     rw = s.get("rpc_ws") or {}
     print(f"Solana RPC logsSubscribe: ertesites {rw.get('notifications', 0)}, TradeEvent {rw.get('events', 0)},"
-          f" visszajatszott korai {rw.get('replayed', 0)}, ujrakapcsolodas {rw.get('reconnects', 0)}"
+          f" CreateEvent {rw.get('creates', 0)}, visszajatszott korai {rw.get('replayed', 0)}, ujrakapcsolodas {rw.get('reconnects', 0)},"
+          f" atlagos keses {rw.get('lag', '-')} mp"
           + (f", utolso hiba: {rw['last_error']}" if rw.get("last_error") else ""))
     if not rw.get("events"):
         print("  FIGYELEM: nem jon TradeEvent a Solana RPC-rol (SOLANA_WS_URL / a nyilvanos RPC korlatozhat — Helius-kulcs ajanlott)")
