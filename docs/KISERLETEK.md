@@ -50,7 +50,12 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
   - S0 −6,5%, S2 −9,4% / pozíció, 1000+ pozíción, statisztikailag negatív;
   - díjak előtt nagyjából nulla;
   - a késés nem számít.
-- **Mérés:** Telegram `/report`, `/wallets` (4. pont: követhetőség), `report --kiszallas`, `/export`.
+- **Bennfentes-klaszter szűrő (2026-10-21-től):** a láncon látható, összehangolt korai vevők
+  (visszatérő csoportok, a fejlesztő „barátai”). Elkerülésre használjuk: S7_tiszta, valamint
+  S9_klaszter_nelkul a kontroll S9_klaszteres ellen. Siker, ha a klaszter nélküli csoport a
+  hibahatárral együtt jobb a klaszteresnél; ha nem, a szűrő nem ér semmit.
+- **Mérés:** Telegram `/report`, `/wallets` (4. pont: követhetőség), `/diag` (bennfentes-klaszterek),
+  `report --kiszallas`, `/export`.
 - **Siker (határidőig):** az S8_masol vagy az S7_organikus legalább 100 pozíción a hibahatárral
   együtt pozitív, 1,25%-os díjjal. Ezután egy második, friss 3 napos időszakon is.
 - **Leállítás:** a határidőre nincs másolható tárca, vagy az S6/S7/S8 egyike sem pozitív →

@@ -1,5 +1,17 @@
 # Changelog
 
+## Paper sniper: bennfentes-klaszterek felismerése a láncon (S7_tiszta, S9)
+
+- RPC nélkül, a kereskedés-üzenetekből. Korai vevők = a token első 3 mp-ének vevői, a dev nélkül.
+  - **Visszatérő csoport:** két korai vevő legalább `PAPER_SNIPER_CLUSTER_MIN` (3) korábbi tokenben is együtt volt korai.
+  - **Dev-barát:** a korai vevő ugyanannak a devnek legalább 2 korábbi tokenjében is korai volt.
+
+  Klaszteres a token, ha legalább 2 csoporttag vagy legalább 1 dev-barát van benne. A jelet csak a korábbi tokenekből számoljuk, így nincs előrelátás.
+- Új stratégiák:
+  - `S7_tiszta`: S7_organikus klaszter nélkül;
+  - `S9_klaszter_nelkul` és `S9_klaszteres`: 10 mp-es minta (`PAPER_SNIPER_SAMPLE_S9`, 10%), egymás kontrolljai.
+- A `diag` mutatja a klaszter-arányt és a legerősebb visszatérő párokat, a Telegram a klaszteres tokenek arányát. A `docs/KISERLETEK.md` sniper-kártyája kiegészült.
+
 ## Paper sniper: követhetőségi pontszám, S8_masol, „masol” kiszállás
 
 - A tárca saját PnL-je félrevezet: egy gyors bot mindig nyerőnek látszik, de 1 mp késéssel követve már veszteséges. Ezért minden tárca-pozícióhoz kiszámoljuk a **követő hozamot** is: belépés `COPY_LAT` mp-cel a tárca vétele után, az akkor érvényes áron; kiszállás az első eladása után `COPY_LAT` mp-cel (vagy az ablak végén); a mi díjainkkal és prioritási díjunkkal. A hozam +500%-nál le van vágva.

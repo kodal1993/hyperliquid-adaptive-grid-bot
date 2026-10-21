@@ -35,6 +35,9 @@ STRATEGIAK
                  dev-vetel 0.5-3 SOL, dev < 10%, TG vagy X link — a metaadat utan
     S6_okos      egy "okos tarca" vett (sajat tarca-adatbazis, lasd lent), 1 mp kesessel
     S6_okos2     legalabb 2 okos tarca vett ugyanabbol
+    S7_tiszta    S7_organikus, de csak bennfentes-klaszter nelkuli tokenben (lasd lent)
+    S9_klaszter_nelkul  10 mp-nel, veletlen minta (PAPER_SNIPER_SAMPLE_S9) a klaszter nelkuli tokenekbol
+    S9_klaszteres       ugyanez a klaszteres tokenekbol (kontroll: rosszabbnak kell lennie)
     S8_masol     kovethetoen nyero tarca vett: a tarcat azon mertuk, mennyit hozott volna NEKUNK
                  kovetve (1 mp keses, a mi dijaink, kiszallas a tarca eladasakor), es ennek az
                  also hibahatara is pozitiv — 1 mp kesessel
@@ -54,6 +57,12 @@ TARCA-ADATBAZIS (informacios elony)
   elso eladasa utan COPY_LAT mp-cel (vagy az ablak vegen), a mi dijainkkal es prio-dijunkkal. A hozam
   +500%-nal le van vagva, hogy egyetlen szerencses token ne vigye el. Masolhato a tarca, ha legalabb
   COPY_MIN_N ilyen pozicioja van, es az atlagos koveto hozam - 2 * standard hiba > 0.
+  Bennfentes-klaszterek (csak a lanc, RPC nelkul): a token elso CLUSTER_SEC (3) mp-enek vevoi
+  ("korai vevok", a dev nelkul). Klaszter-jel egy tokenben:
+    * visszatero csoport: ket korai vevo legalabb CLUSTER_MIN (3) korabbi tokenben is egyutt volt korai
+    * dev-barat: a korai vevo ugyanennek a devnek legalabb 2 korabbi tokenjeben is korai volt
+  Klaszteres a token, ha legalabb 2 visszatero-csoport tag VAGY legalabb 1 dev-barat van benne. A jelet a 3. mp utan szamoljuk, csak a
+  korabbi tokenekbol (nincs elorelatas), utana frissul a statisztika.
   Viselkedesnaplo (state/paper_sniper_wallet_trades.csv): a legalabb 2 korabbi tokennel rendelkezo
   tarcak minden pozicioja + 5% veletlen minta a tobbibol (minta=1, alapvonal). A 'wallets' parancs
   ebbol mutatja meg, milyen belepesi idozites / tartas mukodik, es hogy az okos tarcak eredmenye
@@ -110,6 +119,8 @@ KONFIG (.env, mind opcionalis):
     PAPER_SNIPER_SMART_MIN_PNL=0.5  #   osszes PnL (SOL)
     PAPER_SNIPER_COPY_LAT=1.0       # koveto keses (mp) a kovethetosegi pontszamhoz
     PAPER_SNIPER_COPY_MIN_N=8       # masolhato tarca: legalabb ennyi koveto-pozicio
+    PAPER_SNIPER_SAMPLE_S9=0.1      # S9 minta aranya csoportonkent
+    PAPER_SNIPER_CLUSTER_MIN=3      # visszatero csoport: ennyi kozos korai token
     PAPER_SNIPER_WALLET_LOG=1       # 0 = nincs viselkedesnaplo
     PAPER_SNIPER_WALLET_LOG_MB=300  # e folott a naplo archivalodik (.bak) es ujraindul
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # inditasi uzenet; a rendszeres jelentest a
@@ -157,9 +168,14 @@ STRAT_DESC = {
     "S6_okos2": "legalabb 2 okos tarca vett",
     "S7_organikus": "60 mp: sok vevo, kevés korai/bundle, a dev tart",
     "S8_masol": "kovethetoen nyero tarca vett (a mi kesesunkkel + dijainkkal mert)",
+    "S7_tiszta": "S7_organikus, bennfentes-klaszter nelkul",
+    "S9_klaszter_nelkul": "10 mp, minta a klaszter nelkuli tokenekbol",
+    "S9_klaszteres": "10 mp, minta a klaszteres tokenekbol (kontroll)",
 }
 TOTAL_SUPPLY = 1e9                     # pump.fun tokenek teljes kinalata
 EARLY_SEC = 2.0                        # ennyi mp-en beluli vetel "korai" (bundle / gyors sniper)
+CLUSTER_SEC = 3.0                      # a klaszter-elemzes korai ablaka
+CLUSTER_MAX_EARLY = 15                 # legfeljebb ennyi korai vevo parjait szamoljuk tokenenkent
 META_STRATS = ("S3_linkek", "S4_lendulet", "S5_tiszta")
 # kiszallasi valtozatok: tp/sl a pozicio ertekenek tobbszorose, max perc; trail: csucs folott trail_x,
 # kiszallas a csucstol trail_drop esesnel; part: part_x-nel part_frac eladasa, be: utana 1.0x alatt ki
@@ -461,6 +477,13 @@ class Sniper:
         self.copy_lat = cfg("PAPER_SNIPER_COPY_LAT", 1.0)
         self.copy_n = cfg("PAPER_SNIPER_COPY_MIN_N", 8, int)
         self.led = {}                                        # (mint, kovetett tarca) -> poziciok (masol kiszallas)
+        self.sample_s9 = cfg("PAPER_SNIPER_SAMPLE_S9", 0.1)
+        self.cluster_min = cfg("PAPER_SNIPER_CLUSTER_MIN", 3, int)
+        self.pairs = db.get("pairs", {})                     # "a|b" (rendezve) -> [kozos korai tokenek, utolso ido]
+        self.dev_assoc = db.get("dev_assoc", {})             # "dev|tarca" -> [korai a dev tokenjeiben, utolso ido]
+        self.early_cnt = db.get("early_cnt", {})             # tarca -> [korai vetelek, utolso ido]
+        for k, v in (("clustered", 0), ("cluster_checked", 0)):
+            self.stats.setdefault(k, v)
         for k, v in (("trade_msgs", 0), ("trade_bad", 0), ("wallet_closes", 0)):
             self.stats.setdefault(k, v)
 
@@ -498,7 +521,15 @@ class Sniper:
         if len(self.wallets) > 200_000:
             for k in sorted(self.wallets, key=lambda k: self.wallets[k][3])[: len(self.wallets) - 200_000]:
                 del self.wallets[k]
-        atomic_write(DB_FILE, {"creators": self.creators, "names": self.names, "mint_dev": self.mint_dev, "wallets": self.wallets})
+        now_ = time.time()
+        for d, cap in ((self.pairs, 300_000), (self.dev_assoc, 200_000), (self.early_cnt, 200_000)):
+            for k in [k for k, v in d.items() if v[0] < 2 and v[1] < now_ - 86400]:
+                del d[k]                              # egyszeri egyutt-elofordulas 1 nap utan torlodik
+            if len(d) > cap:
+                for k in sorted(d, key=lambda k: d[k][1])[: len(d) - cap]:
+                    del d[k]
+        atomic_write(DB_FILE, {"creators": self.creators, "names": self.names, "mint_dev": self.mint_dev, "wallets": self.wallets,
+                               "pairs": self.pairs, "dev_assoc": self.dev_assoc, "early_cnt": self.early_cnt})
 
     def open_count(self, strat):
         return sum(1 for p in self.positions if p["strat"] == strat)
@@ -572,8 +603,10 @@ class Sniper:
             self.add_px(T, time.time(), vs / vt)
         self.tracked[T["mint"]] = T
         self.sub_q.append(T["mint"])
-        if "S7_organikus" in self.strats:
-            asyncio.get_running_loop().call_later(60, self.eval_organic, T)
+        loop = asyncio.get_running_loop()
+        loop.call_later(CLUSTER_SEC, self.eval_cluster, T)
+        if "S7_organikus" in self.strats or "S7_tiszta" in self.strats:
+            loop.call_later(60, self.eval_organic, T)
 
     @staticmethod
     def add_px(T, t, px):
@@ -662,6 +695,46 @@ class Sniper:
             if w == T["dev"]:
                 T["dev_sold"] = True
 
+    def eval_cluster(self, T):
+        """3 mp-nel: a korai vevok klaszter-jele a KORABBI tokenekbol, utana a statisztika frissitese"""
+        if self.tracked.get(T["mint"]) is not T:
+            return
+        now = time.time()
+        dev = T["dev"]
+        early = sorted((rec[3], w) for w, rec in T["tr"].items()
+                       if w != dev and rec[0] > 0 and rec[3] - T["t"] <= CLUSTER_SEC)
+        early = [w for _, w in early[:CLUSTER_MAX_EARLY]]
+        group, friends = set(), set()
+        for i, a in enumerate(early):
+            if dev and self.dev_assoc.get(f"{dev}|{a}", [0])[0] >= 2:
+                friends.add(a)
+            for b in early[i + 1:]:
+                if self.pairs.get("|".join(sorted((a, b))), [0])[0] >= self.cluster_min:
+                    group.update((a, b))
+        flagged = group | friends
+        T["cluster"] = {"early": len(early), "group": len(group), "dev_friends": len(friends), "flagged": len(flagged)}
+        T["clustered"] = len(group) >= 2 or len(friends) >= 1
+        self.stats["cluster_checked"] += 1
+        self.stats["clustered"] += int(T["clustered"])
+        # statisztika frissitese (a kovetkezo tokenekhez)
+        for i, a in enumerate(early):
+            e = self.early_cnt.setdefault(a, [0, now])
+            e[0] += 1
+            e[1] = round(now)
+            if dev:
+                d = self.dev_assoc.setdefault(f"{dev}|{a}", [0, now])
+                d[0] += 1
+                d[1] = round(now)
+            for b in early[i + 1:]:
+                pr = self.pairs.setdefault("|".join(sorted((a, b))), [0, now])
+                pr[0] += 1
+                pr[1] = round(now)
+        if not T["copy"]:
+            if T["clustered"] and T["rand"] < self.sample_s9:
+                asyncio.get_running_loop().call_later(10 - CLUSTER_SEC, self.enter_later, "S9_klaszteres", T, 0)
+            elif not T["clustered"] and T["rand"] < self.sample_s9:
+                asyncio.get_running_loop().call_later(10 - CLUSTER_SEC, self.enter_later, "S9_klaszter_nelkul", T, 0)
+
     def eval_organic(self, T):
         if self.tracked.get(T["mint"]) is not T or T["copy"]:
             return
@@ -670,6 +743,8 @@ class Sniper:
         if (len(T["buyers"]) >= 15 and T["early_tok"] / TOTAL_SUPPLY < 0.15 and T["dev_share"] < 10
                 and not T["dev_sold"] and T["n_sell"] < 0.6 * T["n_buy"]):
             self.enter_later("S7_organikus", T, 0)
+            if T.get("clustered") is False:           # csak ha megvolt a klaszter-elemzes, es tiszta
+                self.enter_later("S7_tiszta", T, 0)
 
     def finalize_tracked(self, force=False):
         """a lejart kovetesi ablakok elszamolasa a tarca-adatbazisba, es leiratkozas"""
@@ -1242,6 +1317,9 @@ def telegram_report(hours=2.0):
         out.append(f"Osszesen eddig: {s.get('seen', 0)} token, {s.get('migrations', 0)} graduacio (ablak-adat meg nincs)")
     wst = s.get("wallets")
     if wst:
+        if s.get("cluster_checked"):
+            out.append(f"Bennfentes-klaszter: a tokenek {s.get('clustered', 0) / s['cluster_checked'] * 100:.0f}%-a klaszteres"
+                       f" ({s.get('clustered', 0)}/{s['cluster_checked']})")
         out.append(f"Tarca-adatbazis: {wst.get('n', 0)} tarca, okos {wst.get('smart', 0)}, masolhato {wst.get('copyable', 0)},"
                    f" kovetett token {wst.get('tracked', 0)},"
                    f" kereskedes-uzenet {s.get('trade_msgs', 0)}")
@@ -1545,6 +1623,20 @@ def diag():
             print(f"  {w[:6]}..{w[-4:]}  {r[0]} token, nyero {r[1] / r[0] * 100:.0f}%, PnL {r[2]:+.2f} SOL")
     elif s.get("trade_msgs", 0) == 0:
         print("  FIGYELEM: meg nem jott kereskedes-uzenet (PumpPortal subscribeTokenTrade?)")
+
+    print("\n== Bennfentes-klaszterek")
+    chk, cl = s.get("cluster_checked", 0), s.get("clustered", 0)
+    print(f"elemzett token: {chk}, klaszteres: {cl}" + (f" ({cl / chk * 100:.0f}%)" if chk else ""))
+    dbj = read_json(DB_FILE, {})
+    prs, da = dbj.get("pairs", {}), dbj.get("dev_assoc", {})
+    mn_ = cfg("PAPER_SNIPER_CLUSTER_MIN", 3, int)
+    strong = sorted(((k, v[0]) for k, v in prs.items() if v[0] >= mn_), key=lambda kv: -kv[1])
+    print(f"tarca-parok: {len(prs)}, ebbol >= {mn_} kozos korai tokennel: {len(strong)};"
+          f" dev-barat kapcsolat (>= 2): {sum(1 for v in da.values() if v[0] >= 2)}")
+    for k, c in strong[:5]:
+        a, b = k.split("|")
+        print(f"  {a[:6]}..{a[-4:]} + {b[:6]}..{b[-4:]}: {c} tokenben egyutt korai")
+    print("  (a hatast az S9_klaszter_nelkul / S9_klaszteres es az S7_tiszta / S7_organikus osszevetese mutatja)")
 
     pos = st.get("positions", [])
     if pos:
