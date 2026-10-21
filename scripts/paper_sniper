@@ -22,15 +22,28 @@ STRATEGIAK
     S0_minta     veletlen minta minden uj tokenbol (alapvonal), azonnal
     S1_dev       bizonyitott fejleszto: volt mar graduált tokenje (a sajat helyi
                  adatbazis szerint) es 7 napja nem inditott, azonnal
+                 (az elso 7 napban szinte sosem lep be: a graduáltat csak az
+                 elmult 7 nap inditasaibol ismerjuk)
+    S1_grad      volt mar graduált tokenje, nem sorozat-dev (<= 3 inditas / 7 nap),
+                 nem masolt nev, azonnal
     S2_gyors     szuletesi szuro: nem masolt nev, nem sorozat-dev, dev-vetel
                  0.5-5 SOL, dev < 20% — azonnal
     S2_lassu     ugyanez 5 mp kesessel (mennyit ront a kesleltetes?)
     S3_linkek    Telegram + X link a metaadatban, nem masolat, nem sorozat-dev
     S4_lendulet  3 percen belul >= 30%-os gorbe + van Telegram vagy X
+    S5_tiszta    minden szuro egyutt: nem masolat, a dev elso inditasa 7 napon belul,
+                 dev-vetel 0.5-3 SOL, dev < 10%, TG vagy X link — a metaadat utan
+
+ELSZAMOLAS
+  A papir-vetel nincs benne a valodi gorbeben, ezert eladaskor a valodi SOL-tartalek
+  melle a sajat (dij utani) betetunket is hozzaadjuk. Enelkul egy "kiurult" gorben
+  (mindenki eladott) a pozicio ~0-t erne, holott a valosagban a mi SOL-unk is ott lenne.
 
 PARANCSOK (a repo gyokereben, a venv pythonjaval):
     .venv/bin/python scripts/paper_sniper run       # figyeles + szimulacio (systemd alatt)
     .venv/bin/python scripts/paper_sniper report    # strategiankenti eredmeny
+    .venv/bin/python scripts/paper_sniper report --javitott   # a regi sorok ujraszamolva a javitott elszamolassal
+    .venv/bin/python scripts/paper_sniper diag      # diagnosztika: kiszallasok, kiurult gorbek, metaadat, RPC
     .venv/bin/python scripts/paper_sniper status    # mi fut most, nyitott poziciok
     .venv/bin/python scripts/paper_sniper reset     # szimulalt eredmenyek torlese (a dev-adatbazis marad)
 
@@ -46,6 +59,9 @@ KONFIG (.env, mind opcionalis):
     PAPER_SNIPER_MAX_OPEN=60        # strategiankent egyszerre nyitott poziciok
     PAPER_SNIPER_POLL_SEC=10        # gorbe-lekerdezes gyakorisaga
     PAPER_SNIPER_STRATS=            # ures = mind; pl. S0_minta,S2_gyors,S3_linkek
+    PAPER_SNIPER_IPFS=https://ipfs.io/ipfs/,https://dweb.link/ipfs/,https://w3s.link/ipfs/   # IPFS-atjarok sorrendben
+    PAPER_SNIPER_META_HOSTS=        # nem-IPFS metaadat-hosztok (https, pontos egyezes), vesszovel
+    PAPER_SNIPER_META_WORKERS=8     # parhuzamos metaadat-letoltok
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # opcionalis napi osszesito
 
 LEALLITAS: systemctl stop hyperliquid-paper-sniper   vagy   touch state/STOP_SNIPER
@@ -69,17 +85,22 @@ LOCK_FILE = Path("/tmp/paper_sniper.lock")
 
 PUMP = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 GRAD_SOL = 85.0                        # ennyi valodi SOL-nal graduall a gorbe
+V0_SOL, V0_TOK = 30.0, 1.073e9         # a pump.fun gorbe indulo virtualis tartalekai (SOL, token)
+K_CURVE = V0_SOL * V0_TOK              # allando szorzat (dij a tartalekon kivul megy)
 BASE58 = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 TRADE_FIELDS = ["ts_open", "ts_close", "strat", "mint", "name", "symbol", "latency_s", "entry_vsol", "exit_vsol",
                 "cost_sol", "proceeds_sol", "pnl_sol", "ret_pct", "reason", "hold_s", "graduated"]
 STRAT_DESC = {
     "S0_minta": "veletlen minta, azonnal (alapvonal)",
     "S1_dev": "bizonyitott dev (volt graduáltja, 7 napja csendes), azonnal",
+    "S1_grad": "volt graduáltja, nem sorozat-dev, nem masolat, azonnal",
     "S2_gyors": "szuletesi szuro, azonnal",
     "S2_lassu": "szuletesi szuro, 5 mp keses",
     "S3_linkek": "Telegram + X link, nem masolat, nem sorozat-dev",
     "S4_lendulet": "3 percen belul >=30% gorbe + TG vagy X",
+    "S5_tiszta": "minden szuro + TG vagy X, a metaadat utan",
 }
+META_STRATS = ("S3_linkek", "S4_lendulet", "S5_tiszta")
 
 
 # ---------------------------------------------------------------- segedek
@@ -195,38 +216,87 @@ def buy_tokens(c, sol_lam, fee):
     return c["vtok"] - k / (c["vsol"] + net)
 
 
-def sell_sol(c, tokens, fee, cap_real=True):
+def sell_sol(c, tokens, fee, cap_real=True, own_lam=0.0):
+    """own_lam: a sajat papir-vetelunk SOL-ja (dij utan), ami a valosagban a gorbeben lenne"""
     k = c["vsol"] * c["vtok"]
     out = c["vsol"] - k / (c["vtok"] + tokens)
     if cap_real and not c["done"]:
-        out = min(out, c["rsol"])
+        out = min(out, c["rsol"] + own_lam)
     return max(0.0, out * (1 - fee))
 
 
+def recompute_value(r, fee, prio, fixed=True):
+    """egy lezart sor eladasi erteke (SOL) a CSV-bol: a gorbe szorzata allando, igy a belepo es a
+    kilepo virtualis SOL eleg. fixed=False: a regi elszamolas (validalashoz). None = nem szamolhato"""
+    size = fnum(r.get("cost_sol")) - prio
+    ve, vx = fnum(r.get("entry_vsol")), fnum(r.get("exit_vsol"))
+    if size <= 0 or ve <= 0:
+        return None
+    net = size * (1 - fee)
+    tokens = K_CURVE / ve - K_CURVE / (ve + net)
+    out = vx - K_CURVE / (K_CURVE / vx + tokens) if vx > 0 else 0.0
+    if r.get("graduated") != "1":
+        out = min(out, max(0.0, vx - V0_SOL) + (net if fixed else 0.0))
+    return max(0.0, out) * (1 - fee) - prio
+
+
 # ---------------------------------------------------------------- metaadat (IPFS)
-def gateway_url(uri):
+IPFS_GATEWAYS = ["https://ipfs.io/ipfs/", "https://dweb.link/ipfs/", "https://w3s.link/ipfs/"]
+
+
+def uri_host(uri):
+    uri = str(uri or "").strip()
+    if uri.startswith("ipfs://"):
+        return "ipfs://"
+    h = urllib.parse.urlsplit(uri).hostname if uri.startswith(("http://", "https://")) else None
+    return h or ("ures" if not uri else "egyeb")
+
+
+def gateway_urls(uri):
+    """a letoltheto URL-ek sorrendben; IPFS-nel tobb atjaro (ipfs.io gyakran 429-et ad)"""
     uri = str(uri or "").strip()
     m = (re.match(r"^ipfs://(?:ipfs/)?([A-Za-z0-9]{46,100})(/[\w.\-/]*)?$", uri)
          or re.match(r"^https://[^/?#]+/ipfs/([A-Za-z0-9]{46,100})(/[\w.\-/]*)?(?:[?#].*)?$", uri))
     if m:
-        return os.getenv("PAPER_SNIPER_IPFS", "https://ipfs.io/ipfs/") + m.group(1) + (m.group(2) or "")
+        gws = [g.strip() for g in (os.getenv("PAPER_SNIPER_IPFS") or "").split(",") if g.strip().startswith("https://")] or IPFS_GATEWAYS
+        return [g if g.endswith("/") else g + "/" for g in gws], m.group(1) + (m.group(2) or "")
     m = re.match(r"^https://(?:www\.)?arweave\.net/([A-Za-z0-9_\-]{43})(/[\w.\-/]*)?(?:[?#].*)?$", uri)
     if m:
-        return "https://arweave.net/" + m.group(1) + (m.group(2) or "")
-    return None
+        return ["https://arweave.net/"], m.group(1) + (m.group(2) or "")
+    hosts = {h.strip().lower() for h in (os.getenv("PAPER_SNIPER_META_HOSTS") or "").split(",") if h.strip()}
+    sp = urllib.parse.urlsplit(uri)
+    if sp.scheme == "https" and sp.hostname and sp.hostname.lower() in hosts and sp.port in (None, 443):
+        return [""], uri
+    return [], None
 
 
-def fetch_meta(uri):
-    g = gateway_url(uri)
-    if not g:
-        return None
-    req = urllib.request.Request(g, headers={"User-Agent": "paper-sniper/1.0"})
-    with urllib.request.urlopen(req, timeout=8) as r:
-        raw = r.read(200_001)
-    if len(raw) > 200_000:
-        return None
-    j = json.loads(raw)
-    return j if isinstance(j, dict) else None
+def fetch_meta(uri, timeout=6):
+    """(json | None, hiba-ok)"""
+    gws, path = gateway_urls(uri)
+    if not gws:
+        return None, "nem_tamogatott_uri"
+    err = "?"
+    for g in gws:
+        req = urllib.request.Request(g + path, headers={"User-Agent": "paper-sniper/1.0", "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read(200_001)
+        except urllib.error.HTTPError as e:
+            err = f"http_{e.code}"
+            if e.code in (404, 410):
+                break                                 # a tartalom nincs meg, masik atjaro sem segit
+            continue
+        except Exception as e:
+            err = "timeout" if "timed out" in str(e) else type(e).__name__
+            continue
+        if len(raw) > 200_000:
+            return None, "tul_nagy"
+        try:
+            j = json.loads(raw)
+        except ValueError:
+            return None, "nem_json"
+        return (j, "") if isinstance(j, dict) else (None, "nem_objektum")
+    return None, err
 
 
 def link_kinds(j):
@@ -269,14 +339,18 @@ class Sniper:
         self.strats = [s for s in STRAT_DESC if not only or s in only]
         st = read_json(STATE_FILE, {})
         self.positions = st.get("positions", [])            # nyitott szimulalt poziciok
-        self.stats = st.get("stats", {"started": time.time(), "seen": 0, "migrations": 0, "skipped": {}, "missed": {}, "meta_ok": 0, "meta_fail": 0, "meta_drop": 0})
+        self.stats = st.get("stats", {"started": time.time()})
+        for k, v in (("seen", 0), ("migrations", 0), ("skipped", {}), ("missed", {}), ("meta_ok", 0), ("meta_fail", 0),
+                     ("meta_drop", 0), ("meta_err", {}), ("meta_hosts", {}), ("entered", {})):
+            self.stats.setdefault(k, v)
+        self.meta_workers = cfg("PAPER_SNIPER_META_WORKERS", 8, int)
         db = read_json(DB_FILE, {})
         self.creators = db.get("creators", {})               # dev -> {"t": [ido...], "g": graduáltak}
         self.names = db.get("names", {})                     # "n:nev" / "s:ticker" -> [mint, ido]
         self.mint_dev = db.get("mint_dev", {})               # mint -> [dev, ido]  (graduacio hozzarendelese)
         self.watch = {}                                      # S4 jeloltek: mint -> token
         self.tokens = {}                                     # friss tokenek memoriaban
-        self.meta_q = asyncio.Queue(maxsize=40)
+        self.meta_q = asyncio.Queue(maxsize=200)
         self.stop = False
 
     # ---- allapot
@@ -348,14 +422,21 @@ class Sniper:
 
         basic = not T["copy"] and T["dev_prior"] < 3
         birth = basic and 0.5 <= T["dev_sol"] <= 5 and T["dev_share"] < 20
+        T["clean"] = basic and T["dev_prior"] == 0 and 0.5 <= T["dev_sol"] <= 3 and T["dev_share"] < 10
         if T["rand"] < self.sample:
             self.enter_later("S0_minta", T, 0)
         if T["dev_grad"] > 0 and T["dev_prior"] == 0:
             self.enter_later("S1_dev", T, 0)
+        if T["dev_grad"] > 0 and T["dev_prior"] <= 3 and not T["copy"]:
+            self.enter_later("S1_grad", T, 0)
         if birth:
             self.enter_later("S2_gyors", T, 0)
             self.enter_later("S2_lassu", T, 5)
-        if basic and ("S3_linkek" in self.strats or "S4_lendulet" in self.strats):
+        if basic and any(s in self.strats for s in META_STRATS):
+            h = uri_host(T["uri"])
+            mh = self.stats["meta_hosts"]
+            if h in mh or len(mh) < 50:
+                mh[h] = mh.get(h, 0) + 1
             try:
                 self.meta_q.put_nowait(T)
             except asyncio.QueueFull:
@@ -396,9 +477,11 @@ class Sniper:
             return
         lam = self.size * 1e9
         tokens = buy_tokens(c, lam, self.fee)
+        self.stats["entered"][strat] = self.stats["entered"].get(strat, 0) + 1
         self.positions.append({"strat": strat, "mint": T["mint"], "curve": T["curve"], "name": T["name"], "symbol": T["symbol"],
                                "t_open": time.time(), "born": T["t"], "latency": round(time.time() - T["t"], 2),
-                               "entry_vsol": c["vsol"] / 1e9, "tokens": tokens, "cost": self.size + self.prio, "last": c, "miss": 0})
+                               "entry_vsol": c["vsol"] / 1e9, "tokens": tokens, "net_lam": lam * (1 - self.fee),
+                               "cost": self.size + self.prio, "last": c, "miss": 0})
 
     # ---- metaadat-feldolgozok
     async def meta_worker(self):
@@ -408,16 +491,21 @@ class Sniper:
                 self.stats["meta_drop"] += 1
                 continue
             try:
-                j = await asyncio.to_thread(fetch_meta, T["uri"])
-            except Exception:
-                j = None
+                j, err = await asyncio.to_thread(fetch_meta, T["uri"])
+            except Exception as e:
+                j, err = None, type(e).__name__
             if not j:
                 self.stats["meta_fail"] += 1
+                me = self.stats["meta_err"]
+                if err in me or len(me) < 30:
+                    me[err] = me.get(err, 0) + 1
                 continue
             self.stats["meta_ok"] += 1
             T["tg"], T["x"], T["web"] = link_kinds(j)
             if T["tg"] and T["x"]:
                 self.enter_later("S3_linkek", T, 2)
+            if T.get("clean") and (T["tg"] or T["x"]):
+                self.enter_later("S5_tiszta", T, 0)
             if (T["tg"] or T["x"]) and "S4_lendulet" in self.strats:
                 self.watch[T["mint"]] = T
 
@@ -464,7 +552,8 @@ class Sniper:
             done = bool(c["done"])
             if done and (c["vsol"] <= 0 or c["vtok"] <= 0):
                 c = dict(p["last"], done=True)       # graduacio utan a gorbe kiurul: az utolso ismert allapot
-            value = sell_sol(c, p["tokens"], self.fee, cap_real=not done) / 1e9 - self.prio
+            own = p.get("net_lam", self.size * 1e9 * (1 - self.fee))   # regi allapotfajlban meg nincs
+            value = sell_sol(c, p["tokens"], self.fee, cap_real=not done, own_lam=own) / 1e9 - self.prio
             ratio = value / p["cost"] if p["cost"] else 0
             hold = now - p["t_open"]
             reason = None
@@ -570,6 +659,7 @@ class Sniper:
         while not self.stop:
             await asyncio.sleep(60)
             n += 1
+            self.stats["rpc"] = {"calls": self.rpc.calls, "errors": self.rpc.errors, "since": self.t_start}
             self.save(db=(n % 10 == 0))          # allapot percenkent, a (nagyobb) dev-adatbazis 10 percenkent
             open_ = len(self.positions)
             log(f"latott {self.stats['seen']} token, {self.stats['migrations']} graduacio, nyitott {open_}, RPC hivas {self.rpc.calls} (hiba {self.rpc.errors})")
@@ -581,6 +671,7 @@ class Sniper:
         log(f"Paper sniper indul. Strategiak: {', '.join(self.strats)}. Tetel {self.size} SOL, dij {self.fee*100:.2f}%/irany, prio {self.prio} SOL/tx, "
             f"TP {self.tp}x, SL {self.sl}x, max {self.max_hold/60:.0f} perc. RPC: {urllib.parse.urlsplit(self.rpc.url).netloc}")
         telegram("Paper sniper indul (valodi penz nelkul)")
+        self.t_start = time.time()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -588,7 +679,7 @@ class Sniper:
             except NotImplementedError:
                 pass
         tasks = [asyncio.create_task(self.ws_loop()), asyncio.create_task(self.poll_loop()), asyncio.create_task(self.periodic())]
-        tasks += [asyncio.create_task(self.meta_worker()) for _ in range(3)]
+        tasks += [asyncio.create_task(self.meta_worker()) for _ in range(max(1, self.meta_workers))]
         try:
             while not self.stop:
                 await asyncio.sleep(1)
@@ -608,13 +699,42 @@ def load_trades():
         return list(csv.DictReader(f))
 
 
-def report_text(short=False):
+def sim_costs():
+    return cfg("PAPER_SNIPER_FEE_BPS", 100.0) / 1e4, cfg("PAPER_SNIPER_PRIO_SOL", 0.001)
+
+
+def fixed_rows(rows):
+    """a sorok ujraszamolva a javitott elszamolassal (sajat SOL a kiurult gorbeben); (sorok, kihagyott db)"""
+    fee, prio = sim_costs()
+    out, bad = [], 0
+    for r in rows:
+        v = recompute_value(r, fee, prio, fixed=True)
+        cost = fnum(r.get("cost_sol"))
+        if v is None or cost <= 0:
+            bad += 1
+            continue
+        r = dict(r, proceeds_sol=f"{v:.6f}", pnl_sol=f"{v - cost:.6f}", ret_pct=f"{(v - cost) / cost * 100:.2f}")
+        out.append(r)
+    return out, bad
+
+
+def pct(xs, q):
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, max(0, int(round(q * (len(xs) - 1)))))] if xs else float("nan")
+
+
+def report_text(short=False, fixed=False):
     rows = load_trades()
     st = read_json(STATE_FILE, {}).get("stats", {})
     lines = []
     if st:
         days = max(1e-9, (time.time() - st.get("started", time.time())) / 86400)
         lines.append(f"Futasi ido: {days:.1f} nap, latott token: {st.get('seen', 0)}, graduacio (esemeny): {st.get('migrations', 0)}")
+    if fixed and rows:
+        rows, bad = fixed_rows(rows)
+        fee, prio = sim_costs()
+        lines.append(f"JAVITOTT ujraszamolas (dij {fee*100:.2f}%/irany, prio {prio} SOL/tx): a kiurult gorben a sajat SOL-unk is"
+                     f" visszajar." + (f" Nem szamolhato sor: {bad}." if bad else ""))
     if not rows:
         lines.append("Meg nincs lezart szimulalt pozicio.")
         return "\n".join(lines)
@@ -648,9 +768,13 @@ def report_text(short=False):
         lines.append(f"  PnL: {sum(pnl):+.4f} SOL a {cost:.3f} SOL befektetett osszegen ({sum(pnl)/cost*100:+.1f}%)   profit factor: {pf:.2f}")
         lines.append(f"  atlagos hozam / pozicio: {mean:+.1f}%  (95% CI ±{ci:.1f})  ->  {verdict}")
         lines.append(f"  kiszallasok: " + ", ".join(f"{k} {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])))
+        lines.append(f"  hozam eloszlas: p10 {pct(ret, .1):+.0f}%  median {pct(ret, .5):+.0f}%  p90 {pct(ret, .9):+.0f}%  max {max(ret):+.0f}%")
         if grad:
             g_pnl = sum(float(r["pnl_sol"]) for r in xs if r["graduated"] == "1")
+            ng = [float(r["ret_pct"]) for r in xs if r["graduated"] != "1"]
             lines.append(f"  ebbol a graduáltakon: {g_pnl:+.4f} SOL (OPTIMISTA: a gorbe vegso aran szamolva)")
+            if ng:
+                lines.append(f"  graduáltak nelkul: atlag {sum(ng)/len(ng):+.1f}% / pozicio (n={len(ng)})")
     sk, mi = st.get("skipped", {}), st.get("missed", {})
     if sk or mi:
         lines.append("")
@@ -661,6 +785,82 @@ def report_text(short=False):
         lines.append("Olvasat: legalabb 30 pozicio kell strategiankent. Csak akkor van eselye egy eles valtozatnak, ha az atlag a")
         lines.append("hibahatarral egyutt is pozitiv, ES a graduáltak nelkul sem negativ (azok eladasa optimista).")
     return "\n".join(lines)
+
+
+def diag():
+    """mi torzithatja az eredmenyt: kiszallasi okok, kiurult gorbek, a modell egyezese, metaadat, RPC"""
+    fee, prio = sim_costs()
+    st = read_json(STATE_FILE, {})
+    s = st.get("stats", {})
+    saved = st.get("saved")
+    print("== Allapot")
+    print(f"utolso mentes: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(saved)) if saved else '-'}"
+          + (f" ({(time.time() - saved) / 60:.0f} perce)" if saved else ""))
+    seen, mig = s.get("seen", 0), s.get("migrations", 0)
+    print(f"latott token: {seen}   graduacio: {mig} ({mig / seen * 100 if seen else 0:.2f}%)")
+    rpc = s.get("rpc") or {}
+    if rpc:
+        print(f"RPC (a mostani futas ota): {rpc.get('calls', 0)} hivas, {rpc.get('errors', 0)} hiba"
+              f" ({rpc.get('errors', 0) / max(1, rpc.get('calls', 0)) * 100:.1f}%)")
+    print(f"beallitas: tetel {cfg('PAPER_SNIPER_SIZE_SOL', 0.1)} SOL, dij {fee*100:.2f}%/irany, prio {prio} SOL/tx,"
+          f" TP {cfg('PAPER_SNIPER_TP_X', 2.0)}x, SL {cfg('PAPER_SNIPER_SL_X', 0.5)}x, max {cfg('PAPER_SNIPER_MAX_HOLD_MIN', 30.0):.0f} perc")
+    size = cfg("PAPER_SNIPER_SIZE_SOL", 0.1)
+    flat = recompute_value({"cost_sol": size + prio, "entry_vsol": V0_SOL, "exit_vsol": V0_SOL, "graduated": "1"}, fee, prio)
+    if flat is not None:
+        print(f"azonnali vetel+eladas koltsege (ar valtozas nelkul): {(flat - size - prio) / (size + prio) * 100:+.1f}%")
+
+    print("\n== Belepesek strategiankent (belepett / tele volt / nem sikerult)")
+    ent, sk, mi = s.get("entered", {}), s.get("skipped", {}), s.get("missed", {})
+    for k in sorted(set(ent) | set(sk) | set(mi) | set(STRAT_DESC), key=lambda k: list(STRAT_DESC).index(k) if k in STRAT_DESC else 99):
+        print(f"  {k:12s} {ent.get(k, '-')!s:>6} / {sk.get(k, 0):>5} / {mi.get(k, 0):>5}")
+
+    print("\n== Metaadat")
+    ok, fail, drop = s.get("meta_ok", 0), s.get("meta_fail", 0), s.get("meta_drop", 0)
+    tot = ok + fail + drop
+    print(f"ok {ok}  hiba {fail}  eldobva {drop}" + (f"  -> sikeres {ok / tot * 100:.0f}%" if tot else ""))
+    for name, key in (("hibaokok", "meta_err"), ("URI-hosztok", "meta_hosts")):
+        d = s.get(key) or {}
+        if d:
+            print(f"  {name}: " + ", ".join(f"{k} {v}" for k, v in sorted(d.items(), key=lambda kv: -kv[1])[:12]))
+    if tot and ok / tot < 0.5:
+        print("  FIGYELEM: a metaadat tobbnyire nem jon le -> S3/S4/S5 alig lep be. Lasd PAPER_SNIPER_IPFS / META_HOSTS.")
+
+    pos = st.get("positions", [])
+    if pos:
+        now = time.time()
+        print(f"\n== Nyitott poziciok: {len(pos)}, legregebbi {max(now - p['t_open'] for p in pos) / 60:.0f} perc,"
+              f" adat nelkul (miss>0): {sum(1 for p in pos if p.get('miss'))}")
+
+    rows = load_trades()
+    print(f"\n== Lezart poziciok: {len(rows)}")
+    if not rows:
+        return
+    diffs, by = [], {}
+    for r in rows:
+        old = recompute_value(r, fee, prio, fixed=False)
+        new = recompute_value(r, fee, prio, fixed=True)
+        if old is not None:
+            diffs.append(abs(old - fnum(r.get("proceeds_sol"))))
+        by.setdefault(r["strat"], []).append((r, old, new))
+    if diffs:
+        md = pct(diffs, .5)
+        print(f"modell-ellenorzes: a CSV-bol ujraszamolt regi ertek elterese a rogzitettol: median {md:.6f}, p90 {pct(diffs, .9):.6f} SOL"
+              + ("  (rendben)" if md < 1e-3 else "  (ELTER: nem szabvanyos gorbe vagy mas dij/prio a futas alatt -> a --javitott pontatlan)"))
+    print("\nstrat         n   kiurult  -90%alatt   atlag regi -> javitott   kiszallasok")
+    for k in sorted(by, key=lambda k: list(STRAT_DESC).index(k) if k in STRAT_DESC else 99):
+        xs = by[k]
+        n = len(xs)
+        empty = sum(1 for r, _, _ in xs if r["graduated"] != "1" and fnum(r["exit_vsol"]) - V0_SOL < 1.0)
+        deep = sum(1 for r, _, _ in xs if fnum(r["ret_pct"]) <= -90)
+        o = [fnum(r["ret_pct"]) for r, _, _ in xs]
+        nw = [(v - fnum(r["cost_sol"])) / fnum(r["cost_sol"]) * 100 for r, _, v in xs if v is not None and fnum(r["cost_sol"]) > 0]
+        reasons = {}
+        for r, _, _ in xs:
+            reasons[r["reason"]] = reasons.get(r["reason"], 0) + 1
+        print(f"  {k:11s} {n:4d}   {empty:5d}    {deep:5d}      {sum(o)/n:+6.1f}% -> {(sum(nw)/len(nw) if nw else float('nan')):+6.1f}%    "
+              + ", ".join(f"{a} {b}" for a, b in sorted(reasons.items(), key=lambda kv: -kv[1])))
+    print("\nkiurult = nem graduált, es a kilepeskor < 1 SOL valodi SOL maradt a gorbeben (itt torzitott a regi elszamolas).")
+    print("-90%alatt = a rogzitett (regi) hozam -90% vagy rosszabb.")
 
 
 def status():
@@ -681,11 +881,15 @@ def status():
 
 def main():
     ap = argparse.ArgumentParser(description="pump.fun papir-sniper (valodi penz nelkul)")
-    ap.add_argument("cmd", choices=["run", "report", "status", "reset"])
+    ap.add_argument("cmd", choices=["run", "report", "status", "diag", "reset"])
+    ap.add_argument("--javitott", action="store_true", help="report: a lezart sorok ujraszamolasa a javitott elszamolassal")
     a = ap.parse_args()
     load_env()
     if a.cmd == "report":
-        print(report_text())
+        print(report_text(fixed=a.javitott))
+        return
+    if a.cmd == "diag":
+        diag()
         return
     if a.cmd == "status":
         status()
