@@ -1,5 +1,13 @@
 # Changelog
 
+## Paper sniper: tárca-adatbázis (okos tárcák), bundle-szűrő, reális díj
+
+- Kereskedés-követés: minden új tokenre `subscribeTokenTrade` az első `PAPER_SNIPER_TRADE_WINDOW_MIN` (15) percben. Az ablak végén tárcánként elszámolja a PnL-t: kapott SOL + a maradék token értéke az utolsó áron − befizetett SOL. A dev és a 2 mp-en belüli (bundle, gyors sniper) vevők kimaradnak, mert őket úgysem lehet követni. Csak a lezárt ablakok számítanak, így nincs előrelátás.
+- `S6_okos` / `S6_okos2`: belépés 1 mp késéssel, ha egy, illetve legalább két „okos” tárca vásárol. Okos tárca: legalább 5 token, legalább 50% nyerő arány, összesen legalább +0,5 SOL; mindhárom állítható.
+- `S7_organikus`: 60 mp-nél belép, ha legalább 15 külön vevő van, a korai vevők a kínálat kevesebb mint 15%-át vették, a dev nem adott el, és az eladások aránya 0,6 alatt van.
+- A pump.fun görbe-díj alapértéke 1% → **1,25%** (2026: 0,95% protokoll + 0,30% készítő).
+- A `diag` és a Telegram-jelentés kiírja a tárca-adatbázis méretét, az okos tárcák számát és a kereskedés-üzenetek számát, és figyelmeztet, ha nem jön kereskedés-üzenet.
+
 ## Telegram: /export és /version
 
 - `/export`: egy zip a sniper és a carry adatfájljaival (`state/paper_sniper_trades.csv`, `paper_sniper_state.json`, `paper_carry_log.csv`, `paper_carry_state.json`), valamint a `report`, a `report --kiszallas`, a `diag` és a carry `report` kimenetével. Csak a felsorolt fájlok kerülnek bele (a `.env` soha), a szövegekből a titkok ki vannak takarva.
