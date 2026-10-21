@@ -55,6 +55,8 @@ EXPORT_FILES = [
     "state/paper_carry_log.csv",
     "state/paper_carry_state.json",
 ]
+WALLET_LOG_REL = "state/paper_sniper_wallet_trades.csv"   # nagy lehet: csak a fejléc + az utolsó sorok
+WALLET_LOG_EXPORT_LINES = 200_000
 logger = logging.getLogger(__name__)
 
 BOT_COMMANDS = [
@@ -62,6 +64,7 @@ BOT_COMMANDS = [
     {"command": "status", "description": "Szolgáltatások állapota"},
     {"command": "sniper", "description": "Sniper: részletes eredmény"},
     {"command": "diag", "description": "Sniper: diagnosztika"},
+    {"command": "wallets", "description": "Sniper: okos tárcák viselkedése"},
     {"command": "carry", "description": "Carry: állapot és összesítő"},
     {"command": "logs_sniper", "description": "Sniper: utolsó naplósorok"},
     {"command": "logs_carry", "description": "Carry: utolsó naplósorok"},
@@ -84,6 +87,7 @@ HELP_TEXT = """🤖 PAPÍR-BOTOK VEZÉRLÉSE (valódi pénz nélkül)
 🩺 /status - szolgáltatások állapota
 🎯 /sniper - sniper: stratégiánkénti részletes eredmény
 🔬 /diag - sniper: diagnosztika (metaadat, RPC, kiürült görbék)
+👛 /wallets - okos tárcák viselkedése: mi működik, szerencse vagy tudás
 💰 /carry - carry: állapot és összesítő
 📜 /logs_sniper, /logs_carry - utolsó naplósorok
 🔄 /restart_sniper, /restart_carry - újraindítás
@@ -359,10 +363,20 @@ def build_export() -> tuple[str, bytes, str]:
                 included.append(rel.split("/")[-1])
             else:
                 skipped.append(rel.split("/")[-1])
+        wl = PROJECT_ROOT / WALLET_LOG_REL
+        if wl.is_file():
+            from collections import deque
+
+            with wl.open(encoding="utf-8", errors="replace") as f:
+                header = f.readline()
+                tail = deque(f, maxlen=WALLET_LOG_EXPORT_LINES)
+            z.writestr(WALLET_LOG_REL, header + "".join(tail))
+            included.append(f"{wl.name} (utolsó {len(tail)} sor)")
         texts = {
             "sniper_report.txt": paper_script("paper_sniper", "report"),
             "sniper_kiszallas.txt": paper_script("paper_sniper", "report", "--kiszallas"),
             "sniper_diag.txt": paper_script("paper_sniper", "diag"),
+            "sniper_wallets.txt": paper_script("paper_sniper", "wallets", timeout=180),
             "carry_report.txt": paper_script("paper_carry", "report"),
             "version.txt": version_text(fetch=False),
         }
@@ -432,6 +446,8 @@ def handle_command(text: str, *, confirmed: bool = False) -> tuple[str, dict[str
         return version_text(), None
     if command == "/sniper":
         return "🎯 SNIPER\n" + paper_script("paper_sniper", "report"), None
+    if command == "/wallets":
+        return "👛 TÁRCÁK\n" + paper_script("paper_sniper", "wallets", timeout=180), None
     if command == "/diag":
         return "🔬 SNIPER DIAG\n" + paper_script("paper_sniper", "diag"), None
     if command == "/carry":

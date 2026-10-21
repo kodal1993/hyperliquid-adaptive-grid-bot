@@ -1,5 +1,15 @@
 # Changelog
 
+## Paper sniper: okos tárcák viselkedésnaplója és elemzése (`wallets`, `/wallets`)
+
+- Viselkedésnapló (`state/paper_sniper_wallet_trades.csv`) minden követési ablak végén. Benne van a legalább 2 korábbi tokenen kereskedő tárcák minden pozíciója, valamint 5% véletlen minta a többiből alapvonalként. Mezők: a token kora a belépéskor, valódi SOL a görbében, tétel, tartási idő, eladott hányad, vételek/eladások száma, a token vevőszáma és korai (bundle) része, PnL. `PAPER_SNIPER_WALLET_LOG_MB` (300) felett archiválódik.
+- `paper_sniper wallets` / Telegram `/wallets`:
+  - az okos és a többi tárca viselkedésprofilja;
+  - „mi működik” táblák belépési kor, görbeállás, tartás, tétel és bundle-arány szerint;
+  - szerencse vagy tudás teszt: az első fele alapján címkézett tárcák második felének eredménye;
+  - a legjobb okos tárcák mediánjai.
+- A `/export` tartalmazza a `wallets` elemzést és a napló utolsó 200 ezer sorát.
+
 ## Paper sniper: tárca-adatbázis (okos tárcák), bundle-szűrő, reális díj
 
 - Kereskedés-követés: minden új tokenre `subscribeTokenTrade` az első `PAPER_SNIPER_TRADE_WINDOW_MIN` (15) percben. Az ablak végén tárcánként elszámolja a PnL-t: kapott SOL + a maradék token értéke az utolsó áron − befizetett SOL. A dev és a 2 mp-en belüli (bundle, gyors sniper) vevők kimaradnak, mert őket úgysem lehet követni. Csak a lezárt ablakok számítanak, így nincs előrelátás.
