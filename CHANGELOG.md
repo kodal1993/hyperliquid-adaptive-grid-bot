@@ -1,5 +1,13 @@
 # Changelog
 
+## Paper sniper: követhetőségi pontszám, S8_masol, „masol” kiszállás
+
+- A tárca saját PnL-je félrevezet: egy gyors bot mindig nyerőnek látszik, de 1 mp késéssel követve már veszteséges. Ezért minden tárca-pozícióhoz kiszámoljuk a **követő hozamot** is: belépés `COPY_LAT` mp-cel a tárca vétele után, az akkor érvényes áron; kiszállás az első eladása után `COPY_LAT` mp-cel (vagy az ablak végén); a mi díjainkkal és prioritási díjunkkal. A hozam +500%-nál le van vágva.
+- **Másolható** egy tárca, ha legalább `COPY_MIN_N` (8) követő-pozíciója van, és az átlagos követő hozam − 2 standard hiba > 0.
+- `S8_masol`: belépés 1 mp késéssel, ha egy másolható tárca vásárol.
+- Új `masol` kiszállási változat az S6 és az S8 pozícióira: kiszállás, amikor a követett tárca elad.
+- A `wallets` elemzés 4. pontja: tárcák követő hozama, a saját PnL szerint okos tárcák követve, a top másolható tárcák. A Telegram-jelentés kiírja a másolható tárcák számát.
+
 ## Paper sniper: okos tárcák viselkedésnaplója és elemzése (`wallets`, `/wallets`)
 
 - Viselkedésnapló (`state/paper_sniper_wallet_trades.csv`) minden követési ablak végén. Benne van a legalább 2 korábbi tokenen kereskedő tárcák minden pozíciója, valamint 5% véletlen minta a többiből alapvonalként. Mezők: a token kora a belépéskor, valódi SOL a görbében, tétel, tartási idő, eladott hányad, vételek/eladások száma, a token vevőszáma és korai (bundle) része, PnL. `PAPER_SNIPER_WALLET_LOG_MB` (300) felett archiválódik.
