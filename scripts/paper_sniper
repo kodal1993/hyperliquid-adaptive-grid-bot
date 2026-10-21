@@ -28,6 +28,14 @@ STRATEGIAK
                     5 perces forgalom, vevok/eladok, arvaltozas) a PumpSwap aron, AMM-dijjal es a
                     pool meretebol szamolt csuszassal; kiszallas mint az S12 (csucstol -50%, max 24 ora)
 
+TOKEN-NAPLO (nyero tokenek keresese)
+  Minden uj tokenrol pillanatkep 30 es 60 mp-es korban (lancon merve: a letrehozas utani 75 / 150 slot):
+  gorbe, vevok, vetelek/eladasok, SOL-forgalom, legnagyobb vevo aranya, dev, bundle-arany, klaszter,
+  masolt nev, sorozat-dev, okos es ismert vesztes tarcak szama. Mellette a kimenetel a kovetesi ablak
+  vegeig: a pillanatkep aratol mert legnagyobb es vegso tobbszoros; a graduaciok kulon naplóban.
+  'tokens' parancs: mely jelek mellett gyakori a nyero (>= 3x vagy graduacio) — az adat elso 70%-an
+  keresve, a hatralevo 30%-on ellenorizve.
+
 KISZALLAS
     alap    TP / SL / idokorlat (PAPER_SNIPER_TP_X / SL_X / MAX_HOLD_MIN); graduacional a gorbe
             vegso aran zar (optimista)
@@ -56,6 +64,7 @@ PARANCSOK (a repo gyokereben, a venv pythonjaval):
     .venv/bin/python scripts/paper_sniper report    # strategiankenti eredmeny
     .venv/bin/python scripts/paper_sniper report --kiszallas  # masol vs alap, parositva
     .venv/bin/python scripts/paper_sniper report --telegram --ora 2   # tomor jelentes (a Telegram-vezerlo hivja)
+    .venv/bin/python scripts/paper_sniper tokens    # nyero tokenek korai jelei (tanito / ellenorzo resz)
     .venv/bin/python scripts/paper_sniper wallets   # tarcak viselkedese, kovethetoseg
     .venv/bin/python scripts/paper_sniper diag      # diagnosztika: RPC, tarca-kovetes, klaszterek
     .venv/bin/python scripts/paper_sniper status    # mi fut most, nyitott poziciok
@@ -99,6 +108,12 @@ STATE_DIR = ROOT / "state"
 STATE_FILE = STATE_DIR / "paper_sniper_state.json"
 DB_FILE = STATE_DIR / "paper_sniper_db.json"
 TRADES_FILE = STATE_DIR / "paper_sniper_trades.csv"
+TOKEN_LOG = STATE_DIR / "paper_sniper_tokens.csv"           # token-pillanatkepek + kimenetel (tokens elemzes)
+MIGR_LOG = STATE_DIR / "paper_sniper_migrations.csv"         # graduaciok (ido, mint)
+SNAP_SLOTS = (("30", 75), ("60", 150))                       # pillanatkep: 30 / 60 mp (~0.4 mp / slot)
+TOKEN_FEATS = ["rsol", "buyers", "n_buy", "n_sell", "buy_sol", "top_share", "dev_sol", "dev_share", "dev_sold",
+               "early_pct", "clustered", "copy", "dev_prior", "dev_grad", "smart", "losers"]
+TOKEN_FIELDS = ["ts", "mint", "h", "died"] + TOKEN_FEATS + ["px", "max_mult", "final_mult"]
 WALLET_LOG = STATE_DIR / "paper_sniper_wallet_trades.csv"   # tarca-pozicio viselkedesnaplo (wallets elemzes)
 WALLET_FIELDS = ["ts", "mint", "wallet", "prior_n", "prior_smart", "minta", "entry_age_s", "entry_rsol", "sol_in", "sol_out",
                  "rem_val", "pnl", "ret_pct", "hold_s", "sold_frac", "n_buys", "n_sells", "tok_buyers", "tok_early_pct"]
@@ -524,7 +539,7 @@ class Sniper:
     # ---- kereskedes-kovetes es tarca-adatbazis
     def track(self, T, m):
         T.update({"tr": {}, "buyers": set(), "early_tok": 0.0, "n_buy": 0, "n_sell": 0, "dev_sold": False, "px": None, "smart": set(),
-                  "pt": [], "pp": [], "leaders": {}})
+                  "pt": [], "pp": [], "leaders": {}, "snaps": {}, "pmax": {}, "buy_sol": 0.0, "max_in": 0.0, "losers": set(), "vs": V0_SOL})
         self.tracked[T["mint"]] = T
         T["cslot"] = self.create_slot.get(T["mint"])
         # ha a Solana RPC gyorsabb a PumpPortalnal: a token elso (korai) kereskedesei mar a create elott
@@ -581,6 +596,21 @@ class Sniper:
             return slot - T["cslot"] <= EARLY_SLOTS
         return t - T["t"] <= EARLY_SEC
 
+    def is_loser(self, w):
+        r = self.wallets.get(w)
+        return bool(r) and r[0] >= self.smart_n and r[2] <= -self.smart_pnl and r[1] / r[0] < 0.4
+
+    def token_features(self, T):
+        buy = T.get("buy_sol", 0.0)
+        cl = T.get("clustered")
+        return {"rsol": round(T.get("vs", V0_SOL) - V0_SOL, 3), "buyers": len(T["buyers"]), "n_buy": T["n_buy"],
+                "n_sell": T["n_sell"], "buy_sol": round(buy, 3), "top_share": round(T.get("max_in", 0.0) / buy, 3) if buy else 0.0,
+                "dev_sol": round(T.get("dev_sol", 0.0), 3), "dev_share": round(T.get("dev_share", 0.0), 2),
+                "dev_sold": int(T["dev_sold"]), "early_pct": round(T["early_tok"] / TOTAL_SUPPLY * 100, 2),
+                "clustered": -1 if cl is None else int(cl), "copy": int(bool(T.get("copy"))),
+                "dev_prior": T.get("dev_prior", 0), "dev_grad": T.get("dev_grad", 0),
+                "smart": len(T["smart"]), "losers": len(T.get("losers", ())), "px": T["px"] or 0.0}
+
     def is_smart(self, w):
         r = self.wallets.get(w)
         return bool(r) and r[0] >= self.smart_n and r[1] / r[0] >= self.smart_win and r[2] >= self.smart_pnl
@@ -600,8 +630,17 @@ class Sniper:
             return
         self.stats["trade_msgs"] += 1
         vs, vt = fnum(m.get("vSolInBondingCurve")), fnum(m.get("vTokensInBondingCurve"))
+        slot0, cs = m.get("slot"), T.get("cslot")
+        if "snaps" in T and cs is not None and slot0 is not None:
+            for k, off in SNAP_SLOTS:
+                if k not in T["snaps"] and slot0 > cs + off:
+                    T["snaps"][k] = self.token_features(T)
+                    T["pmax"][k] = T["px"] or 0.0
         if vs > 0 and vt > 0:
             self.add_px(T, now, vs / vt)
+            T["vs"] = vs
+            for k in T.get("snaps", {}):
+                T["pmax"][k] = max(T["pmax"][k], vs / vt)
         # befizetett SOL, kapott SOL, token, elso vetel ideje, valodi SOL a gorbeben az elso veteledkor,
         # utolso eladas ideje, vetelek, eladasok, legtobb tartott token
         # ..., elso eladas ideje (a koveto ekkor szall ki)
@@ -615,6 +654,11 @@ class Sniper:
             rec[8] = max(rec[8], rec[2])
             T["n_buy"] += 1
             T["buyers"].add(w)
+            if "buy_sol" in T:
+                T["buy_sol"] += sol
+                T["max_in"] = max(T["max_in"], rec[0])
+                if w != T["dev"] and self.is_loser(w):
+                    T["losers"].add(w)
             if w != T["dev"] and self.is_early(T, now, slot):
                 T["early_tok"] += tok
             if w != T["dev"] and self.is_smart(w):
@@ -700,6 +744,7 @@ class Sniper:
             del self.tracked[mint]
             self.unsub_q.append(mint)
             px = T["px"]
+            self.log_token(T, now)
             early_pct = round(T["early_tok"] / TOTAL_SUPPLY * 100, 2)
             for w, rec in T["tr"].items():
                 si, so, tk, t0 = rec[:4]
@@ -736,6 +781,28 @@ class Sniper:
                 self.stats["wallet_closes"] += 1
         self.flush_wallet_log()
 
+    def log_token(self, T, now):
+        """token-pillanatkepek + kimenetel a kovetesi ablak vegen (ha egy horizontot nem ert el: 'died')"""
+        if "snaps" not in T or T.get("cslot") is None:
+            return                                     # lancon mert ido nelkul nem naplozunk
+        rows = []
+        for k, _ in SNAP_SLOTS:
+            died = k not in T["snaps"]
+            f = T["snaps"].get(k) or self.token_features(T)   # nem ert el idaig: a vegallapot, 'died' jelolessel
+            px0 = f["px"]
+            mx = (T["pmax"].get(k, px0) / px0) if px0 else 0.0
+            fin = ((T["px"] or 0.0) / px0) if px0 else 0.0
+            rows.append([round(now), T["mint"], k, int(died)] + [f[x] for x in TOKEN_FEATS] + [px0, round(mx, 4), round(fin, 4)])
+        try:
+            new = not TOKEN_LOG.exists()
+            with TOKEN_LOG.open("a", newline="") as fh:
+                w = csv.writer(fh)
+                if new:
+                    w.writerow(TOKEN_FIELDS)
+                w.writerows(rows)
+        except OSError as e:
+            log(f"token-naplo hiba: {e}")
+
     def flush_wallet_log(self):
         if not self.wallet_rows:
             return
@@ -760,6 +827,14 @@ class Sniper:
         if not BASE58.match(mint):
             return
         self.stats["migrations"] += 1
+        try:
+            new = not MIGR_LOG.exists()
+            with MIGR_LOG.open("a", newline="") as fh:
+                if new:
+                    fh.write("ts,mint\n")
+                fh.write(f"{round(time.time())},{mint}\n")
+        except OSError as e:
+            log(f"graduacio-naplo hiba: {e}")
         if "S13_amm" in self.strats and mint not in self.amm_due:
             self.amm_due[mint] = [time.time() + self.s13_delay, 0]     # [mikor, hanyadik probalkozas]
         d = self.mint_dev.get(mint)
@@ -1513,6 +1588,94 @@ def _profile(rows):
             "median": pct([r["ret_pct"] for r in rows], .5)}
 
 
+TOKEN_BUCKETS = [
+    ("rsol", "SOL a gorbeben", [0, 1, 3, 6, 10, 20, 40, 86]),
+    ("buyers", "kulon vevok", [0, 3, 6, 10, 20, 40, 1e9]),
+    ("sell_ratio", "eladas / vetel", [0, 0.1, 0.3, 0.6, 1, 1e9]),
+    ("buy_sol", "vasarolt SOL", [0, 0.5, 2, 5, 10, 25, 1e9]),
+    ("top_share", "legnagyobb vevo aranya", [0, 0.1, 0.2, 0.35, 0.5, 1.01]),
+    ("dev_sol", "dev-vetel (SOL)", [0, 0.01, 0.5, 1, 2, 5, 1e9]),
+    ("dev_share", "dev reszesedes %", [0, 1, 5, 10, 20, 101]),
+    ("dev_sold", "dev eladott", [0, 1, 2]),
+    ("early_pct", "korai (bundle) %", [0, 1, 5, 15, 30, 101]),
+    ("clustered", "klaszteres (-1 = ismeretlen)", [-1, 0, 1, 2]),
+    ("copy", "masolt nev", [0, 1, 2]),
+    ("dev_prior", "dev korabbi inditasai (7 nap)", [0, 1, 2, 4, 10, 1e9]),
+    ("dev_grad", "dev korabbi graduaciói", [0, 1, 2, 1e9]),
+    ("smart", "okos tarcak", [0, 1, 2, 3, 1e9]),
+    ("losers", "ismert vesztes tarcak", [0, 1, 2, 4, 1e9]),
+]
+
+
+def load_token_log(h="30"):
+    if not TOKEN_LOG.exists():
+        return []
+    grads = set()
+    try:
+        with MIGR_LOG.open() as f:
+            grads = {r["mint"] for r in csv.DictReader(f)}
+    except OSError:
+        pass
+    rows = []
+    with TOKEN_LOG.open() as f:
+        for r in csv.DictReader(f):
+            if r.get("h") != h:
+                continue
+            try:
+                d = {k: float(r[k]) for k in TOKEN_FIELDS if k not in ("mint", "h")}
+            except (KeyError, TypeError, ValueError):
+                continue
+            d["mint"] = r["mint"]
+            d["grad"] = int(r["mint"] in grads)
+            d["sell_ratio"] = d["n_sell"] / max(1.0, d["n_buy"])
+            d["win"] = int(d["max_mult"] >= 3 or d["grad"])
+            rows.append(d)
+    rows.sort(key=lambda r: r["ts"])
+    return rows
+
+
+def tokens_report(h="30"):
+    rows = load_token_log(h)
+    if len(rows) < 50:
+        return f"Meg keves a token-naplo ({len(rows)} token a {h} mp-es pillanatkeppel; legalabb 50 kell, par ora)."
+    cut = int(len(rows) * 0.7)
+    train, test = rows[:cut], rows[cut:]
+    rate = lambda xs: sum(r["win"] for r in xs) / len(xs) * 100 if xs else float("nan")
+    fin = lambda xs: sum(min(r["final_mult"], 10.0) for r in xs) / len(xs) if xs else float("nan")
+    hours = (rows[-1]["ts"] - rows[0]["ts"]) / 3600
+    bt, bs = rate(train), rate(test)
+    out = [f"NYERO TOKENEK KORAI JELEI — {len(rows)} token, {hours:.1f} ora, pillanatkep {h} mp-nel (lancon merve)",
+           f"nyero = a pillanatkep aratol >= 3x a kovetesi ablakban VAGY graduacio. Alapvonal: tanito {bt:.1f}%"
+           f" (n={len(train)}), ellenorzo {bs:.1f}% (n={len(test)}); graduacio {sum(r['grad'] for r in rows) / len(rows) * 100:.1f}%",
+           "oszlopok: n tanito / nyero% | n ellenorzo / nyero% | emeles (ellenorzo) | atlagos vegso szorzo (ellenorzo, 10x-nel vagva)",
+           "* = mindket reszen legalabb 1.5x-es emeles es >= 30 ellenorzo token: ez lehet valodi jel", ""]
+    cands = []
+    for key, title, edges in TOKEN_BUCKETS:
+        out.append(f"{title}:")
+        for lo, hi in zip(edges, edges[1:]):
+            tr = [r for r in train if lo <= r[key] < hi]
+            te = [r for r in test if lo <= r[key] < hi]
+            if len(tr) < 10:
+                continue
+            lt = rate(tr) / bt if bt else 0
+            ls = rate(te) / bs if te and bs else float("nan")
+            star = "*" if te and len(te) >= 30 and lt >= 1.5 and ls >= 1.5 else " "
+            lab = f"{lo:g}-{hi:g}" if hi < 1e8 else f"{lo:g}+"
+            out.append(f" {star} {lab:>10s}  {len(tr):5d} / {rate(tr):5.1f}% | {len(te):5d} / {rate(te) if te else float('nan'):5.1f}%"
+                       f" | {ls:4.1f}x | {fin(te):4.2f}")
+            if len(tr) >= 50:
+                cands.append((rate(tr), title, lab, tr, te))
+        out.append("")
+    cands.sort(key=lambda c: -c[0])
+    out.append("A legjobb 3 sav a TANITO resz szerint — es hogyan teljesitettek az ELLENORZO reszen:")
+    for r_tr, title, lab, tr, te in cands[:3]:
+        out.append(f"  {title} {lab}: tanito {r_tr:.1f}% (n={len(tr)}) -> ellenorzo {rate(te) if te else float('nan'):.1f}% (n={len(te)}),"
+                   f" atlagos vegso {fin(te):.2f}x")
+    out.append("Olvasat: csak az a jel szamit, amelyik az ellenorzo reszen is jobb az alapvonalnal. A belepes koltsege")
+    out.append("kb. 5% (a vegso szorzonak 1.05 felett kell lennie atlagosan, hogy egy egyszeru tart-15-percig strategia nyerjen).")
+    return "\n".join(out)
+
+
 def copy_stats(r, n_min):
     """(n, atlag, also hatar, nyero arany) a koveto hozamra egy tarca-rekordbol; None, ha keves"""
     if len(r) < 8 or r[4] < max(2, n_min):
@@ -1774,7 +1937,8 @@ def status():
 
 def main():
     ap = argparse.ArgumentParser(description="pump.fun papir-sniper (valodi penz nelkul)")
-    ap.add_argument("cmd", choices=["run", "report", "status", "diag", "wallets", "reset"])
+    ap.add_argument("cmd", choices=["run", "report", "status", "diag", "wallets", "tokens", "reset"])
+    ap.add_argument("--h", default="30", choices=["30", "60"], help="tokens: a pillanatkep kora (mp)")
     ap.add_argument("--telegram", action="store_true", help="report: tomor jelentes a Telegram-vezerlonek")
     ap.add_argument("--kiszallas", action="store_true", help="report: a kiszallasi valtozatok parositott osszevetese")
     ap.add_argument("--ora", type=float, default=2.0, help="report --telegram: az ablak hossza oraban")
@@ -1791,6 +1955,9 @@ def main():
         return
     if a.cmd == "wallets":
         print(wallets_report())
+        return
+    if a.cmd == "tokens":
+        print(tokens_report(a.h))
         return
     if a.cmd == "status":
         status()
