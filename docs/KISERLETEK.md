@@ -54,6 +54,12 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
   (visszatérő csoportok, a fejlesztő „barátai”). Elkerülésre használjuk: S7_tiszta, valamint
   S9_klaszter_nelkul a kontroll S9_klaszteres ellen. Siker, ha a klaszter nélküli csoport a
   hibahatárral együtt jobb a klaszteresnél; ha nem, a szűrő nem ér semmit.
+- **Bennfentesek követése (S10_bennfentes, 2026-10-21-től, a tulajdonos döntése):**
+  - belépés, amint a token klaszteres és még egyik bennfentes sem adott el;
+  - kiszállás az első bennfentes eladásakor;
+  - a hipotézis: 1 mp-en belül a bennfentesek után kiszállva még nyerünk;
+  - siker: az `S10_bennfentes~masol` legalább 100 pozíción a hibahatárral együtt pozitív;
+  - ellenhipotézis: a bennfentesek a követőknek adnak el, és mire kiszállunk, az ár már leesett.
 - **Mérés:** Telegram `/report`, `/wallets` (4. pont: követhetőség), `/diag` (bennfentes-klaszterek),
   `report --kiszallas`, `/export`.
 - **Siker (határidőig):** az S8_masol vagy az S7_organikus legalább 100 pozíción a hibahatárral
