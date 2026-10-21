@@ -1,5 +1,15 @@
 # Changelog
 
+## Paper sniper: kereskedések a Solana RPC-ről (a PumpPortal kereskedés-adata fizetős lett)
+
+- A PumpPortal `subscribeTokenTrade` / `subscribeAccountTrade` csak legalább 0,02 SOL-lal feltöltött API-kulccsal működik. Ezért eddig egyetlen kereskedés-üzenet sem jött, és a tárcakövetés adat nélkül futott.
+- **Új adatforrás:** a Solana RPC WebSocket `logsSubscribe`-ja a pump.fun programra. A „Program data:” sorokban lévő `TradeEvent` eseményeket (`bddb7fd34ee661ee`) dekódoljuk: mint, SOL, token, vétel/eladás, tárca, virtuális tartalékok. Ingyenes. URL: `SOLANA_WS_URL`, vagy a `SOLANA_RPC_URL` wss-változata. A PumpPortal továbbra is az új tokeneket és a graduációkat adja.
+- Az elutasított PumpPortal-feliratkozásokat a bot nem küldi többé. A követett tárcák eladását nem követett tokenen is figyeli (`masol` kiszállás).
+- WebSocket-diagnosztika a `diag`-ban:
+  - RPC-értesítések és TradeEvent-ek száma, újrakapcsolódások, utolsó hiba;
+  - PumpPortal-üzenettípusok és az utolsó válaszok;
+  - a bináris keretek dekódolása.
+
 ## Paper sniper: csak tárcakövetés + S12_futtat (graduáció után is)
 
 - **Kivezetve:** S0–S5, S7, S9, a metaadat-letöltés (IPFS), a trail/gyors/reszl/szoros/futtat kiszállási változatok, a `report --javitott` és a kiürültgörbe-diagnosztika. A régi sorok a CSV-ben maradnak, de a riportok csak az aktív stratégiákat mutatják.
