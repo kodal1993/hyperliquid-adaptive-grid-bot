@@ -1,5 +1,13 @@
 # Changelog
 
+## Telegram-vezérlő a papír-botokhoz, 2 órás jelentés
+
+- A `scripts/telegram_control_bot.py` a leállított grid bot helyett a paper snipert és a paper carryt kezeli. A grid bot parancsai törölve: `/orders`, `/position`, `/trades`, `/performance`, `/cancelall`, `/panic`, `/closeposition`, `/startbot`, `/stopbot`, `/restartbot`, `/update`. Induláskor a `setMyCommands` a Telegram-menüt is lecseréli.
+- Rendszeres jelentés `TELEGRAM_REPORT_INTERVAL_HOURS` óránként (alap: 2). Tartalma: szolgáltatások állapota, lemez és memória; a sniper elmúlt ablaka (új token/óra, graduáció, metaadat-arány, lezárt pozíciók, legjobb trade) és stratégiánkénti összesítő CI-vel és ítélettel; a carry equity, az ablakbeli funding és díj, a pozíció, a likvidálási távolság és a piaci funding; figyelmeztetések.
+- Riasztás, ha a sniper vagy a carry szolgáltatás leáll vagy újraindul.
+- Új parancsok: `/report`, `/status`, `/sniper`, `/diag`, `/carry`, `/logs_*`, `/restart_*`, `/stop_*` (megerősítéssel), `/start_*`, `/pull` (`git pull --rebase`, hiba esetén `rebase --abort`), `/menu`.
+- `paper_sniper report --telegram --ora N` és `paper_carry telegram --ora N`: tömör jelentés. A régi napi Telegram-összesítők megszűntek.
+
 ## Re-peg the maker-first flatten so defensive exits stop escalating to taker
 
 - Trade-history analysis of the May 28–Jun 23 export (676 fills, reconciled to the exchange net of −$5.97) confirmed the edge breakdown again: gross was ~flat (−$0.65) and **fees were the loss**, concentrated in ~25 taker defensive exits. ~**$1.51** of that was pure taker fee a maker exit would have avoided, and a separate ~−$3.57 came from the Jun 11/14 over-size churn burst (already prevented by the `_submit_live_limit` per-trade/per-position caps). See `docs/trade_history_loss_analysis.md`.
