@@ -1,5 +1,17 @@
 # Changelog
 
+## Paper sniper: S13_amm — graduáció utáni belépés (késés-független, ingyenes)
+
+- A PumpPortal graduációs eseménye után `PAPER_SNIPER_S13_DELAY_MIN` (5) perccel a DexScreener-adatok alapján dönt a belépésről.
+  - **Feltételek:** a legnagyobb likviditású SOL-pár likviditása ≥ `S13_MIN_LIQ_USD` (8000 $); az 5 perces forgalom ≥ `S13_MIN_VOL5_USD` (3000 $); a vételek ≥ `S13_BUY_RATIO` (1,2) × az eladások; az 5 perces árváltozás > 0; nem klaszteres vagy másolt token.
+  - **Indexelés:** ha a pár még nincs indexelve, 3 percenként legfeljebb kétszer újrapróbálja.
+- **Belépés és értékelés** a PumpSwap áron: AMM-díj, plusz csúszás a pool SOL-tartalékából (állandó szorzat), az S12 graduáció utáni értékelésénél is. Kiszállás, mint az S12-nél: csúcstól −50%, legfeljebb 24 óra.
+- A `dex_pairs()` a DexScreenerből likviditást, SOL-tartalékot, 5 perces forgalmat, vételeket és eladásokat, árváltozást ad. A `diag` kiírja az S13 kihagyási okait.
+- `docs/KISERLETEK.md`:
+  - az S6 lezárva (statisztikailag negatív);
+  - az S8 és az S10 felfüggesztve (nincs valós idejű adat);
+  - aktív: S12 és S13, határidő 2026-11-04.
+
 ## Paper sniper: korai vevők láncon mért idővel (slot), RPC-késésmérés
 
 - A nyilvános Solana RPC lassabb a PumpPortalnál, ezért a korai vételek az érkezési idő szerinti 3 mp-es ablakon túl jöttek meg. Emiatt nem lett klaszter, és a tárca-pontozás korai kizárása is pontatlan volt.
