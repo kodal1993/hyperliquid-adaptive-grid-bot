@@ -1,5 +1,11 @@
 # Changelog
 
+## Paper sniper: párhuzamos kiszállási változatok, párosított összevetés
+
+- Minden szimulált belépést 6 kiszállási szabály szerint is lezárunk: `alap` (konfig TP/SL/időkorlát), `trail`, `gyors`, `reszl` (részleges TP + trail / nullszint), `szoros`, `futtat`. A CSV-ben `S2_gyors~trail` formában szerepelnek. Az alap sorok neve nem változott, így a korábbi adatokkal folytonos.
+- `report --kiszallas`: a változatok párosított különbsége az alap-hoz képest (azonos belépések), 95%-os hibahatárral és JOBB/ROSSZABB ítélettel, stratégiánként is. A `report`, a `diag` és a Telegram-jelentés összesítői az alap kiszállással számolnak, a változatok külön blokkban jelennek meg.
+- `PAPER_SNIPER_EXITS` a változatok szűréséhez. A `PAPER_SNIPER_MAX_OPEN` alapértéke 60 → 120, mert a leghosszabb változat 60 percig tart.
+
 ## Telegram-vezérlő a papír-botokhoz, 2 órás jelentés
 
 - A `scripts/telegram_control_bot.py` a leállított grid bot helyett a paper snipert és a paper carryt kezeli. A grid bot parancsai törölve: `/orders`, `/position`, `/trades`, `/performance`, `/cancelall`, `/panic`, `/closeposition`, `/startbot`, `/stopbot`, `/restartbot`, `/update`. Induláskor a `setMyCommands` a Telegram-menüt is lecseréli.
