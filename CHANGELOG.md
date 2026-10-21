@@ -1,5 +1,11 @@
 # Changelog
 
+## Paper sniper: S10_bennfentes — a bennfentesek követése, kiszállás az első eladásukkor
+
+- `S10_bennfentes`: belépés a klaszteres tokenbe a felismerés után (3 mp + `COPY_LAT`), ha még egyik bennfentes sem adott el; ha már eladtak, kimarad. A minta aránya `PAPER_SNIPER_SAMPLE_S10` (0,3).
+- A `masol` kiszállás most több követett tárcát is kezel: az S10 és az S9_klaszteres pozíciók az **első** bennfentes eladásakor zárnak. Ha a követett tárca már a belépés előtt eladott, a pozíció azonnal zárásra jelölődik.
+- A `wallets` 4. pontja: a bennfentes-klaszter tárcák követő hozama. A `docs/KISERLETEK.md` kártyája kiegészült.
+
 ## Paper sniper: bennfentes-klaszterek felismerése a láncon (S7_tiszta, S9)
 
 - RPC nélkül, a kereskedés-üzenetekből. Korai vevők = a token első 3 mp-ének vevői, a dev nélkül.
