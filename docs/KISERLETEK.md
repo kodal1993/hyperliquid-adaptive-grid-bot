@@ -39,34 +39,30 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
 
 ## Kísérletek
 
-### pump.fun sniper (`scripts/paper_sniper`) — papír, utolsó esély
-- **Ki fizet nekünk, és miért:** eredetileg senki: mi fizetünk a gyorsabbaknak. Az egyetlen
-  hihető forrás az információs előny: követhető okos tárcák (S8_masol) és a bundle-ös tokenek
-  elkerülése (S7_organikus).
-- **Miért nem viszi el más:** a sebességet a fejlesztői bundle-ök és a közel telepített botok
-  már elviszik. Hogy 1 mp késéssel követve marad-e előny, épp ezt mérjük.
-- **Költségpadló:** kb. −5% / pozíció (1,25% görbe-díj kétszer + 2 × 0,001 SOL prio 0,1 SOL-on).
-- **Eddigi eredmény (2026-10-21, javított elszámolás, 1% díjjal):**
-  - S0 −6,5%, S2 −9,4% / pozíció, 1000+ pozíción, statisztikailag negatív;
-  - díjak előtt nagyjából nulla;
-  - a késés nem számít.
-- **Bennfentes-klaszter szűrő (2026-10-21-től):** a láncon látható, összehangolt korai vevők
-  (visszatérő csoportok, a fejlesztő „barátai”). Elkerülésre használjuk: S7_tiszta, valamint
-  S9_klaszter_nelkul a kontroll S9_klaszteres ellen. Siker, ha a klaszter nélküli csoport a
-  hibahatárral együtt jobb a klaszteresnél; ha nem, a szűrő nem ér semmit.
-- **Bennfentesek követése (S10_bennfentes, 2026-10-21-től, a tulajdonos döntése):**
-  - belépés, amint a token klaszteres és még egyik bennfentes sem adott el;
-  - kiszállás az első bennfentes eladásakor;
-  - a hipotézis: 1 mp-en belül a bennfentesek után kiszállva még nyerünk;
-  - siker: az `S10_bennfentes~masol` legalább 100 pozíción a hibahatárral együtt pozitív;
-  - ellenhipotézis: a bennfentesek a követőknek adnak el, és mire kiszállunk, az ár már leesett.
-- **Mérés:** Telegram `/report`, `/wallets` (4. pont: követhetőség), `/diag` (bennfentes-klaszterek),
-  `report --kiszallas`, `/export`.
-- **Siker (határidőig):** az S8_masol vagy az S7_organikus legalább 100 pozíción a hibahatárral
-  együtt pozitív, 1,25%-os díjjal. Ezután egy második, friss 3 napos időszakon is.
-- **Leállítás:** a határidőre nincs másolható tárca, vagy az S6/S7/S8 egyike sem pozitív →
-  `systemctl stop hyperliquid-paper-sniper`, a kártya „lezárva: kudarc”.
-- **Határidő:** 2026-10-24.
+### pump.fun sniper (`scripts/paper_sniper`) — papír, csak tárcakövetés
+- **Ki fizet nekünk, és miért:** a sebességben nem versenyzünk. Az egyetlen hihető forrás az
+  információs előny: olyan tárcák követése, amelyek nekünk, 1 mp késéssel is nyereséget hoznak,
+  illetve a nagy nyerők megtartása graduáció után.
+- **Miért nem viszi el más:** a gyors belépést a bundle-ök és a profi botok elviszik. Hogy a
+  követés késéssel is ér-e valamit, épp ezt mérjük.
+- **Költségpadló:** kb. −5% / pozíció a görbén (1,25% díj kétszer + 2 × 0,001 SOL prio 0,1 SOL-on).
+  Graduáció után az AMM-díj 0,30%.
+- **Lezárt mérések (2026-10-21, kivezetve):** S0–S5, S7, S9 és a kiszállási változatok.
+  Születéskori szűrők, véletlen minta, metaadat, bundle-szűrő: díjak előtt nagyjából nulla,
+  díjakkal statisztikailag negatív (pl. S0 −6,5%, S2 −9,4% / pozíció 1000+ pozíción).
+- **Aktív stratégiák:**
+  - `S6_okos`, `S6_okos2`: saját PnL szerint okos tárcák (alapvonal a követéshez);
+  - `S8_masol`: másolható tárcák (a követő hozam alsó hibahatára > 0);
+  - `S10_bennfentes`: bennfentes-klaszter követése, kiszállás az első eladásukkor;
+  - `S12_futtat`: tapadást mutató, tiszta token, graduáció után is tartva, csúcstól −50%, max 24 óra.
+- **Mérés:** Telegram `/report`, `report --kiszallas` (masol vs alap), `/wallets` (követhetőség), `/export`.
+- **Siker:**
+  - S6/S8/S10: a `~masol` vagy az alap legalább 100 pozíción a hibahatárral együtt pozitív;
+  - S12: legalább 50 pozíción pozitív, mert kevés a belépés és nagy a szórás;
+  - mindkettő után egy második, friss időszak.
+- **Leállítás:** a határidőre egyik sem pozitív → `systemctl stop hyperliquid-paper-sniper`,
+  a kártya „lezárva: kudarc”.
+- **Határidő:** S6/S8/S10: 2026-10-24. S12: 2026-11-04 (kevesebb belépés, több idő kell).
 
 ### HYPE funding carry (`scripts/paper_carry`) — papír
 - **Ki fizet nekünk, és miért:** a HYPE perp longjai fundingot fizetnek a shortoknak. Mi
