@@ -1437,6 +1437,28 @@ def wallets_report():
     cs = {w: v for w, v in cs.items() if v}
     out.append("")
     out.append(f"4. Kovethetoseg — mennyit hozott volna NEKUNK a tarca kovetese (1 mp keses, a mi dijaink, kiszallas az o eladasakor)")
+    # eloszlas: van-e eleg adat, es mennyire vannak kozel a legjobbak (akkor is, ha meg senki sem masolhato)
+    fee, prio = sim_costs()
+    size = cfg("PAPER_SNIPER_SIZE_SOL", 0.1)
+    floor = ((1 - fee) ** 2 - 1 - 2 * prio / size) * 100
+    rec = [r for r in db.values() if len(r) >= 8 and r[4] > 0]
+    tot_n = sum(r[4] for r in rec)
+    if tot_n:
+        cnt = {k: sum(1 for r in rec if r[4] >= k) for k in (1, 3, cn, 20)}
+        out.append(f"  koveto-poziciok osszesen: {tot_n}, atlag {sum(r[6] for r in rec) / tot_n * 100:+.1f}%,"
+                   f" nyero {sum(r[5] for r in rec) / tot_n * 100:.0f}%  (koltseg-padlo ar valtozas nelkul: {floor:+.1f}%)")
+        out.append(f"  tarcak koveto-poziciok szerint: >=1: {cnt[1]}, >=3: {cnt[3]}, >={cn}: {cnt[cn]}, >=20: {cnt[20]}")
+        near = sorted(cs.items(), key=lambda kv: -kv[1][2])[:5]
+        if near and near[0][1][2] <= 0:
+            out.append("  meg senki sem masolhato; a legkozelebbiek (also hatar szerint):")
+            for w, (n, mean, lcb, win) in near:
+                out.append(f"    {w[:6]}..{w[-4:]}  {n:4d} poz., atlag {mean * 100:+6.1f}%, also hatar {lcb * 100:+6.1f}%, nyero {win * 100:3.0f}%")
+        pos_mean = sum(1 for v in cs.values() if v[1] > 0)
+        if cs:
+            out.append(f"  >= {cn} pozicios tarcak kozul pozitiv atlagu: {pos_mean} / {len(cs)}"
+                       + ("  -> ha ez kicsi es nem no, kovetve senki sem eri meg" if pos_mean * 10 < len(cs) else ""))
+    else:
+        out.append("  meg nincs koveto-pozicio: a #105-os valtozat ota kell legalabb 15 perc (kovetesi ablak), es uj kod kell a VPS-en")
     if cs:
         def avg(ws):
             xs = [cs[w] for w in ws if w in cs]
