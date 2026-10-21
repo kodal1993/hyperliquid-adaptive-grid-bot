@@ -1778,6 +1778,21 @@ def test_control_bot_version_reports_pending_prs(monkeypatch):
     assert "telepítetlen" in telegram_bot.version_warning()
 
 
+def test_control_bot_seed_wallet_commands(tmp_path, monkeypatch):
+    telegram_bot = load_telegram_control_bot_module()
+    monkeypatch.setattr(telegram_bot, "PROJECT_ROOT", tmp_path)
+    addr = "7" * 43 + "A"
+    assert "Nincs listás tárca" in telegram_bot.seed_command("/seed_list")
+    assert "Érvénytelen" in telegram_bot.seed_command("/seed_add 0OIl-nem-cim")
+    assert "Hozzáadva" in telegram_bot.seed_command(f"/seed_add {addr} Kolscan #1 <b>")
+    assert "Már a listán" in telegram_bot.seed_command(f"/seed_add {addr}")
+    line = (tmp_path / "state" / "seed_wallets.txt").read_text().strip()
+    assert line == f"{addr} Kolscan_1_b"                # a nev szurve: csak betu, szam, _ . -
+    assert addr in telegram_bot.seed_command("/seed_list")
+    assert "Törölve" in telegram_bot.seed_command(f"/seed_del {addr}")
+    assert "Nincs listás tárca" in telegram_bot.seed_command("/seed_list")
+
+
 def _cfg_for_grid_tests(monkeypatch):
     monkeypatch.delenv("ENV_PROFILE", raising=False)
     cfg = BotConfig.from_env()

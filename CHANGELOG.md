@@ -1,5 +1,11 @@
 # Changelog
 
+## Paper sniper: nyilvános ranglistás tárcák követése (S11_lista, Telegram /seed_*)
+
+- `state/seed_wallets.txt` (soronként `cím [név]`): a sniper percenként újraolvassa, és a PumpPortal `subscribeAccountTrade`-del **bármely** pump.fun tokenen látja a listás tárcák kereskedéseit. Újrakapcsolódáskor újra feliratkozik.
+- `S11_lista`: belépés `COPY_LAT` mp-cel a listás tárca vétele után, akkor is, ha a tokent amúgy nem követjük. A `masol` kiszállás az eladására zár. Tárcánkénti eredmény (`stats.seed_perf`) a `wallets` riport 5. pontjában.
+- Telegram: `/seed_list`, `/seed_add <cím> [név]`, `/seed_del <cím>` (címellenőrzés, a név szűrve, legfeljebb 500 tárca). A `/export` tartalmazza a listát.
+
 ## Paper sniper: S10_bennfentes — a bennfentesek követése, kiszállás az első eladásukkor
 
 - `S10_bennfentes`: belépés a klaszteres tokenbe a felismerés után (3 mp + `COPY_LAT`), ha még egyik bennfentes sem adott el; ha már eladtak, kimarad. A minta aránya `PAPER_SNIPER_SAMPLE_S10` (0,3).
