@@ -32,7 +32,9 @@ TOKEN-NAPLO (nyero tokenek keresese)
   Minden uj tokenrol pillanatkep 30 es 60 mp-es korban (lancon merve: a letrehozas utani 75 / 150 slot):
   gorbe, vevok, vetelek/eladasok, SOL-forgalom, legnagyobb vevo aranya, dev, bundle-arany, klaszter,
   masolt nev, sorozat-dev, okos es ismert vesztes tarcak szama. Mellette a kimenetel a kovetesi ablak
-  vegeig: a pillanatkep aratol mert legnagyobb es vegso tobbszoros; a graduaciok kulon naplóban.
+  vegeig: a pillanatkep aratol mert legnagyobb es vegso tobbszoros; a graduaciok kulon naplóban. Graduált
+  tokennel a vegso ar a PumpSwap-ar 15 perccel a graduacio utan (DexScreener), igy a graduacio utani
+  zuhanas is benne van (enelkul a gorbe utolso ara optimista volna).
   'tokens' parancs: mely jelek mellett gyakori a nyero (>= 3x vagy graduacio) — az adat elso 70%-an
   keresve, a hatralevo 30%-on ellenorizve.
 
@@ -115,6 +117,8 @@ DB_FILE = STATE_DIR / "paper_sniper_db.json"
 TRADES_FILE = STATE_DIR / "paper_sniper_trades.csv"
 TOKEN_LOG = STATE_DIR / "paper_sniper_tokens.csv"           # token-pillanatkepek + kimenetel (tokens elemzes)
 MIGR_LOG = STATE_DIR / "paper_sniper_migrations.csv"         # graduaciok (ido, mint)
+POSTGRAD_LOG = STATE_DIR / "paper_sniper_postgrad.csv"       # a PumpSwap-ar 15 perccel a graduacio utan (DexScreener)
+POSTGRAD_DELAY = 15 * 60
 SNAP_SLOTS = (("30", 75), ("60", 150))                       # pillanatkep: 30 / 60 mp (~0.4 mp / slot)
 TOKEN_FEATS = ["rsol", "buyers", "n_buy", "n_sell", "buy_sol", "top_share", "dev_sol", "dev_share", "dev_sold",
                "early_pct", "clustered", "copy", "dev_prior", "dev_grad", "smart", "losers"]
@@ -411,6 +415,7 @@ class Sniper:
         self.amm_fee = cfg("PAPER_SNIPER_AMM_FEE_BPS", 30.0) / 1e4
         self.dex_px = {}                                     # mint -> (SOL-ar graduacio utan, ido, pool SOL-tartalek)
         self.amm_due = {}                                    # S13: mint -> ertekeles ideje (graduacio + DELAY)
+        self.postgrad_due = {}                               # token-naplo: mint -> [a PumpSwap-ar lekeresenek ideje, probalkozas]
         self.s13_delay = cfg("PAPER_SNIPER_S13_DELAY_MIN", 5.0) * 60
         self.s13_liq = cfg("PAPER_SNIPER_S13_MIN_LIQ_USD", 8000.0)
         self.s13_vol5 = cfg("PAPER_SNIPER_S13_MIN_VOL5_USD", 3000.0)
@@ -855,9 +860,36 @@ class Sniper:
             log(f"graduacio-naplo hiba: {e}")
         if "S13_amm" in self.strats and mint not in self.amm_due:
             self.amm_due[mint] = [time.time() + self.s13_delay, 0]     # [mikor, hanyadik probalkozas]
+        if mint in self.tokens and mint not in self.postgrad_due and len(self.postgrad_due) < 5000:
+            self.postgrad_due[mint] = [time.time() + POSTGRAD_DELAY, 0]   # a token-napló kimenetelehez
         d = self.mint_dev.get(mint)
         if d and d[0] in self.creators:
             self.creators[d[0]]["g"] = self.creators[d[0]].get("g", 0) + 1
+
+    def record_postgrad(self, mints, data, now):
+        """a graduált tokenek PumpSwap-ara 15 perccel a graduacio utan -> a token-naplo valodi vegso ara"""
+        rows = []
+        for mint in mints:
+            d = data.get(mint)
+            t, tries = self.postgrad_due.get(mint, (now, 0))
+            if d:
+                rows.append([round(now), mint, d["px"], round(d["liq"])])
+                del self.postgrad_due[mint]
+            elif tries < 2:
+                self.postgrad_due[mint] = [now + 300, tries + 1]    # meg nincs indexelve: 5 perc mulva ujra
+            else:
+                del self.postgrad_due[mint]
+        if not rows:
+            return
+        try:
+            new = not POSTGRAD_LOG.exists()
+            with POSTGRAD_LOG.open("a", newline="") as fh:
+                w = csv.writer(fh)
+                if new:
+                    w.writerow(["ts", "mint", "px_amm", "liq_usd"])
+                w.writerows(rows)
+        except OSError as e:
+            log(f"graduacio-utani naplo hiba: {e}")
 
     def eval_amm(self, mint, d, now):
         """S13: graduacio utan DELAY perccel — belepes, ha a DexScreener szerint van tapadas"""
@@ -977,10 +1009,11 @@ class Sniper:
         now = time.time()
         amm = [p["mint"] for p in self.positions if p.get("amm")]
         due = [m for m, (t, _) in self.amm_due.items() if t <= now]
-        if (amm or due) and now - self.dex_last >= 30:
+        pg = [m for m, (t, _) in self.postgrad_due.items() if t <= now][:60]
+        if (amm or due or pg) and now - self.dex_last >= 30:
             self.dex_last = now
             try:
-                data = await asyncio.to_thread(dex_pairs, list(dict.fromkeys(amm + due)))
+                data = await asyncio.to_thread(dex_pairs, list(dict.fromkeys(amm + due + pg)))
             except Exception as e:
                 data = None
                 log(f"DexScreener hiba: {e}")
@@ -989,6 +1022,7 @@ class Sniper:
                     self.dex_px[mint] = (d["px"], now, d["q"])
                 for mint in due:
                     self.eval_amm(mint, data.get(mint), now)
+                self.record_postgrad(pg, data, now)
         keys = list(dict.fromkeys(p["curve"] for p in self.positions if not p.get("amm")))
         curves = {}
         for i in range(0, len(keys), 100):
@@ -1644,6 +1678,12 @@ def load_token_log(h="30"):
             grads = {r["mint"] for r in csv.DictReader(f)}
     except OSError:
         pass
+    postgrad = {}
+    try:
+        with POSTGRAD_LOG.open() as f:
+            postgrad = {r["mint"]: fnum(r["px_amm"]) for r in csv.DictReader(f)}
+    except OSError:
+        pass
     rows = []
     with TOKEN_LOG.open() as f:
         for r in csv.DictReader(f):
@@ -1655,6 +1695,10 @@ def load_token_log(h="30"):
                 continue
             d["mint"] = r["mint"]
             d["grad"] = int(r["mint"] in grads)
+            d["amm_adj"] = 0
+            if d["grad"] and postgrad.get(r["mint"], 0) > 0 and d["px"] > 0:
+                d["final_mult"] = postgrad[r["mint"]] / d["px"]    # graduacio utani valodi ar (a zuhanassal)
+                d["amm_adj"] = 1
             d["sell_ratio"] = d["n_sell"] / max(1.0, d["n_buy"])
             d["win"] = int(d["max_mult"] >= 3 or d["grad"])
             rows.append(d)
@@ -1681,7 +1725,8 @@ def tokens_report(h="30"):
     bt, bs = rate(train), rate(test)
     out = [f"NYERO TOKENEK KORAI JELEI — {len(rows)} token, {hours:.1f} ora, pillanatkep {h} mp-nel (lancon merve)",
            f"nyero = a pillanatkep aratol >= 3x a kovetesi ablakban VAGY graduacio. Alapvonal: tanito {bt:.1f}%"
-           f" (n={len(train)}), ellenorzo {bs:.1f}% (n={len(test)}); graduacio {sum(r['grad'] for r in rows) / len(rows) * 100:.1f}%",
+           f" (n={len(train)}), ellenorzo {bs:.1f}% (n={len(test)}); graduacio {sum(r['grad'] for r in rows) / len(rows) * 100:.1f}%"
+           f" ({sum(r['grad'] for r in rows)} token, ebbol PumpSwap-arral korrigalva {sum(r['amm_adj'] for r in rows)})",
            "oszlopok: n tanito / nyero% | n ellenorzo / nyero% (nyerok) | emeles (ellenorzo) | vegso szorzo | kiveheto (csucstol -50%, 5% koltseggel)",
            "* = mindket reszen legalabb 1.5x-es emeles es >= 30 ellenorzo token: ez lehet valodi jel", ""]
     cands = []
