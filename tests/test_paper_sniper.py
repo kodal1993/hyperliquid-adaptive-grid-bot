@@ -74,7 +74,7 @@ def closed(mod):
 def test_decode_trade_event_fixture_lines(tmp_path, monkeypatch):
     mod = load_sniper(tmp_path, monkeypatch)
     cases = json.loads((FIXTURES / "pump_trade_events.json").read_text())
-    assert cases
+    assert any(c["source"].startswith("VALODI") for c in cases)            # legalabb egy valodi, lancrol vett sor
     for case in cases:
         assert case["line"].startswith("Program data: vdt/007mYe")      # TradeEvent discriminator base64-ben
         ev = mod.decode_trade_event(case["line"][len("Program data: "):])
@@ -83,14 +83,21 @@ def test_decode_trade_event_fixture_lines(tmp_path, monkeypatch):
         for k in ("txType", "mint", "traderPublicKey", "ts"):
             assert ev[k] == exp[k], k
         for k in ("solAmount", "tokenAmount", "vSolInBondingCurve", "vTokensInBondingCurve", "fee"):
-            assert ev[k] == pytest.approx(exp[k], rel=1e-9), k
-        assert ev["fee"] == pytest.approx(ev["solAmount"] * 0.0125, rel=0.01)   # 95 + 30 bps a gorbe SOL-jan
-        # fuggetlen ellenorzes az eltolasokra: a gorbe szorzata allando, a valodi SOL = virtualis - 30
-        assert ev["vSolInBondingCurve"] * ev["vTokensInBondingCurve"] == pytest.approx(mod.K_CURVE, rel=1e-3)
+            assert ev[k] == pytest.approx(exp[k], rel=1e-9, abs=1e-12), k
+        # fuggetlen ellenorzes az eltolasokra: a valodi tartalekok a 113. bajttol; a token-oldal minden gorben
+        # a szabvanyos kinalatbol indul (1073M virtualis, 793.1M valodi), ezert a kulonbseg mindig 279.9M token
         raw = base64.b64decode(case["line"][len("Program data: "):])
-        real_sol, = struct.unpack_from("<Q", raw, 113)
-        assert real_sol / 1e9 == pytest.approx(ev["vSolInBondingCurve"] - mod.V0_SOL, abs=1e-6)
-        assert real_sol / 1e9 == pytest.approx(exp["realSol"], abs=1e-6)
+        real_sol, real_tok = struct.unpack_from("<QQ", raw, 113)
+        assert real_sol / 1e9 == pytest.approx(exp["realSol"], abs=1e-9)
+        assert real_tok / 1e6 == pytest.approx(exp["realTok"], rel=1e-12)
+        assert ev["vTokensInBondingCurve"] - real_tok / 1e6 == pytest.approx(279.9e6, rel=1e-9)
+        assert real_sol / 1e9 <= ev["vSolInBondingCurve"]
+        if exp.get("standardCurve"):                                     # szabvanyos gorbe: allando szorzat, 30 SOL virtualis
+            assert ev["vSolInBondingCurve"] * ev["vTokensInBondingCurve"] == pytest.approx(mod.K_CURVE, rel=1e-3)
+            assert real_sol / 1e9 == pytest.approx(ev["vSolInBondingCurve"] - mod.V0_SOL, abs=1e-6)
+            assert ev["fee"] == pytest.approx(ev["solAmount"] * 0.0125, rel=0.01)   # 95 + 30 bps
+        if exp.get("mayhemMode"):                                        # a mayhem-gorbe NEM a 30 SOL-os (V0_SOL nem ervenyes)
+            assert ev["vSolInBondingCurve"] - real_sol / 1e9 < 5
 
 
 def test_decode_trade_event_rejects_other_events(tmp_path, monkeypatch):

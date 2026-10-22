@@ -10,7 +10,8 @@
 - **Telegram:** a hosszú üzenetek sorhatáron darabolódnak (eddig 3800 karakterenként, így egy szám is kettétörhetett, pl. „3” + „8144”).
 - **Stratégia-lista figyelmeztetés:** induláskor, a `/diag`-ban és a Telegram-jelentésben, ha a `PAPER_SNIPER_STRATS` ismeretlen (pl. kivezetett) nevet tartalmaz, ha egy stratégiát kizár, vagy ha a mostani konfig mást futtatna, mint a futó sniper (újraindítás kell). A futó példány listája az állapotfájlba kerül.
 - **Nyitott pozíciók stratégiánként:** a `/sniper` riportban, a Telegram-jelentés táblázatában és a `/diag` belépési táblájában. A futó, de még lezárt pozíció nélküli stratégia is megjelenik; a kivezetett stratégiák még nyitott pozíciói külön sorban.
-- `docs/KISERLETEK.md`: az S13 és az S14 ténylegesen 2026-10-22 ~06:45-től fut (addig a `PAPER_SNIPER_STRATS` kizárta őket); az S13-ról addig nincs adat.
+- `docs/KISERLETEK.md`: az S13 és az S14 2026-10-22 10:25-ig egyszer sem futott (a `/diag` szerint 0 belépés, 0 S13-értékelés: a futó sniper listája kizárta őket); róluk eddig nincs adat.
+- **Teszt egy valódi TradeEvent-sorra** (a VPS `/diag` mintája, slot 459966561): a várt értékek a hivatalos IDL teljes borsh-elemzéséből (391 bájt). Ez egy mayhem-módú token: díj 0, a görbe induló virtuális SOL-ja kb. 2,66, nem 30.
 
 ## Paper sniper: 50-es ítélet-küszöb, 1,2%-os AMM-díj, S14-jel 60 mp-ről, tesztek, izolált futtatás
 
