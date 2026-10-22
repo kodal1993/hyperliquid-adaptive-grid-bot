@@ -11,22 +11,17 @@ MIT CSINAL
   nem olvas be, tranzakciot nem kuld.
 
 STRATEGIAK
-    S6_okos         egy "okos tarca" (sajat PnL szerint) vett, 1 mp kesessel
-    S6_okos2        legalabb 2 okos tarca vett ugyanabbol
     S8_masol        MASOLHATO tarca vett: a tarcat azon mertuk, mennyit hozott volna NEKUNK
                     kovetve (COPY_LAT keses, a mi dijaink, kiszallas az o eladasakor), es ennek
                     az also hibahatara is pozitiv
     S10_bennfentes  bennfentes-klaszter (lasd lent) vett: belepes a felismeres utan
                     (3 mp + COPY_LAT), ha meg egyik bennfentes sem adott el
-    S12_futtat      tapadast mutato token (gorbe >= 50%, klaszter nelkul, >= 25 vevo, legalabb 60 mp-es,
-                    a korai vevok < 20%, a dev < 15% — a bundle-os, mp-ek alatt felhuzott inditas kimarad):
-                    a nyerok futtatasa — graduacio UTAN is tartjuk (ar: DexScreener, AMM-dij),
-                    kiszallas a csucstol -50%-nal, legfeljebb 24 ora; nincs TP-plafon
-
     S13_amm         graduacio UTANI belepes (kesesfuggetlen, ingyenes): a PumpPortal graduacios
                     esemenye utan S13_DELAY_MIN perccel a DexScreener-adatok alapjan (likviditas,
                     5 perces forgalom, vevok/eladok, arvaltozas) a PumpSwap aron, AMM-dijjal es a
-                    pool meretebol szamolt csuszassal; kiszallas mint az S12 (csucstol -50%, max 24 ora)
+                    pool meretebol szamolt csuszassal; kiszallas a csucstol -50%-nal, max 24 ora
+  Lezarva (kudarc, a kodbol kivezetve): S6_okos / S6_okos2 (sajat PnL szerint okos tarcak kovetese,
+  -20% / -25%, n=196 / 77), S12_futtat (gorbe >= 50%-nal belepes, graduacio utan dump: -55%, n=10).
 
 TOKEN-NAPLO (nyero tokenek keresese)
   Minden uj tokenrol pillanatkep 30 es 60 mp-es korban (lancon merve: a letrehozas utani 75 / 150 slot):
@@ -46,7 +41,7 @@ KISZALLAS
     alap    TP / SL / idokorlat (PAPER_SNIPER_TP_X / SL_X / MAX_HOLD_MIN); graduacional a gorbe
             vegso aran zar (optimista)
     masol   ki, amikor a kovetett tarca (S10: az elso bennfentes) elad; SL 0.5x, max 30 perc
-    S12_futtat sajat szabaly: csucstol -50%, max 24 ora, graduacio utan is
+    S13 / S14 alap: csucstol -50%, max 24 ora, graduacio utan is
   A CSV-ben "S8_masol" (alap) es "S8_masol~masol"; a kulonbseg parositva: report --kiszallas.
 
 TARCA-ADATBAZIS
@@ -86,7 +81,7 @@ KONFIG (.env, mind opcionalis):
     PAPER_SNIPER_TP_X=2.0 / SL_X=0.5 / MAX_HOLD_MIN=30   # az alap kiszallas
     PAPER_SNIPER_MAX_OPEN=120       # strategiankent egyszerre nyitott poziciok
     PAPER_SNIPER_POLL_SEC=10        # gorbe-lekerdezes gyakorisaga
-    PAPER_SNIPER_STRATS=            # ures = mind; pl. S8_masol,S12_futtat
+    PAPER_SNIPER_STRATS=            # ures = mind; pl. S10_bennfentes,S14_volumen
     PAPER_SNIPER_TRADE_WINDOW_MIN=15   # ennyi percig kovetjuk egy token kereskedeseit
     PAPER_SNIPER_SMART_MIN_N=5 / SMART_MIN_WIN=0.5 / SMART_MIN_PNL=0.5   # okos tarca
     PAPER_SNIPER_COPY_LAT=1.0       # koveto keses (mp)
@@ -137,11 +132,8 @@ BASE58 = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 TRADE_FIELDS = ["ts_open", "ts_close", "strat", "mint", "name", "symbol", "latency_s", "entry_vsol", "exit_vsol",
                 "cost_sol", "proceeds_sol", "pnl_sol", "ret_pct", "reason", "hold_s", "graduated"]
 STRAT_DESC = {
-    "S6_okos": "okos tarca vett (sajat PnL szerint), 1 mp keses",
-    "S6_okos2": "legalabb 2 okos tarca vett",
     "S8_masol": "masolhato tarca vett (a mi kesesunkkel + dijainkkal mert)",
     "S10_bennfentes": "bennfentesek kovetese: be 4 mp-nel, ki az elso bennfentes eladasakor",
-    "S12_futtat": "tapadas (gorbe >= 50%, >= 60 mp, tiszta, nem bundle): graduacio utan is, csucstol -50%, max 24 ora",
     "S13_amm": "graduacio utan 5 perccel, DexScreener-tapadas eseten, a PumpSwap-on; csucstol -50%, max 24 ora",
     "S14_volumen": "30 mp-nel >= 25 SOL vasarlas (a token-naplo jele); alap: csucstol -50% / gyors: -30%, 30 perc",
 }
@@ -155,9 +147,9 @@ WSOL = "So11111111111111111111111111111111111111112"
 TRADE_EVENT_DISC = bytes.fromhex("bddb7fd34ee661ee")   # sha256("event:TradeEvent")[:8] (Anchor esemeny)
 CREATE_EVENT_DISC = bytes.fromhex("1b72a94ddeeb6376")  # sha256("event:CreateEvent")[:8]
 B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-S12_RULE = {"trail_x": 0.0, "trail_drop": 0.5, "max": 24 * 60, "hold_grad": True}   # csucstol -50%, 24 ora
+FUTTAT_RULE = {"trail_x": 0.0, "trail_drop": 0.5, "max": 24 * 60, "hold_grad": True}   # csucstol -50%, 24 ora
 S14_GYORS = {"trail_x": 1.3, "trail_drop": 0.3, "sl": 0.6, "max": 30}               # felfutas utan gyors kiszallas
-HOLD_GRAD = ("S12_futtat", "S14_volumen")                                          # graduacio utan is tartjuk
+HOLD_GRAD = ("S14_volumen",)                                                       # graduacio utan is tartjuk
 # kiszallasi valtozatok: alap a konfigbol; masol a kovetett tarca eladasara (csak kovetett tarcas pozicion)
 EXITS = {
     "alap": {},
@@ -231,7 +223,7 @@ def fnum(x, d=0.0):
 
 def atomic_write(path, obj):
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj))
+    tmp.write_text(json.dumps(obj, separators=(",", ":")))
     tmp.replace(path)
 
 
@@ -445,7 +437,6 @@ class Sniper:
         self.smart_pnl = cfg("PAPER_SNIPER_SMART_MIN_PNL", 0.5)
         self.wallets = db.get("wallets", {})                 # tarca -> [tokenek, nyero, PnL SOL, utolso ido]
         self.tracked = {}                                    # kovetett tokenek (kereskedes-feliratkozas): mint -> token
-        self.sub_q, self.unsub_q = [], []                    # elkuldendo (le)iratkozasok
         self.wallet_log_on = cfg("PAPER_SNIPER_WALLET_LOG", 1, int) == 1
         self.wallet_log_max = cfg("PAPER_SNIPER_WALLET_LOG_MB", 300.0) * 1e6
         self.wallet_rows = []
@@ -567,7 +558,6 @@ class Sniper:
         vs, vt = fnum(m.get("vSolInBondingCurve")), fnum(m.get("vTokensInBondingCurve"))
         if vs > 0 and vt > 0 and not T["pt"]:
             self.add_px(T, time.time(), vs / vt)
-        self.sub_q.append(T["mint"])
         asyncio.get_running_loop().call_later(CLUSTER_SEC, self.eval_cluster, T)
 
     @staticmethod
@@ -678,21 +668,10 @@ class Sniper:
             if w != T["dev"] and self.is_early(T, now, slot):
                 T["early_tok"] += tok
             if w != T["dev"] and self.is_smart(w):
-                T["smart"].add(w)
-                T["leaders"].setdefault("S6_okos", w)
-                self.enter_later("S6_okos", T, 1)
-                if len(T["smart"]) >= 2:
-                    T["leaders"].setdefault("S6_okos2", w)
-                    self.enter_later("S6_okos2", T, 1)
+                T["smart"].add(w)                      # a token-naplo jele (az S6 kovetes kudarc volt)
             if w != T["dev"] and self.is_copyable(w):
                 T["leaders"].setdefault("S8_masol", w)
                 self.enter_later("S8_masol", T, self.copy_lat)
-            # tapadas: gorbe >= 50%, tiszta, sok vevo — es IDOBEN kibontakozo: egy 5 mp alatt 80%-ig toltott
-            # gorbe bundle-os inditas (friss tarcakkal, ezert a klaszter-szuro nem latja), graduacio utan dump
-            if (vs - V0_SOL >= 0.5 * GRAD_SOL and T.get("clustered") is False and not T["copy"]
-                    and len(T["buyers"]) >= 25 and T["n_sell"] < 0.7 * T["n_buy"]
-                    and now - T["t"] >= 60 and T["early_tok"] / TOTAL_SUPPLY < 0.20 and T.get("dev_share", 0) < 15):
-                self.enter_later("S12_futtat", T, self.copy_lat)
         else:
             rec[1] += sol
             rec[2] = max(0.0, rec[2] - tok)
@@ -762,6 +741,8 @@ class Sniper:
                 self.finalize_token(mint, T, now)
             except Exception as e:
                 self.note_error("elszamolas", e)       # csak ez az egy token marad ki
+            for k in ("tr", "pt", "pp", "buyers", "smart", "losers", "snaps", "pmax"):
+                T.pop(k, None)                         # memoria: a teljes kereskedesi elozmeny mar nem kell
         self.flush_wallet_log()
 
     def finalize_token(self, mint, T, now):
@@ -984,13 +965,13 @@ class Sniper:
                 p["leader_sold"] = time.time()          # a kovetett tarca mar a belepes elott elkezdett eladni
 
     def new_exits(self, strat=""):
-        names = ["alap"] if strat in ("S12_futtat", "S13_amm") else (["alap", "gyors"] if strat == "S14_volumen" else list(self.exits))
+        names = ["alap"] if strat == "S13_amm" else (["alap", "gyors"] if strat == "S14_volumen" else list(self.exits))
         return {k: {"peak": 0.0, "rem": 1.0, "got": 0.0, "part": False} for k in names}
 
     def rule(self, p, name):
         if p["strat"] == "S14_volumen":
-            return S12_RULE if name == "alap" else (S14_GYORS if name == "gyors" else None)
-        return S12_RULE if p["strat"] in ("S12_futtat", "S13_amm") and name == "alap" else self.exits.get(name)
+            return FUTTAT_RULE if name == "alap" else (S14_GYORS if name == "gyors" else None)
+        return FUTTAT_RULE if p["strat"] == "S13_amm" and name == "alap" else self.exits.get(name)
 
     # ---- gorbe-lekerdezes: kiszallasok
     async def poll_loop(self):
@@ -1183,9 +1164,6 @@ class Sniper:
             import websockets
         except ImportError:
             websockets = None
-        # ujrakapcsolodaskor az osszes kovetett tokenre ujra feliratkozunk
-        self.sub_q = list(self.tracked)
-        self.unsub_q = []
         if websockets:
             async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=30, max_size=2 ** 20) as ws:
                 for s in subs:
@@ -1221,7 +1199,6 @@ class Sniper:
             try:
                 if self.trades_on:
                     self.finalize_tracked()
-                self.sub_q, self.unsub_q = [], []
                 cut = time.time() - 30
                 for k in [k for k, v in self.pending.items() if v[0][0] < cut]:
                     del self.pending[k]               # 30 mp utan sem jott create: regi vagy nem kovetett token
@@ -1308,8 +1285,8 @@ class Sniper:
                             self.on_trade(ev)
                         except Exception as e:
                             self.note_error("kereskedes", e)
-                    elif mint not in self.tokens and mint not in self.mint_dev:
-                        buf = self.pending.setdefault(mint, [])   # meg nem lattuk a create-et: puffer
+                    elif mint in self.create_slot and mint not in self.tokens:
+                        buf = self.pending.setdefault(mint, [])   # friss token, a PumpPortal create meg nem jott meg
                         if len(buf) < 50:
                             buf.append((time.time(), ev))
 
@@ -1484,7 +1461,8 @@ def report_text(short=False):
             lines.append(f"  ebbol graduacional zarva: {g_pnl:+.4f} SOL (OPTIMISTA: a gorbe vegso aran szamolva)")
             if ng:
                 lines.append(f"  graduáltak nelkul: atlag {sum(ng)/len(ng):+.1f}% / pozicio (n={len(ng)})")
-    sk, mi = st.get("skipped", {}), st.get("missed", {})
+    sk = {k: v for k, v in st.get("skipped", {}).items() if k in STRAT_DESC}     # a kivezetett strategiak nelkul
+    mi = {k: v for k, v in st.get("missed", {}).items() if k in STRAT_DESC}
     if sk or mi:
         lines.append("")
         lines.append("Kihagyva (tele volt a strategia): " + (", ".join(f"{k} {v}" for k, v in sk.items()) or "-")
@@ -1955,7 +1933,7 @@ def diag():
     print("\n== Tarca-kovetes (S6/S8/S10)")
     wst = s.get("wallets") or {}
     print(f"kereskedes-uzenet: {s.get('trade_msgs', 0)}  hibas: {s.get('trade_bad', 0)}  elszamolt tarca-pozicio: {s.get('wallet_closes', 0)}"
-          f"  kovetett token most: {wst.get('tracked', '-')}  feliratkozas elkuldve: {s.get('subs_sent', 0)} token")
+          f"  kovetett token most: {wst.get('tracked', '-')}")
     rw = dict(s.get("rpc_ws") or {})
     if rw.get("last_error"):
         rw["last_error"] = redact(rw["last_error"])
