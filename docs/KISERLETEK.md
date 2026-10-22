@@ -14,6 +14,11 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
 2. **Papírteszt előre rögzített feltételekkel.** A határidő, a siker és a leállítás az indulás
    előtt kerül ide, és utólag nem módosítjuk. A paraméterek hangolása addig, amíg jó nem lesz,
    tilos: egy hangolás = új kísérlet, új határidővel.
+   **Korai leállítás** (2026-10-22-től): ha egy stratégia legalább 50 lezárt pozíción a hibahatárral együtt is
+   negatív (a riport ítélete `NEGATIV`), a határidő előtt leállítható. Ez csak a veszteseket zárja ki korábban,
+   a pozitív irányba nem torzít. Korai *siker* nincs: a pozitívat a határidőig és egy friss időszakon is igazolni kell.
+   **Kódstop** (2026-10-22-től): futó kísérlet alatt csak a mérést elrontó hibát javítjuk; új jel, stratégia vagy
+   riport-funkció csak új kísérletként, a kapukérdések után.
 3. **Mérce:** a HLP vault (2026 október: kb. 3,5% APR). Ami ennél nem jobb a kockázatához mérten,
    annál egyszerűbb a HLP.
 4. **Statisztika:**
@@ -124,7 +129,11 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
 - **Mérés:** Telegram `/report`; `/diag` (S13 kihagyási okok); `/export`.
 - **Siker:** legalább 50 pozíción a hibahatárral együtt pozitív, utána egy második, friss időszak. A riport
   ítélete (`POZITIV` / `NEGATIV`, kiszállás-összevetésnél `JOBB` / `ROSSZABB`) is csak 50 pozíciótól dönt.
-- **Leállítás:** a határidőre egyik sem pozitív → `systemctl stop hyperliquid-paper-sniper`.
+- **Leállítás:** a határidőre egyik sem pozitív → `systemctl stop hyperliquid-paper-sniper`. Egy stratégia korábban is
+  leáll, ha legalább 50 lezárt pozíción `NEGATIV` (lásd a 2. szabályt): kivétel a `PAPER_SNIPER_STRATS`-ból
+  (`/set`, utána `/restart_sniper`), és ide a lezárt mérések közé kerül az eredménnyel.
+- **Ellenőrzési pontok:** 2026-10-22 este (`/report`: az S14 első ítélete), 2026-10-23 este (S10, S13), 10-28 (carry),
+  11-04 (sniper határidő).
 - **Határidő:** 2026-11-04.
 
 ### HYPE funding carry (`scripts/paper_carry`) — papír
