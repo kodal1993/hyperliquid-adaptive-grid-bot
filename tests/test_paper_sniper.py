@@ -514,6 +514,9 @@ def test_wallet_skill_verdict_needs_significance(tmp_path, monkeypatch):
     same = _skill_log(mod, (10, -10), (10, -10))                         # a masodik fele egyforma: nincs tudas
     assert "atlagos hozam" in same and same.count("nem bizonyitott kulonbseg") == 2
     assert "van kitarto tudas" not in same
+    small = _skill_log(mod, (11, -10), (10, -10))                        # +0.4 %-pont, a hibahataron belul (a riport +0.3-as esete)
+    line_s = next(ln for ln in small.splitlines() if "-> atlagos hozam" in ln)
+    assert "+0.4%-ponttal" in line_s and "nem bizonyitott kulonbseg" in line_s
     diff = _skill_log(mod, (30, 25), (-30, 5))                           # a jok a masodik felben is jobbak
     line_a = next(ln for ln in diff.splitlines() if "-> atlagos hozam" in ln)
     line_w = next(ln for ln in diff.splitlines() if "-> nyero arany" in ln)
