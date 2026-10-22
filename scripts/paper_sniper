@@ -36,6 +36,10 @@ TOKEN-NAPLO (nyero tokenek keresese)
   'tokens' parancs: mely jelek mellett gyakori a nyero (>= 3x vagy graduacio) — az adat elso 70%-an
   keresve, a hatralevo 30%-on ellenorizve.
 
+    S14_volumen     a token-naplo elso, ellenorzott jele: 30 mp-nel (lancon merve) >= S14_MIN_BUY_SOL (25) SOL
+                    vasarlas. Ket kiszallas parositva: alap = csucstol -50%, max 24 ora, graduacio utan is;
+                    gyors = 1.3x felett csucstol -30%, SL 0.6x, max 30 perc
+
 KISZALLAS
     alap    TP / SL / idokorlat (PAPER_SNIPER_TP_X / SL_X / MAX_HOLD_MIN); graduacional a gorbe
             vegso aran zar (optimista)
@@ -87,6 +91,7 @@ KONFIG (.env, mind opcionalis):
     PAPER_SNIPER_COPY_MIN_N=8       # masolhato tarca: legalabb ennyi koveto-pozicio
     PAPER_SNIPER_SAMPLE_S10=0.3     # S10: a klaszteres tokenek ekkora reszebe lepunk be
     PAPER_SNIPER_S13_DELAY_MIN=5    # S13: ennyi perccel a graduacio utan ertekel
+    PAPER_SNIPER_S14_MIN_BUY_SOL=25 # S14: ennyi vasarolt SOL kell a 30 mp-es pillanatkepig
     PAPER_SNIPER_S13_MIN_LIQ_USD=8000 / S13_MIN_VOL5_USD=3000 / S13_BUY_RATIO=1.2   # S13 belepesi feltetelek
     PAPER_SNIPER_CLUSTER_MIN=3      # visszatero csoport: ennyi kozos korai token
     PAPER_SNIPER_WALLET_LOG=1 / WALLET_LOG_MB=300   # viselkedesnaplo
@@ -134,6 +139,7 @@ STRAT_DESC = {
     "S10_bennfentes": "bennfentesek kovetese: be 4 mp-nel, ki az elso bennfentes eladasakor",
     "S12_futtat": "tapadas (gorbe >= 50%, >= 60 mp, tiszta, nem bundle): graduacio utan is, csucstol -50%, max 24 ora",
     "S13_amm": "graduacio utan 5 perccel, DexScreener-tapadas eseten, a PumpSwap-on; csucstol -50%, max 24 ora",
+    "S14_volumen": "30 mp-nel >= 25 SOL vasarlas (a token-naplo jele); alap: csucstol -50% / gyors: -30%, 30 perc",
 }
 TOTAL_SUPPLY = 1e9                     # pump.fun tokenek teljes kinalata
 EARLY_SEC = 2.0                        # ennyi mp-en beluli vetel "korai" (bundle / gyors sniper)
@@ -146,6 +152,8 @@ TRADE_EVENT_DISC = bytes.fromhex("bddb7fd34ee661ee")   # sha256("event:TradeEven
 CREATE_EVENT_DISC = bytes.fromhex("1b72a94ddeeb6376")  # sha256("event:CreateEvent")[:8]
 B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 S12_RULE = {"trail_x": 0.0, "trail_drop": 0.5, "max": 24 * 60, "hold_grad": True}   # csucstol -50%, 24 ora
+S14_GYORS = {"trail_x": 1.3, "trail_drop": 0.3, "sl": 0.6, "max": 30}               # felfutas utan gyors kiszallas
+HOLD_GRAD = ("S12_futtat", "S14_volumen")                                          # graduacio utan is tartjuk
 # kiszallasi valtozatok: alap a konfigbol; masol a kovetett tarca eladasara (csak kovetett tarcas pozicion)
 EXITS = {
     "alap": {},
@@ -407,6 +415,7 @@ class Sniper:
         self.s13_liq = cfg("PAPER_SNIPER_S13_MIN_LIQ_USD", 8000.0)
         self.s13_vol5 = cfg("PAPER_SNIPER_S13_MIN_VOL5_USD", 3000.0)
         self.s13_ratio = cfg("PAPER_SNIPER_S13_BUY_RATIO", 1.2)
+        self.s14_buy = cfg("PAPER_SNIPER_S14_MIN_BUY_SOL", 25.0)
         self.dex_last = 0.0
         self.poll = cfg("PAPER_SNIPER_POLL_SEC", 10.0)
         only = [s.strip() for s in (os.getenv("PAPER_SNIPER_STRATS") or "").split(",") if s.strip()]
@@ -636,6 +645,8 @@ class Sniper:
                 if k not in T["snaps"] and slot0 > cs + off:
                     T["snaps"][k] = self.token_features(T)
                     T["pmax"][k] = T["px"] or 0.0
+                    if k == "30" and T["snaps"][k]["buy_sol"] >= self.s14_buy:
+                        self.enter_later("S14_volumen", T, 0)    # a token-naplo ellenorzott jele
         if vs > 0 and vt > 0:
             self.add_px(T, now, vs / vt)
             T["vs"] = vs
@@ -742,44 +753,50 @@ class Sniper:
             if not force and now - T["t"] < self.trade_window:
                 continue
             del self.tracked[mint]
-            self.unsub_q.append(mint)
-            px = T["px"]
-            self.log_token(T, now)
-            early_pct = round(T["early_tok"] / TOTAL_SUPPLY * 100, 2)
-            for w, rec in T["tr"].items():
-                si, so, tk, t0 = rec[:4]
-                if w == T["dev"] or self.is_early(T, t0, rec[10] if len(rec) > 10 else None) or si < 0.02:
-                    continue                          # dev, korai (nem kovetheto) vagy por-meretu
-                rem = tk * px * (1 - self.fee) if px else 0.0
-                pnl = so + rem - si
-                prior = self.wallets.get(w)
-                if self.wallet_log_on and len(rec) >= 9:
-                    minta = random.random() < 0.05
-                    if minta or (prior and prior[0] >= 2):
-                        e_rsol, t_sell, nb, ns, mx = rec[4:9]
-                        self.wallet_rows.append([round(now), mint, w, prior[0] if prior else 0, int(self.is_smart(w)), int(minta),
-                                                 round(t0 - T["t"], 1), round(e_rsol, 2), round(si, 4), round(so, 4), round(rem, 4),
-                                                 round(pnl, 4), round(pnl / si * 100, 1), round((t_sell or now) - t0) if t_sell else -1,
-                                                 round(1 - tk / mx, 3) if mx > 0 else 0.0, nb, ns, len(T["buyers"]), early_pct])
-                r = self.wallets.setdefault(w, [0, 0, 0.0, now])
-                while len(r) < 8:
-                    r.append(0)                       # koveto: poziciok, nyero, hozam-osszeg, negyzetosszeg
-                entry = self.px_at(T, t0 + self.copy_lat)
-                if entry:
-                    t_sell = rec[9] if len(rec) >= 10 else 0.0
-                    ex = (self.px_at(T, t_sell + self.copy_lat) if t_sell else None) or T["px"]
-                    cr = (ex / entry) * (1 - self.fee) ** 2 - 1 - 2 * self.prio / self.size
-                    cr = max(-1.0, min(5.0, cr))
-                    r[4] += 1
-                    r[5] += int(cr > 0)
-                    r[6] = round(r[6] + cr, 5)
-                    r[7] = round(r[7] + cr * cr, 5)
-                r[0] += 1
-                r[1] += int(pnl > 0)
-                r[2] = round(r[2] + pnl, 4)
-                r[3] = round(now)
-                self.stats["wallet_closes"] += 1
+            try:
+                self.finalize_token(mint, T, now)
+            except Exception as e:
+                self.note_error("elszamolas", e)       # csak ez az egy token marad ki
         self.flush_wallet_log()
+
+    def finalize_token(self, mint, T, now):
+        """egy lejart token elszamolasa: token-naplo sor, tarca-pozicio naplo, tarca-adatbazis"""
+        px = T["px"]
+        self.log_token(T, now)
+        early_pct = round(T["early_tok"] / TOTAL_SUPPLY * 100, 2)
+        for w, rec in T["tr"].items():
+            si, so, tk, t0 = rec[:4]
+            if w == T["dev"] or self.is_early(T, t0, rec[10] if len(rec) > 10 else None) or si < 0.02:
+                continue                          # dev, korai (nem kovetheto) vagy por-meretu
+            rem = tk * px * (1 - self.fee) if px else 0.0
+            pnl = so + rem - si
+            prior = self.wallets.get(w)
+            if self.wallet_log_on and len(rec) >= 9:
+                minta = random.random() < 0.05
+                if minta or (prior and prior[0] >= 2):
+                    e_rsol, t_sell, nb, ns, mx = rec[4:9]
+                    self.wallet_rows.append([round(now), mint, w, prior[0] if prior else 0, int(self.is_smart(w)), int(minta),
+                                             round(t0 - T["t"], 1), round(e_rsol, 2), round(si, 4), round(so, 4), round(rem, 4),
+                                             round(pnl, 4), round(pnl / si * 100, 1), round((t_sell or now) - t0) if t_sell else -1,
+                                             round(1 - tk / mx, 3) if mx > 0 else 0.0, nb, ns, len(T["buyers"]), early_pct])
+            r = self.wallets.setdefault(w, [0, 0, 0.0, now])
+            while len(r) < 8:
+                r.append(0)                       # koveto: poziciok, nyero, hozam-osszeg, negyzetosszeg
+            entry = self.px_at(T, t0 + self.copy_lat)
+            if entry:
+                t_sell = rec[9] if len(rec) >= 10 else 0.0
+                ex = (self.px_at(T, t_sell + self.copy_lat) if t_sell else None) or T["px"]
+                cr = (ex / entry) * (1 - self.fee) ** 2 - 1 - 2 * self.prio / self.size
+                cr = max(-1.0, min(5.0, cr))
+                r[4] += 1
+                r[5] += int(cr > 0)
+                r[6] = round(r[6] + cr, 5)
+                r[7] = round(r[7] + cr * cr, 5)
+            r[0] += 1
+            r[1] += int(pnl > 0)
+            r[2] = round(r[2] + pnl, 4)
+            r[3] = round(now)
+            self.stats["wallet_closes"] += 1
 
     def log_token(self, T, now):
         """token-pillanatkepek + kimenetel a kovetesi ablak vegen (ha egy horizontot nem ert el: 'died')"""
@@ -793,6 +810,7 @@ class Sniper:
             mx = (T["pmax"].get(k, px0) / px0) if px0 else 0.0
             fin = ((T["px"] or 0.0) / px0) if px0 else 0.0
             rows.append([round(now), T["mint"], k, int(died)] + [f[x] for x in TOKEN_FEATS] + [px0, round(mx, 4), round(fin, 4)])
+        self.stats["token_rows"] = self.stats.get("token_rows", 0) + 1
         try:
             new = not TOKEN_LOG.exists()
             with TOKEN_LOG.open("a", newline="") as fh:
@@ -934,10 +952,12 @@ class Sniper:
                 p["leader_sold"] = time.time()          # a kovetett tarca mar a belepes elott elkezdett eladni
 
     def new_exits(self, strat=""):
-        names = ["alap"] if strat in ("S12_futtat", "S13_amm") else list(self.exits)
+        names = ["alap"] if strat in ("S12_futtat", "S13_amm") else (["alap", "gyors"] if strat == "S14_volumen" else list(self.exits))
         return {k: {"peak": 0.0, "rem": 1.0, "got": 0.0, "part": False} for k in names}
 
     def rule(self, p, name):
+        if p["strat"] == "S14_volumen":
+            return S12_RULE if name == "alap" else (S14_GYORS if name == "gyors" else None)
         return S12_RULE if p["strat"] in ("S12_futtat", "S13_amm") and name == "alap" else self.exits.get(name)
 
     # ---- gorbe-lekerdezes: kiszallasok
@@ -990,7 +1010,7 @@ class Sniper:
             done = bool(c["done"])
             if done and (c["vsol"] <= 0 or c["vtok"] <= 0):
                 c = dict(p["last"], done=True)       # graduacio utan a gorbe kiurul: az utolso ismert allapot
-            if done and p["strat"] == "S12_futtat" and not p.get("amm"):
+            if done and p["strat"] in HOLD_GRAD and not p.get("amm"):
                 p["amm"], p["grad_t"] = True, now     # S12: graduacio utan is tartjuk, az AMM-en
             own = p.get("net_lam", self.size * 1e9 * (1 - self.fee))   # regi allapotfajlban meg nincs
             dex = self.dex_px.get(p["mint"]) if p.get("amm") else None
@@ -1137,14 +1157,10 @@ class Sniper:
                 for s in subs:
                     await ws.send(s)
                 log("PumpPortal: kapcsolodva")
-                sender = asyncio.create_task(self.sub_sender(ws.send))
-                try:
-                    async for raw in ws:
-                        self.handle(raw)
-                        if self.stop:
-                            break
-                finally:
-                    sender.cancel()
+                async for raw in ws:
+                    self.handle(raw)
+                    if self.stop:
+                        break
             return
         try:
             import aiohttp
@@ -1155,29 +1171,38 @@ class Sniper:
                 for x in subs:
                     await ws.send_str(x)
                 log("PumpPortal: kapcsolodva (aiohttp)")
-                sender = asyncio.create_task(self.sub_sender(ws.send_str))
-                try:
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            self.handle(msg.data)
-                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                            break
-                        if self.stop:
-                            break
-                finally:
-                    sender.cancel()
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        self.handle(msg.data)
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+                    if self.stop:
+                        break
 
-    async def sub_sender(self, send):
-        """masodpercenkent: a lejart kovetesi ablakok elszamolasa. (A PumpPortal subscribeTokenTrade
-        fizetos API-kulcsot ker, ezert a kereskedeseket a Solana RPC-rol olvassuk: rpc_ws_loop.)"""
+    async def maintenance_loop(self):
+        """masodpercenkent: a lejart kovetesi ablakok elszamolasa (token- es tarca-naplo) es a puffer takaritasa.
+        Sajat feladat, fuggetlen a PumpPortal-kapcsolattol; egy hiba nem allitja le (eddig csendben leallhatott)."""
         while not self.stop:
             await asyncio.sleep(1)
-            if self.trades_on:
-                self.finalize_tracked()
-            self.sub_q, self.unsub_q = [], []
-            cut = time.time() - 30
-            for k in [k for k, v in self.pending.items() if v[0][0] < cut]:
-                del self.pending[k]                   # 30 mp utan sem jott create: regi vagy nem kovetett token
+            try:
+                if self.trades_on:
+                    self.finalize_tracked()
+                self.sub_q, self.unsub_q = [], []
+                cut = time.time() - 30
+                for k in [k for k, v in self.pending.items() if v[0][0] < cut]:
+                    del self.pending[k]               # 30 mp utan sem jott create: regi vagy nem kovetett token
+                self.stats["maint_last"] = round(time.time())
+            except Exception as e:
+                self.note_error("karbantartas", e)
+
+    def note_error(self, where, e):
+        """hibak szamlalasa es naplozasa (az elso 5, utana 100-ankent), hogy ne nemuljon el semmi"""
+        import traceback
+        err = self.stats.setdefault("errors", {})
+        err[where] = err.get(where, 0) + 1
+        self.stats["last_exc"] = redact(f"{where}: {type(e).__name__}: {str(e)[:150]}")
+        if err[where] <= 5 or err[where] % 100 == 0:
+            log(f"HIBA ({where}, {err[where]}.): {self.stats['last_exc']}\n" + redact(traceback.format_exc(limit=4)))
 
     # ---- kereskedesek a Solana RPC-rol (logsSubscribe a pump.fun programra)
     async def rpc_ws_loop(self):
@@ -1245,7 +1270,10 @@ class Sniper:
                         st["lag"] = round(lag if "lag" not in st else 0.99 * st["lag"] + 0.01 * lag, 2)
                     mint = ev["mint"]
                     if mint in self.tracked or ev["traderPublicKey"] in self.led_wallets:
-                        self.on_trade(ev)
+                        try:
+                            self.on_trade(ev)
+                        except Exception as e:
+                            self.note_error("kereskedes", e)
                     elif mint not in self.tokens and mint not in self.mint_dev:
                         buf = self.pending.setdefault(mint, [])   # meg nem lattuk a create-et: puffer
                         if len(buf) < 50:
@@ -1293,7 +1321,7 @@ class Sniper:
             except NotImplementedError:
                 pass
         tasks = [asyncio.create_task(self.ws_loop()), asyncio.create_task(self.poll_loop()), asyncio.create_task(self.periodic()),
-                 asyncio.create_task(self.rpc_ws_loop())]
+                 asyncio.create_task(self.rpc_ws_loop()), asyncio.create_task(self.maintenance_loop())]
         try:
             while not self.stop:
                 await asyncio.sleep(1)
@@ -1642,12 +1670,19 @@ def tokens_report(h="30"):
     train, test = rows[:cut], rows[cut:]
     rate = lambda xs: sum(r["win"] for r in xs) / len(xs) * 100 if xs else float("nan")
     fin = lambda xs: sum(min(r["final_mult"], 10.0) for r in xs) / len(xs) if xs else float("nan")
+    # kiveheto kozelites: csucstol -50%-os kiszallas (S12/S14 alap) — a vegso ar, ha nem esett a csucs felere, kulonben a csucs fele;
+    # a belepes es kiszallas koltsege kb. 5% (0.95x). 1.0 felett nyereseges lenne.
+    def trail50(r):
+        peak = max(1.0, r["max_mult"])                 # a csucs legalabb a belepesi ar
+        v = 0.5 * peak if r["final_mult"] < 0.5 * peak else r["final_mult"]
+        return 0.95 * min(10.0, v)
+    cap = lambda xs: sum(trail50(r) for r in xs) / len(xs) if xs else float("nan")
     hours = (rows[-1]["ts"] - rows[0]["ts"]) / 3600
     bt, bs = rate(train), rate(test)
     out = [f"NYERO TOKENEK KORAI JELEI — {len(rows)} token, {hours:.1f} ora, pillanatkep {h} mp-nel (lancon merve)",
            f"nyero = a pillanatkep aratol >= 3x a kovetesi ablakban VAGY graduacio. Alapvonal: tanito {bt:.1f}%"
            f" (n={len(train)}), ellenorzo {bs:.1f}% (n={len(test)}); graduacio {sum(r['grad'] for r in rows) / len(rows) * 100:.1f}%",
-           "oszlopok: n tanito / nyero% | n ellenorzo / nyero% | emeles (ellenorzo) | atlagos vegso szorzo (ellenorzo, 10x-nel vagva)",
+           "oszlopok: n tanito / nyero% | n ellenorzo / nyero% (nyerok) | emeles (ellenorzo) | vegso szorzo | kiveheto (csucstol -50%, 5% koltseggel)",
            "* = mindket reszen legalabb 1.5x-es emeles es >= 30 ellenorzo token: ez lehet valodi jel", ""]
     cands = []
     for key, title, edges in TOKEN_BUCKETS:
@@ -1661,18 +1696,25 @@ def tokens_report(h="30"):
             ls = rate(te) / bs if te and bs else float("nan")
             star = "*" if te and len(te) >= 30 and lt >= 1.5 and ls >= 1.5 else " "
             lab = f"{lo:g}-{hi:g}" if hi < 1e8 else f"{lo:g}+"
-            out.append(f" {star} {lab:>10s}  {len(tr):5d} / {rate(tr):5.1f}% | {len(te):5d} / {rate(te) if te else float('nan'):5.1f}%"
-                       f" | {ls:4.1f}x | {fin(te):4.2f}")
+            nw = sum(r["win"] for r in te)
+            out.append(f" {star} {lab:>10s}  {len(tr):5d} / {rate(tr):5.1f}% | {len(te):5d} / {rate(te) if te else float('nan'):5.1f}% ({nw:2d})"
+                       f" | {ls:4.1f}x | {fin(te):4.2f} | {cap(te):4.2f}")
             if len(tr) >= 50:
                 cands.append((rate(tr), title, lab, tr, te))
+        out.append("")
+    test_wins = sum(r["win"] for r in test)
+    if test_wins < 20:
+        out.append(f"FIGYELEM: az ellenorzo reszen csak {test_wins} nyero token van — a csillagok meg bizonytalanok, sok csillagot")
+        out.append("ugyanaz a nehany token adhat. Tobb adat kell (legalabb ~20 ellenorzo nyero).")
         out.append("")
     cands.sort(key=lambda c: -c[0])
     out.append("A legjobb 3 sav a TANITO resz szerint — es hogyan teljesitettek az ELLENORZO reszen:")
     for r_tr, title, lab, tr, te in cands[:3]:
         out.append(f"  {title} {lab}: tanito {r_tr:.1f}% (n={len(tr)}) -> ellenorzo {rate(te) if te else float('nan'):.1f}% (n={len(te)}),"
-                   f" atlagos vegso {fin(te):.2f}x")
+                   f" vegso {fin(te):.2f}x, kiveheto {cap(te):.2f}x")
     out.append("Olvasat: csak az a jel szamit, amelyik az ellenorzo reszen is jobb az alapvonalnal. A belepes koltsege")
-    out.append("kb. 5% (a vegso szorzonak 1.05 felett kell lennie atlagosan, hogy egy egyszeru tart-15-percig strategia nyerjen).")
+    out.append("kb. 5%: a 'kiveheto' oszlopnak 1.0 felett kell lennie, hogy a csucstol -50%-os kiszallas nyerjen. A graduacio a")
+    out.append("nyero-definicioban a bundle-os pump-and-dumpot is nyerokent szamolja — ezert a kiveheto a fontosabb.")
     return "\n".join(out)
 
 
@@ -1857,6 +1899,13 @@ def diag():
     s13 = s.get("s13_skip") or {}
     if s13:
         print("  S13 kihagyva: " + ", ".join(f"{k} {v}" for k, v in sorted(s13.items(), key=lambda kv: -kv[1])))
+
+    ml = s.get("maint_last")
+    print(f"\n== Elszamolas: token-naplo sor {s.get('token_rows', 0)}, utolso karbantartas"
+          f" {f'{(time.time() - ml):.0f} mp-e' if ml else '-'}, hibak: {s.get('errors') or '-'}"
+          + (f"\n  utolso hiba: {s['last_exc']}" if s.get("last_exc") else ""))
+    if ml and time.time() - ml > 120:
+        print("  FIGYELEM: a karbantarto ciklus nem fut (a token- es tarca-naplo nem no)")
 
     print("\n== Tarca-kovetes (S6/S8/S10)")
     wst = s.get("wallets") or {}
