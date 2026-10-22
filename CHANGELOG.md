@@ -1,5 +1,24 @@
 # Changelog
 
+## Paper sniper: 50-es ítélet-küszöb, 1,2%-os AMM-díj, S14-jel 60 mp-ről, tesztek, izolált futtatás
+
+- **Ítélet:** a riport, a Telegram-jelentés és a kiszállás-összevetés legalább 50 pozíción dönt (eddig 30), a `docs/KISERLETEK.md` sniper-kártyája szerint (`VERDICT_MIN_N`).
+- **AMM-díj:** a `PAPER_SNIPER_AMM_FEE_BPS` alapértéke 30 → 120 bps (a PumpSwap friss graduált sávja kb. 1,2%/irány). Az eddigi S13 sorok és a graduáció után zárt S14 (`+amm`) sorok optimisták, pozíciónként kb. 1,8 százalékponttal. A `/diag` beállítás-sora mutatja az AMM-díjat.
+- **`tokens`:** az S14-jel (30 mp-nél legalább 25 SOL vásárlás) kimenetele a 60 mp-es pillanatkép árától is, mert a belépés a késés miatt kb. ott történik. A két pillanatkép mint szerint párosítva, tanító és ellenőrző részre bontva, a 60 mp-es alapvonallal együtt.
+- **Tesztek** (`tests/test_paper_sniper.py`):
+  - `decode_trade_event` egy elmentett `Program data:` sorra (`tests/fixtures/pump_trade_events.json`). A sor egyelőre a pump.fun hivatalos IDL-je (`@pump-fun/pump-sdk` 4.2.0, 36 mezős TradeEvent) szerint kódolt, mert a fejlesztői környezet nem éri el a Solana RPC-t; a valódi sor a `/diag` mintájából kerül mellé. Független ellenőrzés: a görbe szorzata és a valódi SOL-tartalék;
+  - vétel és eladás oda-vissza kb. −2 × díj;
+  - `poll_once` kiszállások: TP, SL, idő, S14 gyors és alap trail, graduáció → a görbe-stratégia zár, az S14 a PumpSwap-on folytatja 1,2%-os díjjal és csúszással;
+  - az 50-es ítélet-küszöb; a `tokens` S14 60 mp-es szakasza.
+- A `/diag` óránként elment és kiír egy valódi `TradeEvent` mintasort (slot, tranzakció), a teszt-fixture-höz.
+- **Izolált futtatás** (`deploy/install_paper_sniper.sh`, egyszer, root-ként):
+  - `paper-sniper` felhasználó, állapot a `/var/lib/paper-sniper`-ben, konfig a `/etc/paper-sniper/paper_sniper.env`-ben (a mostani `PAPER_SNIPER_*` és Solana/PumpPortal URL sorokból; privát kulcs és Telegram-token nélkül);
+  - a systemd unit a repóból csak a `scripts/` és a `.venv/` könyvtárat látja: a `.env`, a `.env.bak*` és a `config/live.env` a szolgáltatás számára nem létezik;
+  - `systemd-analyze security`: 9,4 (UNSAFE) → 4,3 (OK). Visszaállítás: `--vissza`.
+  - A vezérlő `/set PAPER_SNIPER_*` parancsa ekkor a sniper saját konfigjába ír (megtartja a jogosultságát), az `/export` onnan olvas, a sniper parancsai a vezérlő környezete (Telegram-token, kulcsok) nélkül futnak.
+  - A telepítő futtatásáig minden a régi módon megy.
+- A lock-fájl a `/tmp` helyett az állapot-könyvtárban van (a systemd `PrivateTmp`-je miatt).
+
 ## Telegram: `/set` és `/unset` — papír-beállítások a telefonról
 
 - `/set` listázza, `/set KULCS=ÉRTÉK` beírja vagy cseréli, `/unset KULCS` törli a beállítást a `config/live.env`-ben. Érvényes a `/restart_sniper` vagy `/restart_carry` után.

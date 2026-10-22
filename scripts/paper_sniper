@@ -19,7 +19,9 @@ STRATEGIAK
     S13_amm         graduacio UTANI belepes (kesesfuggetlen, ingyenes): a PumpPortal graduacios
                     esemenye utan S13_DELAY_MIN perccel a DexScreener-adatok alapjan (likviditas,
                     5 perces forgalom, vevok/eladok, arvaltozas) a PumpSwap aron, AMM-dijjal es a
-                    pool meretebol szamolt csuszassal; kiszallas a csucstol -50%-nal, max 24 ora
+                    pool meretebol szamolt csuszassal; kiszallas a csucstol -50%-nal, max 24 ora.
+                    A 2026-10-22 elotti S13 sorok (es a graduacio utan zart S14 '+amm' sorok) 0.30%-os
+                    AMM-dijjal szamoltak: OPTIMISTAK, iranyonkent kb. 0.9 szazalekponttal
   Lezarva (kudarc, a kodbol kivezetve): S6_okos / S6_okos2 (sajat PnL szerint okos tarcak kovetese,
   -20% / -25%, n=196 / 77), S12_futtat (gorbe >= 50%-nal belepes, graduacio utan dump: -55%, n=10).
 
@@ -31,7 +33,8 @@ TOKEN-NAPLO (nyero tokenek keresese)
   tokennel a vegso ar a PumpSwap-ar 15 perccel a graduacio utan (DexScreener), igy a graduacio utani
   zuhanas is benne van (enelkul a gorbe utolso ara optimista volna).
   'tokens' parancs: mely jelek mellett gyakori a nyero (>= 3x vagy graduacio) — az adat elso 70%-an
-  keresve, a hatralevo 30%-on ellenorizve.
+  keresve, a hatralevo 30%-on ellenorizve. Az S14-jel kimenetele a 60 mp-es pillanatkep aratol is
+  (a belepes a keses miatt kb. ott tortenik).
 
     S14_volumen     a token-naplo elso, ellenorzott jele: 30 mp-nel (lancon merve) >= S14_MIN_BUY_SOL (25) SOL
                     vasarlas. Ket kiszallas parositva: alap = csucstol -50%, max 24 ora, graduacio utan is;
@@ -57,8 +60,11 @@ TARCA-ADATBAZIS
 
 ELSZAMOLAS
   A papir-vetel nincs a valodi gorbeben, ezert eladaskor a sajat (dij utani) SOL-unkat is a
-  gorbe tartalekahoz szamoljuk. Graduacio utan (S12) az ar a DexScreener SOL-arfolyama, a dij
-  PAPER_SNIPER_AMM_FEE_BPS.
+  gorbe tartalekahoz szamoljuk. Graduacio utan (S13, es a graduacio utan is
+  tartott S14) az ar a DexScreener SOL-arfolyama, a dij PAPER_SNIPER_AMM_FEE_BPS (a PumpSwap friss graduált
+  savja kb. 1.2% / irany).
+  Itelet (POZITIV / NEGATIV statisztikailag): legalabb VERDICT_MIN_N (50) pozicio, es a 95%-os hibahatar
+  nem metszi a 0-t (docs/KISERLETEK.md, sniper-kartya).
 
 PARANCSOK (a repo gyokereben, a venv pythonjaval):
     .venv/bin/python scripts/paper_sniper run       # figyeles + szimulacio (systemd alatt)
@@ -71,12 +77,13 @@ PARANCSOK (a repo gyokereben, a venv pythonjaval):
     .venv/bin/python scripts/paper_sniper status    # mi fut most, nyitott poziciok
     .venv/bin/python scripts/paper_sniper reset     # szimulalt eredmenyek archivalasa (az adatbazis marad)
 
-KONFIG (.env, mind opcionalis):
+KONFIG (mind opcionalis): izolalt telepitesben (deploy/install_paper_sniper.sh) CSAK a
+/etc/paper-sniper/paper_sniper.env; kulonben config/live.env + .env (a .env az erosebb).
     SOLANA_RPC_URL=https://api.mainnet-beta.solana.com   # Helius-kulcsos URL ajanlott
     SOLANA_WS_URL=                  # ures = a SOLANA_RPC_URL https->wss valtozata (a kereskedes-esemenyekhez)
     PAPER_SNIPER_SIZE_SOL=0.1       # szimulalt tetel / vetel
     PAPER_SNIPER_FEE_BPS=125        # pump.fun gorbe-dij / irany (2026: 0.95% protokoll + 0.30% keszito)
-    PAPER_SNIPER_AMM_FEE_BPS=30     # graduacio utani (PumpSwap) dij / irany
+    PAPER_SNIPER_AMM_FEE_BPS=120    # graduacio utani (PumpSwap) dij / irany: a friss graduált tokenek savja ~1.2%
     PAPER_SNIPER_PRIO_SOL=0.001     # prioritasi / Jito dij tranzakcionkent
     PAPER_SNIPER_TP_X=2.0 / SL_X=0.5 / MAX_HOLD_MIN=30   # az alap kiszallas
     PAPER_SNIPER_MAX_OPEN=120       # strategiankent egyszerre nyitott poziciok
@@ -92,9 +99,15 @@ KONFIG (.env, mind opcionalis):
     PAPER_SNIPER_S13_MIN_LIQ_USD=8000 / S13_MIN_VOL5_USD=3000 / S13_BUY_RATIO=1.2   # S13 belepesi feltetelek
     PAPER_SNIPER_CLUSTER_MIN=3      # visszatero csoport: ennyi kozos korai token
     PAPER_SNIPER_WALLET_LOG=1 / WALLET_LOG_MB=300   # viselkedesnaplo
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # inditasi uzenet; a jelentest a telegram_control_bot.py kuldi
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # inditasi uzenet (izolalt modban nincs); a jelentest a telegram_control_bot.py kuldi
 
-LEALLITAS: systemctl stop hyperliquid-paper-sniper   vagy   touch state/STOP_SNIPER
+IZOLALT FUTTATAS (deploy/install_paper_sniper.sh, deploy/systemd/hyperliquid-paper-sniper.service):
+  kulon felhasznalo (paper-sniper), allapot a /var/lib/paper-sniper-ben, konfig a /etc/paper-sniper/paper_sniper.env-ben.
+  A szolgaltatas a repobol csak a scripts/ es a .venv/ konyvtarat latja: a .env, a .env.bak* es a
+  config/live.env (privat kulcs, Telegram-token) szamara nem letezik. Ha a /etc/paper-sniper/paper_sniper.env
+  letezik, a riport-parancsok (root-kent is) ugyanezt a konfigot es allapotot hasznaljak.
+
+LEALLITAS: systemctl stop hyperliquid-paper-sniper   vagy   touch <allapot-konyvtar>/STOP_SNIPER
 """
 import argparse, asyncio, base64, csv, fcntl, json, math, os, random, re, signal, struct, sys, time, unicodedata
 import urllib.error, urllib.parse, urllib.request
@@ -106,7 +119,10 @@ except ImportError:
     load_dotenv = None
 
 ROOT = Path(__file__).resolve().parent.parent
-STATE_DIR = ROOT / "state"
+ISO_ENV = Path("/etc/paper-sniper/paper_sniper.env")         # izolalt telepites: a sniper sajat konfigja ...
+ISO_STATE = Path("/var/lib/paper-sniper")                    # ... es allapot-konyvtara (kulon felhasznalo)
+ISOLATED = os.path.isfile(ISO_ENV)                           # isfile: jogosultsag nelkul sem dob hibat
+STATE_DIR = ISO_STATE if ISOLATED else ROOT / "state"
 STATE_FILE = STATE_DIR / "paper_sniper_state.json"
 DB_FILE = STATE_DIR / "paper_sniper_db.json"
 TRADES_FILE = STATE_DIR / "paper_sniper_trades.csv"
@@ -122,7 +138,7 @@ WALLET_LOG = STATE_DIR / "paper_sniper_wallet_trades.csv"   # tarca-pozicio vise
 WALLET_FIELDS = ["ts", "mint", "wallet", "prior_n", "prior_smart", "minta", "entry_age_s", "entry_rsol", "sol_in", "sol_out",
                  "rem_val", "pnl", "ret_pct", "hold_s", "sold_frac", "n_buys", "n_sells", "tok_buyers", "tok_early_pct"]
 STOP_FILE = STATE_DIR / "STOP_SNIPER"
-LOCK_FILE = Path("/tmp/paper_sniper.lock")
+LOCK_FILE = STATE_DIR / "paper_sniper.lock"                  # nem /tmp: a systemd PrivateTmp-je kulon /tmp-t ad
 
 PUMP = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 GRAD_SOL = 85.0                        # ennyi valodi SOL-nal graduall a gorbe
@@ -138,6 +154,7 @@ STRAT_DESC = {
     "S14_volumen": "30 mp-nel >= 25 SOL vasarlas (a token-naplo jele); alap: csucstol -50% / gyors: -30%, 30 perc",
 }
 TOTAL_SUPPLY = 1e9                     # pump.fun tokenek teljes kinalata
+VERDICT_MIN_N = 50                     # itelet (POZITIV / NEGATIV) legalabb ennyi pozicion (docs/KISERLETEK.md, sniper-kartya)
 EARLY_SEC = 2.0                        # ennyi mp-en beluli vetel "korai" (bundle / gyors sniper)
 CLUSTER_SEC = 3.0                      # a klaszter-elemzes elso probalkozasa (mp a create utan)
 EARLY_SLOTS = 7                        # "korai" vetel: legfeljebb ennyi slot (~0.4 mp) a letrehozas utan — lancon mert,
@@ -175,9 +192,14 @@ def strat_order(k):
 
 # ---------------------------------------------------------------- segedek
 def load_env():
-    if load_dotenv:
-        load_dotenv(ROOT / "config" / "live.env", override=False)
-        load_dotenv(ROOT / ".env", override=True)
+    """izolalt modban CSAK a sajat konfig: a repo .env / config/live.env fajljai kulcsokat tartalmaznak"""
+    if not load_dotenv:
+        return
+    if ISOLATED:
+        load_dotenv(ISO_ENV, override=True)
+        return
+    load_dotenv(ROOT / "config" / "live.env", override=False)
+    load_dotenv(ROOT / ".env", override=True)
 
 
 def cfg(key, default, cast=float):
@@ -404,7 +426,7 @@ class Sniper:
         self.max_open = cfg("PAPER_SNIPER_MAX_OPEN", 120, int)
         self.exits = {k: dict(v) for k, v in EXITS.items()}
         self.exits["alap"] = {"tp": self.tp, "sl": self.sl, "max": self.max_hold / 60}
-        self.amm_fee = cfg("PAPER_SNIPER_AMM_FEE_BPS", 30.0) / 1e4
+        self.amm_fee = cfg("PAPER_SNIPER_AMM_FEE_BPS", 120.0) / 1e4   # PumpSwap, friss graduált sav (~1.2% / irany)
         self.dex_px = {}                                     # mint -> (SOL-ar graduacio utan, ido, pool SOL-tartalek)
         self.amm_due = {}                                    # S13: mint -> ertekeles ideje (graduacio + DELAY)
         self.postgrad_due = {}                               # token-naplo: mint -> [a PumpSwap-ar lekeresenek ideje, probalkozas]
@@ -1026,7 +1048,7 @@ class Sniper:
             if done and (c["vsol"] <= 0 or c["vtok"] <= 0):
                 c = dict(p["last"], done=True)       # graduacio utan a gorbe kiurul: az utolso ismert allapot
             if done and p["strat"] in HOLD_GRAD and not p.get("amm"):
-                p["amm"], p["grad_t"] = True, now     # S12: graduacio utan is tartjuk, az AMM-en
+                p["amm"], p["grad_t"] = True, now     # S14: graduacio utan is tartjuk, az AMM-en
             own = p.get("net_lam", self.size * 1e9 * (1 - self.fee))   # regi allapotfajlban meg nincs
             dex = self.dex_px.get(p["mint"]) if p.get("amm") else None
             if p.get("amm"):
@@ -1276,6 +1298,9 @@ class Sniper:
                 if ev:
                     st["events"] = st.get("events", 0) + 1
                     ev["slot"] = slot if isinstance(slot, int) else None
+                    if time.time() - (st.get("sample") or {}).get("t", 0) > 3600:   # orankent egy valodi minta (diag, tesztek)
+                        st["sample"] = {"t": round(time.time()), "slot": ev["slot"], "sig": str(v.get("signature") or "")[:100],
+                                        "line": ln[:1500]}
                     lag = time.time() - ev["ts"]
                     if 0 <= lag < 600:                 # RPC keses: a blokk ideje -> nalunk (mozgo atlag)
                         st["lag"] = round(lag if "lag" not in st else 0.99 * st["lag"] + 0.01 * lag, 2)
@@ -1323,6 +1348,10 @@ class Sniper:
     async def main(self):
         log(f"Paper sniper indul. Strategiak: {', '.join(self.strats)}. Tetel {self.size} SOL, dij {self.fee*100:.2f}%/irany, prio {self.prio} SOL/tx, "
             f"TP {self.tp}x, SL {self.sl}x, max {self.max_hold/60:.0f} perc, AMM-dij {self.amm_fee*100:.2f}%. RPC: {urllib.parse.urlsplit(self.rpc.url).netloc}")
+        if ISOLATED:
+            seen = [f.name for f in (ROOT / ".env", ROOT / "config" / "live.env") if os.access(f, os.R_OK)]
+            log(f"Izolalt mod: konfig {ISO_ENV}, allapot {STATE_DIR}; a repo kulcsfajljai: "
+                + ("OLVASHATOK (" + ", ".join(seen) + ") — ellenorizd a systemd unitot!" if seen else "nem olvashatok (rendben)"))
         telegram("Paper sniper indul (valodi penz nelkul)")
         self.t_start = time.time()
         loop = asyncio.get_running_loop()
@@ -1393,7 +1422,7 @@ def exit_compare(rows, compact=False):
         md = sum(d) / n
         sd = math.sqrt(sum((x - md) ** 2 for x in d) / (n - 1)) if n > 1 else 0.0
         ci = 1.96 * sd / math.sqrt(n) if n > 1 else float("nan")
-        verdict = "JOBB" if n >= 30 and md - ci > 0 else ("ROSSZABB" if n >= 30 and md + ci < 0 else "?")
+        verdict = "JOBB" if n >= VERDICT_MIN_N and md - ci > 0 else ("ROSSZABB" if n >= VERDICT_MIN_N and md + ci < 0 else "?")
         mv, ma = sum(v for _, v, _ in pairs) / n, sum(a for a, _, _ in pairs) / n
         cis = "" if math.isnan(ci) else f" ±{ci:.1f}"
         if compact:
@@ -1409,7 +1438,7 @@ def exit_compare(rows, compact=False):
             lines.append(f"    {b:11s} " + " | ".join(f"{ex} {sum(x) / len(x):+.1f} (n={len(x)})"
                                                       for ex, x in sorted(per_strat[b].items(), key=lambda kv: strat_order("x~" + kv[0]))))
     if len(lines) > 1:
-        lines.append("  (a kulonbseg statisztikailag eldontott, ha n >= 30 es a hibahatar nem metszi a 0-t)")
+        lines.append(f"  (a kulonbseg statisztikailag eldontott, ha n >= {VERDICT_MIN_N} es a hibahatar nem metszi a 0-t)")
     return lines if len(lines) > 1 else []
 
 
@@ -1444,7 +1473,8 @@ def report_text(short=False):
         for r in xs:
             reasons[r["reason"]] = reasons.get(r["reason"], 0) + 1
         lat = sorted(float(r["latency_s"]) for r in xs)[n // 2]
-        verdict = "POZITIV (statisztikailag)" if n >= 30 and mean - ci > 0 else ("NEGATIV (statisztikailag)" if n >= 30 and mean + ci < 0 else "meg nem eldontheto")
+        verdict = ("POZITIV (statisztikailag)" if n >= VERDICT_MIN_N and mean - ci > 0 else
+                   ("NEGATIV (statisztikailag)" if n >= VERDICT_MIN_N and mean + ci < 0 else "meg nem eldontheto"))
         if short:
             lines.append(f"{s}: n={n}, PnL {sum(pnl):+.3f} SOL, atlag {mean:+.1f}% ±{ci:.1f}, graduált {grad} -> {verdict}")
             continue
@@ -1473,8 +1503,8 @@ def report_text(short=False):
         lines += cmp_
     if not short:
         lines.append("")
-        lines.append("Olvasat: legalabb 100 pozicio kell strategiankent (S12-nel tobb, nagy a szoras). Csak az szamit, ami a")
-        lines.append("hibahatarral egyutt is pozitiv; utana egy friss idoszakon is igazolni kell (docs/KISERLETEK.md).")
+        lines.append(f"Olvasat: itelet legalabb {VERDICT_MIN_N} pozicion strategiankent (docs/KISERLETEK.md, sniper-kartya). Csak az")
+        lines.append("szamit, ami a hibahatarral egyutt is pozitiv; utana egy friss idoszakon is igazolni kell.")
     return "\n".join(lines)
 
 
@@ -1485,7 +1515,7 @@ def strat_stats(xs):
     mean = sum(ret) / n
     sd = math.sqrt(sum((x - mean) ** 2 for x in ret) / (n - 1)) if n > 1 else 0.0
     ci = 1.96 * sd / math.sqrt(n) if n > 1 else float("nan")
-    verdict = "+" if n >= 30 and mean - ci > 0 else ("-" if n >= 30 and mean + ci < 0 else "?")
+    verdict = "+" if n >= VERDICT_MIN_N and mean - ci > 0 else ("-" if n >= VERDICT_MIN_N and mean + ci < 0 else "?")
     return {"n": n, "pnl": sum(pnl), "mean": mean, "ci": ci, "win": sum(1 for p in pnl if p > 0) / n * 100,
             "verdict": verdict, "median": pct(ret, .5)}
 
@@ -1557,7 +1587,7 @@ def telegram_report(hours=2.0):
                        + (f"  [{ws['n']} / {ws['mean']:+.1f}%]" if ws else "  [-]"))
         tot = strat_stats(rows)
         out.append(f"Ossz: {tot['n']} poz., PnL {tot['pnl']:+.3f} SOL ({tot['mean']:+.1f}%/poz.)")
-        pos_ = [k for k in by if len(by[k]) >= 30 and strat_stats(by[k])["verdict"] == "+"]
+        pos_ = [k for k in by if strat_stats(by[k])["verdict"] == "+"]
         if pos_:
             out.append("Statisztikailag pozitiv: " + ", ".join(pos_) + " -> friss idoszakon is igazolni kell")
 
@@ -1692,7 +1722,7 @@ def tokens_report(h="30"):
     train, test = rows[:cut], rows[cut:]
     rate = lambda xs: sum(r["win"] for r in xs) / len(xs) * 100 if xs else float("nan")
     fin = lambda xs: sum(min(r["final_mult"], 10.0) for r in xs) / len(xs) if xs else float("nan")
-    # kiveheto kozelites: csucstol -50%-os kiszallas (S12/S14 alap) — a vegso ar, ha nem esett a csucs felere, kulonben a csucs fele;
+    # kiveheto kozelites: csucstol -50%-os kiszallas (S13/S14 alap) — a vegso ar, ha nem esett a csucs felere, kulonben a csucs fele;
     # a belepes es kiszallas koltsege kb. 5% (0.95x). 1.0 felett nyereseges lenne.
     def trail50(r):
         peak = max(1.0, r["max_mult"])                 # a csucs legalabb a belepesi ar
@@ -1735,10 +1765,36 @@ def tokens_report(h="30"):
     for r_tr, title, lab, tr, te in cands[:3]:
         out.append(f"  {title} {lab}: tanito {r_tr:.1f}% (n={len(tr)}) -> ellenorzo {rate(te) if te else float('nan'):.1f}% (n={len(te)}),"
                    f" vegso {fin(te):.2f}x, kiveheto {cap(te):.2f}x")
+    if h == "30":
+        out += [""] + s14_outcome(train, test, rate, fin, cap)
     out.append("Olvasat: csak az a jel szamit, amelyik az ellenorzo reszen is jobb az alapvonalnal. A belepes koltsege")
     out.append("kb. 5%: a 'kiveheto' oszlopnak 1.0 felett kell lennie, hogy a csucstol -50%-os kiszallas nyerjen. A graduacio a")
     out.append("nyero-definicioban a bundle-os pump-and-dumpot is nyerokent szamolja — ezert a kiveheto a fontosabb.")
     return "\n".join(out)
+
+
+def s14_outcome(train, test, rate, fin, cap):
+    """az S14-jel (30 mp-nel >= S14_MIN_BUY_SOL vasarlas) kimenetele a 30 ES a 60 mp-es pillanatkep aratol:
+    a jel 30 mp-nel jon, de a belepes az RPC-keses miatt kb. 60 mp-nel tortenik. A 30-as es 60-as sorok mint
+    szerint parositva, a tanito / ellenorzo felosztas a 30-as sorok szerint."""
+    thr = cfg("PAPER_SNIPER_S14_MIN_BUY_SOL", 25.0)
+    by60 = {r["mint"]: r for r in load_token_log("60")}
+    out = [f"S14-JEL (30 mp-nel >= {thr:g} SOL vasarlas): a belepes a keses miatt kb. 60 mp-nel van, ezert a kimenetel a 60 mp-es"
+           " pillanatkep aratol is (ugyanazok a tokenek). oszlopok: n / nyero% (nyerok) | vegso | kiveheto"]
+    for part, rows in (("tanito", train), ("ellenorzo", test)):
+        sig = [r for r in rows if r["buy_sol"] >= thr]
+        pair = [(r, by60[r["mint"]]) for r in sig if r["mint"] in by60]
+        if not pair:
+            out.append(f"  {part:9s}: nincs jel ({len(sig)} token, 60 mp-es sorral {len(pair)})")
+            continue
+        r30, r60 = [a for a, _ in pair], [b for _, b in pair]
+        base60 = [by60[r["mint"]] for r in rows if r["mint"] in by60]
+        for lab, xs in (("30 mp-es ar", r30), ("60 mp-es ar", r60)):
+            out.append(f"  {part:9s} {lab}: {len(xs):4d} / {rate(xs):5.1f}% ({sum(r['win'] for r in xs):2d}) | {fin(xs):4.2f} | {cap(xs):4.2f}")
+        out.append(f"  {part:9s} alapvonal (minden token, 60 mp-es ar): {rate(base60):.1f}% (n={len(base60)})"
+                   + (f"; 60 mp-ig elhalt (nincs ujabb kereskedes): {sum(int(r['died']) for r in r60)}" if r60 else ""))
+    out.append("  A 60 mp-es sor a valosaghoz kozelebbi: ha a kiveheto ott 1.0 alatt van, a jel a mi kesesunkkel nem fizet.")
+    return out
 
 
 def copy_stats(r, n_min):
@@ -1903,12 +1959,14 @@ def diag():
           + (f" ({(time.time() - saved) / 60:.0f} perce)" if saved else ""))
     seen, mig = s.get("seen", 0), s.get("migrations", 0)
     print(f"latott token: {seen}   graduacio: {mig} ({mig / seen * 100 if seen else 0:.2f}%)")
+    print(f"futas: {'izolalt (konfig ' + str(ISO_ENV) + ')' if ISOLATED else 'a repobol (config/live.env + .env)'}, allapot: {STATE_DIR}")
     rpc = s.get("rpc") or {}
     if rpc:
         print(f"RPC (a mostani futas ota): {rpc.get('calls', 0)} hivas, {rpc.get('errors', 0)} hiba"
               f" ({rpc.get('errors', 0) / max(1, rpc.get('calls', 0)) * 100:.1f}%)")
     print(f"beallitas: tetel {cfg('PAPER_SNIPER_SIZE_SOL', 0.1)} SOL, dij {fee*100:.2f}%/irany, prio {prio} SOL/tx,"
-          f" TP {cfg('PAPER_SNIPER_TP_X', 2.0)}x, SL {cfg('PAPER_SNIPER_SL_X', 0.5)}x, max {cfg('PAPER_SNIPER_MAX_HOLD_MIN', 30.0):.0f} perc")
+          f" TP {cfg('PAPER_SNIPER_TP_X', 2.0)}x, SL {cfg('PAPER_SNIPER_SL_X', 0.5)}x, max {cfg('PAPER_SNIPER_MAX_HOLD_MIN', 30.0):.0f} perc,"
+          f" AMM-dij {cfg('PAPER_SNIPER_AMM_FEE_BPS', 120.0) / 100:.2f}%/irany")
     size = cfg("PAPER_SNIPER_SIZE_SOL", 0.1)
     flat = recompute_value({"cost_sol": size + prio, "entry_vsol": V0_SOL, "exit_vsol": V0_SOL, "graduated": "1"}, fee, prio)
     if flat is not None:
@@ -1930,7 +1988,7 @@ def diag():
     if ml and time.time() - ml > 120:
         print("  FIGYELEM: a karbantarto ciklus nem fut (a token- es tarca-naplo nem no)")
 
-    print("\n== Tarca-kovetes (S6/S8/S10)")
+    print("\n== Tarca-kovetes (S8/S10)")
     wst = s.get("wallets") or {}
     print(f"kereskedes-uzenet: {s.get('trade_msgs', 0)}  hibas: {s.get('trade_bad', 0)}  elszamolt tarca-pozicio: {s.get('wallet_closes', 0)}"
           f"  kovetett token most: {wst.get('tracked', '-')}")
@@ -1944,6 +2002,10 @@ def diag():
           + (f", utolso hiba: {rw['last_error']}" if rw.get("last_error") else ""))
     if not rw.get("events"):
         print("  FIGYELEM: nem jon TradeEvent a Solana RPC-rol (SOLANA_WS_URL / a nyilvanos RPC korlatozhat — Helius-kulcs ajanlott)")
+    smp = rw.get("sample") or {}
+    if smp.get("line"):
+        print(f"minta TradeEvent (a tesztekhez; {time.strftime('%m-%d %H:%M', time.localtime(smp.get('t', 0)))},"
+              f" slot {smp.get('slot')}, tx {smp.get('sig') or '-'}):\n  {smp['line']}")
     wt = s.get("ws_types") or {}
     if wt:
         print("WebSocket-uzenetek tipus szerint: " + ", ".join(f"{k} {v}" for k, v in sorted(wt.items(), key=lambda kv: -kv[1])))
@@ -2034,9 +2096,10 @@ def main():
     if a.cmd == "status":
         status()
         return
-    lock = LOCK_FILE.open("w")
+    STATE_DIR.mkdir(exist_ok=True)
+    lock = os.open(LOCK_FILE, os.O_RDONLY | os.O_CREAT, 0o644)   # csak olvasva: a root (reset) es a szolgaltatas is nyithatja
     try:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         sys.exit("HIBA: mar fut egy paper sniper peldany (a 'report' es 'status' ettol meg hasznalhato)")
     if a.cmd == "reset":
@@ -2046,7 +2109,7 @@ def main():
         log("Szimulalt eredmenyek archivalva (.bak), a dev-adatbazis megmaradt.")
         return
     if STOP_FILE.exists():
-        sys.exit("HIBA: state/STOP_SNIPER letezik — torold, ha indulhat:  rm state/STOP_SNIPER")
+        sys.exit(f"HIBA: {STOP_FILE} letezik — torold, ha indulhat:  rm {STOP_FILE}")
     asyncio.run(Sniper().main())
 
 
