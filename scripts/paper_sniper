@@ -742,44 +742,50 @@ class Sniper:
             if not force and now - T["t"] < self.trade_window:
                 continue
             del self.tracked[mint]
-            self.unsub_q.append(mint)
-            px = T["px"]
-            self.log_token(T, now)
-            early_pct = round(T["early_tok"] / TOTAL_SUPPLY * 100, 2)
-            for w, rec in T["tr"].items():
-                si, so, tk, t0 = rec[:4]
-                if w == T["dev"] or self.is_early(T, t0, rec[10] if len(rec) > 10 else None) or si < 0.02:
-                    continue                          # dev, korai (nem kovetheto) vagy por-meretu
-                rem = tk * px * (1 - self.fee) if px else 0.0
-                pnl = so + rem - si
-                prior = self.wallets.get(w)
-                if self.wallet_log_on and len(rec) >= 9:
-                    minta = random.random() < 0.05
-                    if minta or (prior and prior[0] >= 2):
-                        e_rsol, t_sell, nb, ns, mx = rec[4:9]
-                        self.wallet_rows.append([round(now), mint, w, prior[0] if prior else 0, int(self.is_smart(w)), int(minta),
-                                                 round(t0 - T["t"], 1), round(e_rsol, 2), round(si, 4), round(so, 4), round(rem, 4),
-                                                 round(pnl, 4), round(pnl / si * 100, 1), round((t_sell or now) - t0) if t_sell else -1,
-                                                 round(1 - tk / mx, 3) if mx > 0 else 0.0, nb, ns, len(T["buyers"]), early_pct])
-                r = self.wallets.setdefault(w, [0, 0, 0.0, now])
-                while len(r) < 8:
-                    r.append(0)                       # koveto: poziciok, nyero, hozam-osszeg, negyzetosszeg
-                entry = self.px_at(T, t0 + self.copy_lat)
-                if entry:
-                    t_sell = rec[9] if len(rec) >= 10 else 0.0
-                    ex = (self.px_at(T, t_sell + self.copy_lat) if t_sell else None) or T["px"]
-                    cr = (ex / entry) * (1 - self.fee) ** 2 - 1 - 2 * self.prio / self.size
-                    cr = max(-1.0, min(5.0, cr))
-                    r[4] += 1
-                    r[5] += int(cr > 0)
-                    r[6] = round(r[6] + cr, 5)
-                    r[7] = round(r[7] + cr * cr, 5)
-                r[0] += 1
-                r[1] += int(pnl > 0)
-                r[2] = round(r[2] + pnl, 4)
-                r[3] = round(now)
-                self.stats["wallet_closes"] += 1
+            try:
+                self.finalize_token(mint, T, now)
+            except Exception as e:
+                self.note_error("elszamolas", e)       # csak ez az egy token marad ki
         self.flush_wallet_log()
+
+    def finalize_token(self, mint, T, now):
+        """egy lejart token elszamolasa: token-naplo sor, tarca-pozicio naplo, tarca-adatbazis"""
+        px = T["px"]
+        self.log_token(T, now)
+        early_pct = round(T["early_tok"] / TOTAL_SUPPLY * 100, 2)
+        for w, rec in T["tr"].items():
+            si, so, tk, t0 = rec[:4]
+            if w == T["dev"] or self.is_early(T, t0, rec[10] if len(rec) > 10 else None) or si < 0.02:
+                continue                          # dev, korai (nem kovetheto) vagy por-meretu
+            rem = tk * px * (1 - self.fee) if px else 0.0
+            pnl = so + rem - si
+            prior = self.wallets.get(w)
+            if self.wallet_log_on and len(rec) >= 9:
+                minta = random.random() < 0.05
+                if minta or (prior and prior[0] >= 2):
+                    e_rsol, t_sell, nb, ns, mx = rec[4:9]
+                    self.wallet_rows.append([round(now), mint, w, prior[0] if prior else 0, int(self.is_smart(w)), int(minta),
+                                             round(t0 - T["t"], 1), round(e_rsol, 2), round(si, 4), round(so, 4), round(rem, 4),
+                                             round(pnl, 4), round(pnl / si * 100, 1), round((t_sell or now) - t0) if t_sell else -1,
+                                             round(1 - tk / mx, 3) if mx > 0 else 0.0, nb, ns, len(T["buyers"]), early_pct])
+            r = self.wallets.setdefault(w, [0, 0, 0.0, now])
+            while len(r) < 8:
+                r.append(0)                       # koveto: poziciok, nyero, hozam-osszeg, negyzetosszeg
+            entry = self.px_at(T, t0 + self.copy_lat)
+            if entry:
+                t_sell = rec[9] if len(rec) >= 10 else 0.0
+                ex = (self.px_at(T, t_sell + self.copy_lat) if t_sell else None) or T["px"]
+                cr = (ex / entry) * (1 - self.fee) ** 2 - 1 - 2 * self.prio / self.size
+                cr = max(-1.0, min(5.0, cr))
+                r[4] += 1
+                r[5] += int(cr > 0)
+                r[6] = round(r[6] + cr, 5)
+                r[7] = round(r[7] + cr * cr, 5)
+            r[0] += 1
+            r[1] += int(pnl > 0)
+            r[2] = round(r[2] + pnl, 4)
+            r[3] = round(now)
+            self.stats["wallet_closes"] += 1
 
     def log_token(self, T, now):
         """token-pillanatkepek + kimenetel a kovetesi ablak vegen (ha egy horizontot nem ert el: 'died')"""
@@ -793,6 +799,7 @@ class Sniper:
             mx = (T["pmax"].get(k, px0) / px0) if px0 else 0.0
             fin = ((T["px"] or 0.0) / px0) if px0 else 0.0
             rows.append([round(now), T["mint"], k, int(died)] + [f[x] for x in TOKEN_FEATS] + [px0, round(mx, 4), round(fin, 4)])
+        self.stats["token_rows"] = self.stats.get("token_rows", 0) + 1
         try:
             new = not TOKEN_LOG.exists()
             with TOKEN_LOG.open("a", newline="") as fh:
@@ -1137,14 +1144,10 @@ class Sniper:
                 for s in subs:
                     await ws.send(s)
                 log("PumpPortal: kapcsolodva")
-                sender = asyncio.create_task(self.sub_sender(ws.send))
-                try:
-                    async for raw in ws:
-                        self.handle(raw)
-                        if self.stop:
-                            break
-                finally:
-                    sender.cancel()
+                async for raw in ws:
+                    self.handle(raw)
+                    if self.stop:
+                        break
             return
         try:
             import aiohttp
@@ -1155,29 +1158,38 @@ class Sniper:
                 for x in subs:
                     await ws.send_str(x)
                 log("PumpPortal: kapcsolodva (aiohttp)")
-                sender = asyncio.create_task(self.sub_sender(ws.send_str))
-                try:
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            self.handle(msg.data)
-                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                            break
-                        if self.stop:
-                            break
-                finally:
-                    sender.cancel()
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        self.handle(msg.data)
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+                    if self.stop:
+                        break
 
-    async def sub_sender(self, send):
-        """masodpercenkent: a lejart kovetesi ablakok elszamolasa. (A PumpPortal subscribeTokenTrade
-        fizetos API-kulcsot ker, ezert a kereskedeseket a Solana RPC-rol olvassuk: rpc_ws_loop.)"""
+    async def maintenance_loop(self):
+        """masodpercenkent: a lejart kovetesi ablakok elszamolasa (token- es tarca-naplo) es a puffer takaritasa.
+        Sajat feladat, fuggetlen a PumpPortal-kapcsolattol; egy hiba nem allitja le (eddig csendben leallhatott)."""
         while not self.stop:
             await asyncio.sleep(1)
-            if self.trades_on:
-                self.finalize_tracked()
-            self.sub_q, self.unsub_q = [], []
-            cut = time.time() - 30
-            for k in [k for k, v in self.pending.items() if v[0][0] < cut]:
-                del self.pending[k]                   # 30 mp utan sem jott create: regi vagy nem kovetett token
+            try:
+                if self.trades_on:
+                    self.finalize_tracked()
+                self.sub_q, self.unsub_q = [], []
+                cut = time.time() - 30
+                for k in [k for k, v in self.pending.items() if v[0][0] < cut]:
+                    del self.pending[k]               # 30 mp utan sem jott create: regi vagy nem kovetett token
+                self.stats["maint_last"] = round(time.time())
+            except Exception as e:
+                self.note_error("karbantartas", e)
+
+    def note_error(self, where, e):
+        """hibak szamlalasa es naplozasa (az elso 5, utana 100-ankent), hogy ne nemuljon el semmi"""
+        import traceback
+        err = self.stats.setdefault("errors", {})
+        err[where] = err.get(where, 0) + 1
+        self.stats["last_exc"] = redact(f"{where}: {type(e).__name__}: {str(e)[:150]}")
+        if err[where] <= 5 or err[where] % 100 == 0:
+            log(f"HIBA ({where}, {err[where]}.): {self.stats['last_exc']}\n" + redact(traceback.format_exc(limit=4)))
 
     # ---- kereskedesek a Solana RPC-rol (logsSubscribe a pump.fun programra)
     async def rpc_ws_loop(self):
@@ -1245,7 +1257,10 @@ class Sniper:
                         st["lag"] = round(lag if "lag" not in st else 0.99 * st["lag"] + 0.01 * lag, 2)
                     mint = ev["mint"]
                     if mint in self.tracked or ev["traderPublicKey"] in self.led_wallets:
-                        self.on_trade(ev)
+                        try:
+                            self.on_trade(ev)
+                        except Exception as e:
+                            self.note_error("kereskedes", e)
                     elif mint not in self.tokens and mint not in self.mint_dev:
                         buf = self.pending.setdefault(mint, [])   # meg nem lattuk a create-et: puffer
                         if len(buf) < 50:
@@ -1293,7 +1308,7 @@ class Sniper:
             except NotImplementedError:
                 pass
         tasks = [asyncio.create_task(self.ws_loop()), asyncio.create_task(self.poll_loop()), asyncio.create_task(self.periodic()),
-                 asyncio.create_task(self.rpc_ws_loop())]
+                 asyncio.create_task(self.rpc_ws_loop()), asyncio.create_task(self.maintenance_loop())]
         try:
             while not self.stop:
                 await asyncio.sleep(1)
@@ -1857,6 +1872,13 @@ def diag():
     s13 = s.get("s13_skip") or {}
     if s13:
         print("  S13 kihagyva: " + ", ".join(f"{k} {v}" for k, v in sorted(s13.items(), key=lambda kv: -kv[1])))
+
+    ml = s.get("maint_last")
+    print(f"\n== Elszamolas: token-naplo sor {s.get('token_rows', 0)}, utolso karbantartas"
+          f" {f'{(time.time() - ml):.0f} mp-e' if ml else '-'}, hibak: {s.get('errors') or '-'}"
+          + (f"\n  utolso hiba: {s['last_exc']}" if s.get("last_exc") else ""))
+    if ml and time.time() - ml > 120:
+        print("  FIGYELEM: a karbantarto ciklus nem fut (a token- es tarca-naplo nem no)")
 
     print("\n== Tarca-kovetes (S6/S8/S10)")
     wst = s.get("wallets") or {}
