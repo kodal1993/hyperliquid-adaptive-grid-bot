@@ -1,5 +1,10 @@
 # Changelog
 
+## Kísérleti napló: az S13 és az S14 2026-10-22 ~10:31-től fut; második valódi TradeEvent a tesztben
+
+- `docs/KISERLETEK.md` és a docstring: az S13 és az S14 ténylegesen 2026-10-22 ~10:31-től fut (a #127 telepítése a javított stratégialistával), az eredményeik ettől számítanak. Első működési adat (12:21): S14 61 belépés, S13 4 belépés 69 értékelt graduációból, a kihagyási okokkal.
+- Második valódi TradeEvent-sor a dekóder-tesztben (slot 459983200): szabványos görbe (virtuális − valódi SOL = 30) és nem nulla díj (95 + 30 bps). Így a görbe-feltevés és a díjmező eltolása is valódi adaton van igazolva; az első valódi sor mayhem-módú volt, 0 díjjal.
+
 ## Paper sniper: S8 lezárva, tárca-elszámolás díjakkal és PumpSwap-áron, stratégia-figyelmeztetés, nyitott pozíciók stratégiánként
 
 - **S8_masol lezárva (kudarc), a kódból kivezetve:** 38 144 követő-pozíció után sincs másolható tárca (átlag −12,5%; az okos tárcák követve −2,8%). A jó tárcák előnye a sebesség. A `PAPER_SNIPER_STRATS` régi listájában maradt `S8_masol`-t a sniper figyelmen kívül hagyja. A követő-mérés (`/wallets` 4. pont) marad.

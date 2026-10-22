@@ -17,8 +17,8 @@ STRATEGIAK
                     esemenye utan S13_DELAY_MIN perccel a DexScreener-adatok alapjan (likviditas,
                     5 perces forgalom, vevok/eladok, arvaltozas) a PumpSwap aron, AMM-dijjal es a
                     pool meretebol szamolt csuszassal; kiszallas a csucstol -50%-nal, max 24 ora.
-                    Az S13 es az S14 2026-10-22 10:25-ig egyszer sem futott (a PAPER_SNIPER_STRATS kizarta oket),
-                    igy 0.30%-os AMM-dijjal szamolt soruk sincs
+                    Az S13 es az S14 tenylegesen 2026-10-22 ~10:31-tol fut (addig a PAPER_SNIPER_STRATS kizarta
+                    oket), igy 0.30%-os AMM-dijjal szamolt soruk sincs
   Lezarva (kudarc, a kodbol kivezetve): S6_okos / S6_okos2 (sajat PnL szerint okos tarcak kovetese,
   -20% / -25%, n=196 / 77), S12_futtat (gorbe >= 50%-nal belepes, graduacio utan dump: -55%, n=10),
   S8_masol (masolhato tarca kovetese: 38 144 koveto-pozicio utan sincs masolhato tarca, atlag -12.5%;
