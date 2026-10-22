@@ -1,5 +1,14 @@
 # Changelog
 
+## Paper sniper: S8 lezárva, tárca-elszámolás díjakkal és PumpSwap-áron, Telegram-darabolás sorhatáron
+
+- **S8_masol lezárva (kudarc), a kódból kivezetve:** 38 144 követő-pozíció után sincs másolható tárca (átlag −12,5%; az okos tárcák követve −2,8%). A jó tárcák előnye a sebesség. A `PAPER_SNIPER_STRATS` régi listájában maradt `S8_masol`-t a sniper figyelmen kívül hagyja. A követő-mérés (`/wallets` 4. pont) marad.
+- **Tárca-elszámolás:**
+  - a tárca saját díjai is levonódnak: a TradeEvent `fee` + `creator_fee` mezője (a pump.fun SDK szerint vételkor a görbe SOL-ján felül fizeti, eladáskor abból vonják le). Rövidebb, régi eseménynél a konfig szerinti 1,25%/irány;
+  - ha a token a követési ablakban graduál, az elszámolás megvárja a PumpSwap-árat 15 perccel a graduáció után (legfeljebb 30 percig), és a maradékot azon, AMM-díjjal értékeli, nem a görbe csúcsárán. Ugyanez a követő-hozam kiszállási áránál.
+  - A `/wallets` fejléce ezt írja le; a 2026-10-22 előtti sorok optimisták, a napló kb. fél nap alatt lecserélődik.
+- **Telegram:** a hosszú üzenetek sorhatáron darabolódnak (eddig 3800 karakterenként, így egy szám is kettétörhetett, pl. „3” + „8144”).
+
 ## Paper sniper: 50-es ítélet-küszöb, 1,2%-os AMM-díj, S14-jel 60 mp-ről, tesztek, izolált futtatás
 
 - **Ítélet:** a riport, a Telegram-jelentés és a kiszállás-összevetés legalább 50 pozíción dönt (eddig 30), a `docs/KISERLETEK.md` sniper-kártyája szerint (`VERDICT_MIN_N`).

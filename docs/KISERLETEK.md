@@ -61,16 +61,24 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
     a kódból kivezetve, ahogy az S6 is.
   - A követhető tárcák: 1 mp késéssel, a mi díjainkkal a „okos” tárcák követve −0,8%, minden tárca −7,1%,
     a 93 legalább 8 pozíciós tárca közül egyik sem másolható (2026-10-21). A tárcakövetés nem profitforrás.
-- **Fut, de késleltetett adattal pesszimista: S8_masol.** A PumpPortal kereskedés-adata
-  fizetős (0,02 SOL minimális egyenleg, 10 000 kereskedésenként 0,01 SOL; a teljes követés kb. 0,75 SOL/nap),
-  a nyilvános Solana RPC kb. 33 mp-et késik, a Helius ingyenes kerete a teljes pump.fun-forgalomra kb. 16 óra
-  alatt elfogy. A másolható tárca ritka (lásd fent), ezért kevés belépés várható.
+  - 2026-10-22: **S8_masol** (másolható tárca követése). 38 144 követő-pozíció után átlag −12,5%, nyerő 24%
+    (költségpadló −4,5%); az 569 legalább 8 pozíciós tárca közül egyik sem másolható (az alsó hibahatár sehol
+    nem pozitív). Az „okos” tárcák követve −2,8%, a többi −12,1%. A tárcák tudása valódi (a 3. pont szerint a
+    második felükben is 18,5 százalékponttal jobbak), de az előnyük a sebesség: a legjobb (BwWK17, 455 token)
+    saját maga 84%-ban nyer, követve 15%-ban, −3,4%-kal; medián 25 mp-nél vesz, 69 mp-en belül elad. A mérés
+    1 mp késéssel számolt, a valódi késésünk 14–55 mp. **Lezárva: kudarc**, a kódból kivezetve. A követő-mérés
+    (`/wallets` 4. pont) és a tárca-adatbázis marad: jelforrás az S10-nek és a token-naplónak.
+  - Ugyanekkor javítva a tárca-elszámolás két optimista torzítása: a tárca saját díjai (a TradeEvent `fee` +
+    `creator_fee` mezője) eddig kimaradtak, és az ablakban graduált tokenek maradékát a görbe utolsó, csúcs-árán
+    értékeltük. Mostantól a PumpSwap-áron 15 perccel a graduáció után. A korábbi adatbázis-rekordok és naplósorok
+    optimisták; a fenti következtetést ez nem változtatja meg, mert mindkét torzítás a tárcákat szépítette.
 - **Fut, késleltetett adattal: `S10_bennfentes`.** A klaszter-felismerés slot alapú, ezért a késés nem
   rontja el. A bennfentesek eladását viszont kb. 33 mp-cel később látjuk, így az eredmény pesszimista.
   - Első adat (2026-10-21): +34,3% ±72,4, n=6 (egy +182%-os nyerő viszi); ez még nem bizonyíték.
   - Ha legalább 50 pozíción a hibahatárral együtt is pozitív → pontos teszt valós idejű adattal: PumpPortal-kulcs,
     csak a klaszteres tokenekre szűkítve, kb. 0,15 SOL/nap.
-- **Aktív** (`PAPER_SNIPER_STRATS=S8_masol,S10_bennfentes,S13_amm,S14_volumen`):
+- **Aktív** (`PAPER_SNIPER_STRATS=S10_bennfentes,S13_amm,S14_volumen`; a régi listában maradt `S8_masol`-t a
+  sniper figyelmen kívül hagyja):
   - `S13_amm`: belépés graduáció után 5 perccel, ha a DexScreener szerint van tapadás (likviditás
     ≥ 8000 $, 5 perces forgalom ≥ 3000 $, vevők ≥ 1,2 × eladók, emelkedő ár). Késés-független és
     ingyenes: csak a PumpPortal graduációs eseménye és a DexScreener kell. Kiszállás a csúcstól −50%-nál,

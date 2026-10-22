@@ -12,7 +12,8 @@
       "vSolInBondingCurve": 40.5,
       "vTokensInBondingCurve": 794814814.814815,
       "ts": 1792641600,
-      "realSol": 10.5
+      "realSol": 10.5,
+      "fee": 0.00625
     }
   }
 ]

@@ -1861,6 +1861,19 @@ def test_control_bot_sniper_runs_without_control_env(monkeypatch):
     assert seen["paper_carry"] is None
 
 
+def test_control_bot_splits_messages_on_line_boundaries():
+    telegram_bot = load_telegram_control_bot_module()
+    text = "\n".join(["x" * 90] * 41 + ["z" * 39, "  koveto-poziciok osszesen: 38144, atlag -12.5%"] + ["y" * 90] * 5)
+    assert text[3799:3801] == "38"                                       # a regi, 3800 karakteres vagas itt torte ketté
+    chunks = telegram_bot.split_message(text, 3800)
+    assert len(chunks) == 2 and all(len(c) <= 3800 for c in chunks)
+    assert "\n".join(chunks) == text                                     # semmi nem vesz el
+    assert chunks[1].startswith("  koveto-poziciok osszesen: 38144")     # a sor egyben, a kovetkezo darabban
+    long = telegram_bot.split_message("a" * 9000, 3800)                   # egyetlen hosszu sor: kemeny vagas
+    assert [len(c) for c in long] == [3800, 3800, 1400]
+    assert telegram_bot.split_message("rovid") == ["rovid"]
+
+
 def _cfg_for_grid_tests(monkeypatch):
     monkeypatch.delenv("ENV_PROFILE", raising=False)
     cfg = BotConfig.from_env()

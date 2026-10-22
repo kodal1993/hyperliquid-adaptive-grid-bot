@@ -11,9 +11,6 @@ MIT CSINAL
   nem olvas be, tranzakciot nem kuld.
 
 STRATEGIAK
-    S8_masol        MASOLHATO tarca vett: a tarcat azon mertuk, mennyit hozott volna NEKUNK
-                    kovetve (COPY_LAT keses, a mi dijaink, kiszallas az o eladasakor), es ennek
-                    az also hibahatara is pozitiv
     S10_bennfentes  bennfentes-klaszter (lasd lent) vett: belepes a felismeres utan
                     (3 mp + COPY_LAT), ha meg egyik bennfentes sem adott el
     S13_amm         graduacio UTANI belepes (kesesfuggetlen, ingyenes): a PumpPortal graduacios
@@ -23,7 +20,9 @@ STRATEGIAK
                     A 2026-10-22 elotti S13 sorok (es a graduacio utan zart S14 '+amm' sorok) 0.30%-os
                     AMM-dijjal szamoltak: OPTIMISTAK, iranyonkent kb. 0.9 szazalekponttal
   Lezarva (kudarc, a kodbol kivezetve): S6_okos / S6_okos2 (sajat PnL szerint okos tarcak kovetese,
-  -20% / -25%, n=196 / 77), S12_futtat (gorbe >= 50%-nal belepes, graduacio utan dump: -55%, n=10).
+  -20% / -25%, n=196 / 77), S12_futtat (gorbe >= 50%-nal belepes, graduacio utan dump: -55%, n=10),
+  S8_masol (masolhato tarca kovetese: 38 144 koveto-pozicio utan sincs masolhato tarca, atlag -12.5%;
+  a jo tarcak elonye a sebesseg). A koveto-meres (wallets 4. pont) marad.
 
 TOKEN-NAPLO (nyero tokenek keresese)
   Minden uj tokenrol pillanatkep 30 es 60 mp-es korban (lancon merve: a letrehozas utani 75 / 150 slot):
@@ -45,12 +44,15 @@ KISZALLAS
             vegso aran zar (optimista)
     masol   ki, amikor a kovetett tarca (S10: az elso bennfentes) elad; SL 0.5x, max 30 perc
     S13 / S14 alap: csucstol -50%, max 24 ora, graduacio utan is
-  A CSV-ben "S8_masol" (alap) es "S8_masol~masol"; a kulonbseg parositva: report --kiszallas.
+  A CSV-ben "S10_bennfentes" (alap) es "S10_bennfentes~masol"; a kulonbseg parositva: report --kiszallas.
 
 TARCA-ADATBAZIS
   Minden uj token kereskedeseit figyeljuk az elso PAPER_SNIPER_TRADE_WINDOW_MIN percben
-  (subscribeTokenTrade). Az ablak vegen tarcankent: kapott SOL + a maradek token erteke -
-  befizetett SOL. A dev es a 2 mp-en beluli vevok kimaradnak. Okos: >= SMART_MIN_N token,
+  (Solana RPC TradeEvent). Az ablak vegen tarcankent: kapott SOL + a maradek token erteke -
+  befizetett SOL - a tarca dijai (a TradeEvent fee + creator_fee mezoje; vetelkor a gorbe SOL-jan felul
+  fizeti, eladaskor abbol vonjak le). Ha a token az ablakban graduált, az elszamolas megvarja a PumpSwap-arat
+  15 perccel a graduacio utan, es a maradekot azon ertekeli (a gorbe utolso ara a csucs volna).
+  A dev es a 2 mp-en beluli vevok kimaradnak. Okos: >= SMART_MIN_N token,
   nyero >= SMART_MIN_WIN, PnL >= SMART_MIN_PNL. Kovethetoseg: minden tarca-poziciohoz a KOVETO
   hozam is (belepes COPY_LAT mp-cel a veteluk utan, kiszallas az elso eladasuk utan, a mi
   dijainkkal, +500%-nal levagva); masolhato, ha >= COPY_MIN_N ilyen pozicio es atlag - 2 SE > 0.
@@ -148,7 +150,6 @@ BASE58 = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 TRADE_FIELDS = ["ts_open", "ts_close", "strat", "mint", "name", "symbol", "latency_s", "entry_vsol", "exit_vsol",
                 "cost_sol", "proceeds_sol", "pnl_sol", "ret_pct", "reason", "hold_s", "graduated"]
 STRAT_DESC = {
-    "S8_masol": "masolhato tarca vett (a mi kesesunkkel + dijainkkal mert)",
     "S10_bennfentes": "bennfentesek kovetese: be 4 mp-nel, ki az elso bennfentes eladasakor",
     "S13_amm": "graduacio utan 5 perccel, DexScreener-tapadas eseten, a PumpSwap-on; csucstol -50%, max 24 ora",
     "S14_volumen": "30 mp-nel >= 25 SOL vasarlas (a token-naplo jele); alap: csucstol -50% / gyors: -30%, 30 perc",
@@ -179,7 +180,7 @@ EXIT_DESC = {
 
 
 def split_strat(k):
-    """'S8_masol~masol' -> ('S8_masol', 'masol'); 'S8_masol' -> ('S8_masol', 'alap')"""
+    """'S10_bennfentes~masol' -> ('S10_bennfentes', 'masol'); 'S10_bennfentes' -> ('S10_bennfentes', 'alap')"""
     base, _, ex = str(k).partition("~")
     return base, ex or "alap"
 
@@ -349,8 +350,11 @@ def b58encode(b):
 
 def decode_trade_event(data):
     """pump.fun TradeEvent (a 'Program data:' sor base64-e) -> PumpPortal-szeru uzenet, vagy None.
-    Elrendezes: disc(8) mint(32) sol_amount u64, token_amount u64, is_buy u8, user(32), timestamp i64,
-    virtual_sol_reserves u64, virtual_token_reserves u64, ... (a tobbi mezot nem hasznaljuk)"""
+    Elrendezes (IDL): disc(8) mint(32) sol_amount u64, token_amount u64, is_buy u8, user(32), timestamp i64,
+    virtual_sol_reserves u64, virtual_token_reserves u64, real_sol u64, real_token u64, fee_recipient(32),
+    fee_basis_points u64, fee u64 (@169), creator(32), creator_fee_basis_points u64, creator_fee u64 (@217), ...
+    A sol_amount a gorbe resze: vetelkor a tarca ezen felul fizeti a dijat, eladaskor ebbol vonjak le.
+    'fee' = fee + creator_fee SOL-ban (None, ha a sor rovidebb)"""
     try:
         b = base64.b64decode(data)
     except Exception:
@@ -361,9 +365,10 @@ def decode_trade_event(data):
     is_buy = b[56] == 1
     ts, = struct.unpack_from("<q", b, 89)
     vsol, vtok = struct.unpack_from("<QQ", b, 97)
+    fee = (struct.unpack_from("<Q", b, 169)[0] + struct.unpack_from("<Q", b, 217)[0]) / 1e9 if len(b) >= 225 else None
     return {"txType": "buy" if is_buy else "sell", "mint": b58encode(b[8:40]), "traderPublicKey": b58encode(b[57:89]),
             "solAmount": sol / 1e9, "tokenAmount": tok / 1e6, "vSolInBondingCurve": vsol / 1e9, "vTokensInBondingCurve": vtok / 1e6,
-            "ts": ts}
+            "ts": ts, "fee": fee}
 
 
 def decode_create_event(b):
@@ -671,10 +676,12 @@ class Sniper:
                 T["pmax"][k] = max(T["pmax"][k], vs / vt)
         # befizetett SOL, kapott SOL, token, elso vetel ideje, valodi SOL a gorbeben az elso veteledkor,
         # utolso eladas ideje, vetelek, eladasok, legtobb tartott token
-        # ..., elso eladas ideje (a koveto ekkor szall ki)
+        # ..., elso eladas ideje (a koveto ekkor szall ki), az elso vetel slotja, a tarca dijai (SOL)
         slot = m.get("slot")
         rec = T["tr"].setdefault(w, [0.0, 0.0, 0.0, now, (vs - V0_SOL) if vs > 0 else -1.0, 0.0, 0, 0, 0.0, 0.0,
-                                     slot if slot is not None else -1])   # ..., az elso vetel slotja
+                                     slot if slot is not None else -1, 0.0])
+        fee = m.get("fee")
+        rec[11] += fnum(fee) if fee is not None else sol * self.fee   # a TradeEvent dija; nelkule a konfig szerinti
         if m.get("txType") == "buy":
             rec[0] += sol
             rec[2] += tok
@@ -691,9 +698,6 @@ class Sniper:
                 T["early_tok"] += tok
             if w != T["dev"] and self.is_smart(w):
                 T["smart"].add(w)                      # a token-naplo jele (az S6 kovetes kudarc volt)
-            if w != T["dev"] and self.is_copyable(w):
-                T["leaders"].setdefault("S8_masol", w)
-                self.enter_later("S8_masol", T, self.copy_lat)
         else:
             rec[1] += sol
             rec[2] = max(0.0, rec[2] - tok)
@@ -758,6 +762,8 @@ class Sniper:
         for mint, T in list(self.tracked.items()):
             if not force and now - T["t"] < self.trade_window:
                 continue
+            if not force and mint in self.postgrad_due and now < T.get("grad_t", now) + POSTGRAD_DELAY + 900:
+                continue                               # az ablakban graduált: a maradek a PumpSwap-aron (record_postgrad)
             del self.tracked[mint]
             try:
                 self.finalize_token(mint, T, now)
@@ -768,16 +774,18 @@ class Sniper:
         self.flush_wallet_log()
 
     def finalize_token(self, mint, T, now):
-        """egy lejart token elszamolasa: token-naplo sor, tarca-pozicio naplo, tarca-adatbazis"""
-        px = T["px"]
+        """egy lejart token elszamolasa: token-naplo sor, tarca-pozicio naplo, tarca-adatbazis. Graduált tokennel a
+        maradek a PumpSwap-aron (15 perccel a graduacio utan): a gorbe utolso ara a graduacios csucs volna."""
         self.log_token(T, now)
+        px = T.get("px_amm") or T["px"]
+        sell_fee = self.amm_fee if T.get("px_amm") else self.fee
         early_pct = round(T["early_tok"] / TOTAL_SUPPLY * 100, 2)
         for w, rec in T["tr"].items():
             si, so, tk, t0 = rec[:4]
             if w == T["dev"] or self.is_early(T, t0, rec[10] if len(rec) > 10 else None) or si < 0.02:
                 continue                          # dev, korai (nem kovetheto) vagy por-meretu
-            rem = tk * px * (1 - self.fee) if px else 0.0
-            pnl = so + rem - si
+            rem = tk * px * (1 - sell_fee) if px else 0.0
+            pnl = so + rem - si - (rec[11] if len(rec) > 11 else 0.0)   # a tarca sajat dijai is
             prior = self.wallets.get(w)
             if self.wallet_log_on and len(rec) >= 9:
                 minta = random.random() < 0.05
@@ -793,7 +801,7 @@ class Sniper:
             entry = self.px_at(T, t0 + self.copy_lat)
             if entry:
                 t_sell = rec[9] if len(rec) >= 10 else 0.0
-                ex = (self.px_at(T, t_sell + self.copy_lat) if t_sell else None) or T["px"]
+                ex = (self.px_at(T, t_sell + self.copy_lat) if t_sell else None) or px
                 cr = (ex / entry) * (1 - self.fee) ** 2 - 1 - 2 * self.prio / self.size
                 cr = max(-1.0, min(5.0, cr))
                 r[4] += 1
@@ -864,7 +872,8 @@ class Sniper:
         if "S13_amm" in self.strats and mint not in self.amm_due:
             self.amm_due[mint] = [time.time() + self.s13_delay, 0]     # [mikor, hanyadik probalkozas]
         if mint in self.tokens and mint not in self.postgrad_due and len(self.postgrad_due) < 5000:
-            self.postgrad_due[mint] = [time.time() + POSTGRAD_DELAY, 0]   # a token-napló kimenetelehez
+            self.postgrad_due[mint] = [time.time() + POSTGRAD_DELAY, 0]   # a token-napló es a tarca-elszamolas kimenetelehez
+            self.tokens[mint]["grad_t"] = time.time()
         d = self.mint_dev.get(mint)
         if d and d[0] in self.creators:
             self.creators[d[0]]["g"] = self.creators[d[0]].get("g", 0) + 1
@@ -878,6 +887,9 @@ class Sniper:
             if d:
                 rows.append([round(now), mint, d["px"], round(d["liq"])])
                 del self.postgrad_due[mint]
+                T = self.tracked.get(mint)
+                if T is not None:
+                    T["px_amm"] = d["px"]                # a meg el nem szamolt token tarcainak maradeka ezen
             elif tries < 2:
                 self.postgrad_due[mint] = [now + 300, tries + 1]    # meg nincs indexelve: 5 perc mulva ujra
             else:
@@ -1816,7 +1828,9 @@ def wallets_report():
     smart_now = {w for w, r in db.items() if r[0] >= mn and r[1] / r[0] >= mw and r[2] >= mp}
     hours = (max(r["ts"] for r in rows) - min(r["ts"] for r in rows)) / 3600
     out = [f"TARCA-VISELKEDES — {len(rows)} tarca-pozicio, {len({r['wallet'] for r in rows})} tarca, {hours:.1f} ora",
-           "(a hozam a tarca sajat eredmenye a kovetesi ablak vegeig, a mi dijaink es kesesunk NELKUL)", ""]
+           "(a hozam a tarca sajat eredmenye a SAJAT dijaival, a kovetesi ablak vegeig, a mi kesesunk NELKUL; graduált tokennel",
+           " a maradek a PumpSwap-aron 15 perccel a graduacio utan. A 2026-10-22 elotti sorok dij nelkul es a graduacios",
+           " csucsaron szamoltak: optimistak; a naplo kb. fel nap alatt lecserelodik)", ""]
 
     # 1. profil: okos vs tobbi
     groups = [("okos (most)", [r for r in rows if r["wallet"] in smart_now]),
@@ -1923,7 +1937,7 @@ def wallets_report():
             out.append(f"  bennfentes-klaszter tarcak kovetve: {a_i:+.1f}% / pozicio (n={n_i}, {len(insiders & set(cs))} tarca)"
                        "  — a koveto hozam itt a korai (2 mp-en beluli) vetelek NELKUL szamolt, kesobbi poziciojukra vonatkozik")
         if n_s and a_s <= 0:
-            out.append("  -> a sajat PnL alapjan okos tarcak kovetve NEM hoznak: oket nem szabad masolni (S6), csak a masolhatokat (S8).")
+            out.append("  -> a sajat PnL alapjan okos tarcak kovetve NEM hoznak: az elonyuk a sebesseg (S6 es S8 lezarva, docs/KISERLETEK.md).")
         for w in copyable[:10]:
             n, mean, lcb, win = cs[w]
             r = db[w]
@@ -1988,7 +2002,7 @@ def diag():
     if ml and time.time() - ml > 120:
         print("  FIGYELEM: a karbantarto ciklus nem fut (a token- es tarca-naplo nem no)")
 
-    print("\n== Tarca-kovetes (S8/S10)")
+    print("\n== Tarca-kovetes (S10, tarca-adatbazis)")
     wst = s.get("wallets") or {}
     print(f"kereskedes-uzenet: {s.get('trade_msgs', 0)}  hibas: {s.get('trade_bad', 0)}  elszamolt tarca-pozicio: {s.get('wallet_closes', 0)}"
           f"  kovetett token most: {wst.get('tracked', '-')}")
