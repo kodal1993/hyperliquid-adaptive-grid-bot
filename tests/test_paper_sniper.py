@@ -339,3 +339,46 @@ def test_tokens_s14_outcome_from_60s_snapshot(tmp_path, monkeypatch):
     e60 = next(ln for ln in lines if ln.strip().startswith("ellenorzo") and "60 mp-es ar" in ln)
     assert "   3 /" in e60
     assert "alapvonal (minden token, 60 mp-es ar): 0.0% (n=70)" in sec
+
+
+# ---------------------------------------------------------------- strategia-lista, nyitott poziciok
+def test_strat_warnings_unknown_missing_and_restart(tmp_path, monkeypatch):
+    mod = load_sniper(tmp_path, monkeypatch)
+    monkeypatch.setenv("PAPER_SNIPER_STRATS", "S8_masol,S10_bennfentes")
+    w = mod.strat_warnings({"strats": ["S10_bennfentes"]})
+    assert any("ismeretlen" in x and "S8_masol" in x for x in w)
+    assert any(x.startswith("nem fut: S13_amm, S14_volumen") for x in w)
+    assert not any("ujrainditas" in x for x in w)
+    monkeypatch.setenv("PAPER_SNIPER_STRATS", "")                       # ures = mind fut ...
+    w = mod.strat_warnings({"strats": ["S10_bennfentes"]})               # ... de a futo peldany meg a regi listaval
+    assert any(x.startswith("nem fut: S13_amm, S14_volumen") for x in w) and any("/restart_sniper" in x for x in w)
+    assert mod.strat_warnings({"strats": list(mod.STRAT_DESC)}) == []
+    assert mod.strat_warnings({}) == []                                  # regi allapotfajl: csak a konfig szamit
+    S = make_sniper(mod)
+    S.save(db=False)
+    assert json.loads(mod.STATE_FILE.read_text())["stats"]["strats"] == list(mod.STRAT_DESC)
+
+
+def test_reports_show_open_positions_per_strategy(tmp_path, monkeypatch):
+    mod = load_sniper(tmp_path, monkeypatch)
+    pos = [{"strat": "S13_amm", "t_open": time.time()}] * 2 + [{"strat": "S14_volumen", "t_open": time.time()},
+                                                                {"strat": "S8_masol", "t_open": time.time()}]
+    now = time.time()
+    mod.STATE_FILE.write_text(json.dumps({"positions": pos, "saved": now,
+                                          "stats": {"started": now - 3600, "strats": ["S10_bennfentes", "S13_amm", "S14_volumen"]}}))
+    with mod.TRADES_FILE.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(mod.TRADE_FIELDS)
+        for i in range(3):
+            w.writerow([round(now) - 600, round(now) - 60, "S14_volumen", f"m{i}", "n", "s", 60, 40, 41, 0.101, 0.11, 0.009, 9, "trail", 540, 0])
+    text = mod.report_text()
+    assert "S13_amm: meg nincs lezart pozicio, nyitott most 2" in text
+    assert "S10_bennfentes: meg nincs lezart pozicio, nyitott most 0" in text   # fut, de meg semmi
+    assert "lezart poziciok: 3   nyitott most: 1" in text
+    assert "S8_masol 1" in text and "meg lezarulnak" in text
+    tg = mod.telegram_report(2)
+    assert "S13_amm: meg nincs lezart | nyitott 2" in tg
+    assert any(ln.startswith("S14_volumen: 3 |") and "| 1  [" in ln for ln in tg.splitlines())
+    assert "Nyitott osszesen: 4 (ebbol kivezetett strategiae, meg lezarulnak: S8_masol 1)" in tg
+    monkeypatch.setenv("PAPER_SNIPER_STRATS", "S13_amm")                  # a konfig mar mast mond: ujrainditas kell
+    assert "/restart_sniper" in mod.telegram_report(2)

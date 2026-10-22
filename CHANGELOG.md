@@ -1,6 +1,6 @@
 # Changelog
 
-## Paper sniper: S8 lezárva, tárca-elszámolás díjakkal és PumpSwap-áron, Telegram-darabolás sorhatáron
+## Paper sniper: S8 lezárva, tárca-elszámolás díjakkal és PumpSwap-áron, stratégia-figyelmeztetés, nyitott pozíciók stratégiánként
 
 - **S8_masol lezárva (kudarc), a kódból kivezetve:** 38 144 követő-pozíció után sincs másolható tárca (átlag −12,5%; az okos tárcák követve −2,8%). A jó tárcák előnye a sebesség. A `PAPER_SNIPER_STRATS` régi listájában maradt `S8_masol`-t a sniper figyelmen kívül hagyja. A követő-mérés (`/wallets` 4. pont) marad.
 - **Tárca-elszámolás:**
@@ -8,6 +8,9 @@
   - ha a token a követési ablakban graduál, az elszámolás megvárja a PumpSwap-árat 15 perccel a graduáció után (legfeljebb 30 percig), és a maradékot azon, AMM-díjjal értékeli, nem a görbe csúcsárán. Ugyanez a követő-hozam kiszállási áránál.
   - A `/wallets` fejléce ezt írja le; a 2026-10-22 előtti sorok optimisták, a napló kb. fél nap alatt lecserélődik.
 - **Telegram:** a hosszú üzenetek sorhatáron darabolódnak (eddig 3800 karakterenként, így egy szám is kettétörhetett, pl. „3” + „8144”).
+- **Stratégia-lista figyelmeztetés:** induláskor, a `/diag`-ban és a Telegram-jelentésben, ha a `PAPER_SNIPER_STRATS` ismeretlen (pl. kivezetett) nevet tartalmaz, ha egy stratégiát kizár, vagy ha a mostani konfig mást futtatna, mint a futó sniper (újraindítás kell). A futó példány listája az állapotfájlba kerül.
+- **Nyitott pozíciók stratégiánként:** a `/sniper` riportban, a Telegram-jelentés táblázatában és a `/diag` belépési táblájában. A futó, de még lezárt pozíció nélküli stratégia is megjelenik; a kivezetett stratégiák még nyitott pozíciói külön sorban.
+- `docs/KISERLETEK.md`: az S13 és az S14 ténylegesen 2026-10-22 ~06:45-től fut (addig a `PAPER_SNIPER_STRATS` kizárta őket); az S13-ról addig nincs adat.
 
 ## Paper sniper: 50-es ítélet-küszöb, 1,2%-os AMM-díj, S14-jel 60 mp-ről, tesztek, izolált futtatás
 

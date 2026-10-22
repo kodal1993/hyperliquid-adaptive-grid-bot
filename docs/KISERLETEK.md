@@ -46,9 +46,14 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
   (nem 0,30%-ot, ahogy eddig számoltunk).
 - **Költségpadló:** görbén kb. −5% / pozíció; graduáció után kb. −4,4% (2 × 1,2% + 2 × 0,001 SOL prio
   0,1 SOL-on), plusz a pool méretéből számolt csúszás.
-- **AMM-díj javítva (2026-10-22):** a `PAPER_SNIPER_AMM_FEE_BPS` alapértéke 30 → 120. **Az eddigi S13_amm sorok és
-  a graduáció után zárt S14 (`+amm`) sorok optimisták:** 0,30%-os díjjal számoltak, pozíciónként kb. 1,8 százalékponttal
-  jobbak a valóságnál (2 × 0,9). Az S13 és S14 ítéletébe ezeket a sorokat ezzel a levonással kell érteni.
+- **AMM-díj javítva (2026-10-22):** a `PAPER_SNIPER_AMM_FEE_BPS` alapértéke 30 → 120. A 0,30%-os díjjal zárt S13 és
+  graduáció utáni S14 (`+amm`) sorok pozíciónként kb. 1,8 százalékponttal (2 × 0,9) jobbak a valóságnál. Ilyen sor csak a
+  javítás (#126) telepítése előtt zárulhatott, és mivel az S13 és az S14 csak 2026-10-22 ~06:45-től fut (lásd lent),
+  legfeljebb néhány lehet; a nyitva maradt pozíciók az újraindítás után már 1,2%-kal zárnak.
+- **Futási idő:** az S13 és az S14 ténylegesen **2026-10-22 ~06:45-től** fut. Addig a `PAPER_SNIPER_STRATS` kizárta őket
+  (a lista a bevezetésük előtti volt). **Az S13-ról addig nincs adat**, és az S14-ről sincs. Az eredményeik ettől az
+  időponttól számítanak; a sniper azóta induláskor, a `/diag`-ban és a Telegram-jelentésben figyelmeztet, ha a lista
+  ismeretlen nevet tartalmaz, vagy egy stratégiát kizár.
 - **Lezárt mérések:**
   - 2026-10-21, kivezetve: S0–S5, S7, S9 és a kiszállási változatok; díjakkal statisztikailag negatív.
   - 2026-10-21: **S6_okos** (−25,2% ±9,1, n=115) és **S6_okos2** (−20,2% ±14,6, n=51) statisztikailag
@@ -79,11 +84,11 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
     csak a klaszteres tokenekre szűkítve, kb. 0,15 SOL/nap.
 - **Aktív** (`PAPER_SNIPER_STRATS=S10_bennfentes,S13_amm,S14_volumen`; a régi listában maradt `S8_masol`-t a
   sniper figyelmen kívül hagyja):
-  - `S13_amm`: belépés graduáció után 5 perccel, ha a DexScreener szerint van tapadás (likviditás
+  - `S13_amm` (ténylegesen 2026-10-22 ~06:45-től): belépés graduáció után 5 perccel, ha a DexScreener szerint van tapadás (likviditás
     ≥ 8000 $, 5 perces forgalom ≥ 3000 $, vevők ≥ 1,2 × eladók, emelkedő ár). Késés-független és
     ingyenes: csak a PumpPortal graduációs eseménye és a DexScreener kell. Kiszállás a csúcstól −50%-nál,
     legfeljebb 24 óra, felső célár nélkül.
-  - `S14_volumen` (2026-10-22-től): a token-napló első, ellenőrzött jele. Ha 30 mp-nél legalább 25 SOL a
+  - `S14_volumen` (ténylegesen 2026-10-22 ~06:45-től): a token-napló első, ellenőrzött jele. Ha 30 mp-nél legalább 25 SOL a
     vásárlás, az ellenőrző részen 8,6% a nyerő arány, az alapvonal 1,6% (n=35, 1034 tokenből). A 15 perces
     végső szorzó viszont 0,92x, vagyis felfut, majd visszaesik. Két kiszállás párosítva: `alap` (csúcstól −50%,
     24 óra, graduáció után is) és `gyors` (1,3x felett csúcstól −30%, SL 0,6x, 30 perc). Kevés az

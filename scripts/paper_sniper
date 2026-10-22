@@ -17,8 +17,9 @@ STRATEGIAK
                     esemenye utan S13_DELAY_MIN perccel a DexScreener-adatok alapjan (likviditas,
                     5 perces forgalom, vevok/eladok, arvaltozas) a PumpSwap aron, AMM-dijjal es a
                     pool meretebol szamolt csuszassal; kiszallas a csucstol -50%-nal, max 24 ora.
-                    A 2026-10-22 elotti S13 sorok (es a graduacio utan zart S14 '+amm' sorok) 0.30%-os
-                    AMM-dijjal szamoltak: OPTIMISTAK, iranyonkent kb. 0.9 szazalekponttal
+                    A #126 telepitese elott zart S13 sorok (es a graduacio utan zart S14 '+amm' sorok) 0.30%-os
+                    AMM-dijjal szamoltak: OPTIMISTAK, iranyonkent kb. 0.9 szazalekponttal. Az S13 es az S14
+                    tenylegesen 2026-10-22 ~06:45-tol fut (addig a PAPER_SNIPER_STRATS kizarta oket)
   Lezarva (kudarc, a kodbol kivezetve): S6_okos / S6_okos2 (sajat PnL szerint okos tarcak kovetese,
   -20% / -25%, n=196 / 77), S12_futtat (gorbe >= 50%-nal belepes, graduacio utan dump: -55%, n=10),
   S8_masol (masolhato tarca kovetese: 38 144 koveto-pozicio utan sincs masolhato tarca, atlag -12.5%;
@@ -90,7 +91,8 @@ KONFIG (mind opcionalis): izolalt telepitesben (deploy/install_paper_sniper.sh) 
     PAPER_SNIPER_TP_X=2.0 / SL_X=0.5 / MAX_HOLD_MIN=30   # az alap kiszallas
     PAPER_SNIPER_MAX_OPEN=120       # strategiankent egyszerre nyitott poziciok
     PAPER_SNIPER_POLL_SEC=10        # gorbe-lekerdezes gyakorisaga
-    PAPER_SNIPER_STRATS=            # ures = mind; pl. S10_bennfentes,S14_volumen
+    PAPER_SNIPER_STRATS=            # ures = mind; pl. S10_bennfentes,S14_volumen. Ismeretlen (kivezetett) nevre es kizart
+                                    # strategiara figyelmeztet: induláskor, diag, Telegram-jelentes
     PAPER_SNIPER_TRADE_WINDOW_MIN=15   # ennyi percig kovetjuk egy token kereskedeseit
     PAPER_SNIPER_SMART_MIN_N=5 / SMART_MIN_WIN=0.5 / SMART_MIN_PNL=0.5   # okos tarca
     PAPER_SNIPER_COPY_LAT=1.0       # koveto keses (mp)
@@ -201,6 +203,38 @@ def load_env():
         return
     load_dotenv(ROOT / "config" / "live.env", override=False)
     load_dotenv(ROOT / ".env", override=True)
+
+
+def parse_strats(raw):
+    """PAPER_SNIPER_STRATS -> (futo strategiak, ismeretlen nevek, kizart strategiak); ures = mind fut"""
+    only = [x.strip() for x in (raw or "").split(",") if x.strip()]
+    active = [k for k in STRAT_DESC if not only or k in only]
+    return active, [x for x in only if x not in STRAT_DESC], [k for k in STRAT_DESC if k not in active]
+
+
+def strat_warnings(stats):
+    """ismeretlen (pl. kivezetett) nev a PAPER_SNIPER_STRATS-ban, nem futo strategia, es ha a mostani konfig
+    mast futtatna, mint a futo sniper (a stats["strats"] a futo peldany listaja; regi allapotfajlban nincs)"""
+    active, unknown, _ = parse_strats(os.getenv("PAPER_SNIPER_STRATS"))
+    running = stats.get("strats")
+    out = []
+    if unknown:
+        out.append(f"a PAPER_SNIPER_STRATS ismeretlen (kivezetett?) strategiat tartalmaz: {', '.join(unknown)} — figyelmen kivul hagyva")
+    off = [k for k in STRAT_DESC if k not in (running if running is not None else active)]
+    if off:
+        out.append(f"nem fut: {', '.join(off)} (a PAPER_SNIPER_STRATS kizarja)")
+    if running is not None and set(running) != set(active):
+        out.append(f"a konfig szerint ezek futnanak: {', '.join(active) or '-'}, de a futo sniper: {', '.join(running) or '-'}"
+                   " — ujrainditas kell (/restart_sniper)")
+    return out
+
+
+def open_counts(state):
+    """nyitott poziciok strategiankent az allapotfajlbol"""
+    cnt = {}
+    for p in state.get("positions", []):
+        cnt[p.get("strat")] = cnt.get(p.get("strat"), 0) + 1
+    return cnt
 
 
 def cfg(key, default, cast=float):
@@ -442,13 +476,13 @@ class Sniper:
         self.s14_buy = cfg("PAPER_SNIPER_S14_MIN_BUY_SOL", 25.0)
         self.dex_last = 0.0
         self.poll = cfg("PAPER_SNIPER_POLL_SEC", 10.0)
-        only = [s.strip() for s in (os.getenv("PAPER_SNIPER_STRATS") or "").split(",") if s.strip()]
-        self.strats = [s for s in STRAT_DESC if not only or s in only]
+        self.strats = parse_strats(os.getenv("PAPER_SNIPER_STRATS"))[0]
         st = read_json(STATE_FILE, {})
         self.positions = st.get("positions", [])            # nyitott szimulalt poziciok
         self.stats = st.get("stats", {"started": time.time()})
         for k, v in (("seen", 0), ("migrations", 0), ("skipped", {}), ("missed", {}), ("entered", {})):
             self.stats.setdefault(k, v)
+        self.stats["strats"] = self.strats                   # a futo peldany listaja (riport: kell-e ujrainditas)
         if (self.stats.get("rpc_ws") or {}).get("last_error"):
             self.stats["rpc_ws"]["last_error"] = redact(self.stats["rpc_ws"]["last_error"])   # regi allapotfajlbol
         db = read_json(DB_FILE, {})
@@ -1364,7 +1398,11 @@ class Sniper:
             seen = [f.name for f in (ROOT / ".env", ROOT / "config" / "live.env") if os.access(f, os.R_OK)]
             log(f"Izolalt mod: konfig {ISO_ENV}, allapot {STATE_DIR}; a repo kulcsfajljai: "
                 + ("OLVASHATOK (" + ", ".join(seen) + ") — ellenorizd a systemd unitot!" if seen else "nem olvashatok (rendben)"))
-        telegram("Paper sniper indul (valodi penz nelkul)")
+        warns = strat_warnings(self.stats)
+        for w in warns:
+            log("FIGYELEM: " + w)
+        telegram("Paper sniper indul (valodi penz nelkul). Strategiak: " + ", ".join(self.strats)
+                 + "".join("\nFIGYELEM: " + w for w in warns))
         self.t_start = time.time()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -1456,20 +1494,26 @@ def exit_compare(rows, compact=False):
 
 def report_text(short=False):
     rows = active_rows(load_trades())
-    st = read_json(STATE_FILE, {}).get("stats", {})
+    state = read_json(STATE_FILE, {})
+    st = state.get("stats", {})
+    opn = open_counts(state)
     lines = []
     if st:
         days = max(1e-9, (time.time() - st.get("started", time.time())) / 86400)
         lines.append(f"Futasi ido: {days:.1f} nap, latott token: {st.get('seen', 0)}, graduacio (esemeny): {st.get('migrations', 0)}")
+    lines += ["FIGYELEM: " + w for w in strat_warnings(st)]
     if not rows:
         lines.append("Meg nincs lezart szimulalt pozicio.")
-        return "\n".join(lines)
     all_rows, rows = rows, base_rows(rows)
     by = {}
     for r in rows:
         by.setdefault(r["strat"], []).append(r)
-    for s in sorted(by, key=strat_order):
-        xs = by[s]
+    running = st.get("strats") or parse_strats(os.getenv("PAPER_SNIPER_STRATS"))[0]
+    for s in sorted(set(by) | {k for k in list(opn) + list(running) if k in STRAT_DESC}, key=strat_order):
+        xs = by.get(s, [])
+        if not xs:                                   # fut (vagy van nyitott pozicioja), de meg nincs lezart
+            lines += ([] if short else [""]) + [f"{s}: meg nincs lezart pozicio, nyitott most {opn.get(s, 0)}"]
+            continue
         n = len(xs)
         pnl = [float(r["pnl_sol"]) for r in xs]
         ret = [float(r["ret_pct"]) for r in xs]
@@ -1488,11 +1532,13 @@ def report_text(short=False):
         verdict = ("POZITIV (statisztikailag)" if n >= VERDICT_MIN_N and mean - ci > 0 else
                    ("NEGATIV (statisztikailag)" if n >= VERDICT_MIN_N and mean + ci < 0 else "meg nem eldontheto"))
         if short:
-            lines.append(f"{s}: n={n}, PnL {sum(pnl):+.3f} SOL, atlag {mean:+.1f}% ±{ci:.1f}, graduált {grad} -> {verdict}")
+            lines.append(f"{s}: n={n}, PnL {sum(pnl):+.3f} SOL, atlag {mean:+.1f}% ±{ci:.1f}, graduált {grad} -> {verdict},"
+                         f" nyitott {opn.get(s, 0)}")
             continue
         lines.append("")
         lines.append(f"{s} — {STRAT_DESC.get(s, '')}")
-        lines.append(f"  poziciok: {n}   nyero: {wins} ({wins/n*100:.0f}%)   graduált: {grad} ({grad/n*100:.1f}%)   median keses a szuleteshez: {lat:.1f} mp")
+        lines.append(f"  lezart poziciok: {n}   nyitott most: {opn.get(s, 0)}   nyero: {wins} ({wins/n*100:.0f}%)"
+                     f"   graduált: {grad} ({grad/n*100:.1f}%)   median keses a szuleteshez: {lat:.1f} mp")
         lines.append(f"  PnL: {sum(pnl):+.4f} SOL a {cost:.3f} SOL befektetett osszegen ({sum(pnl)/cost*100:+.1f}%)   profit factor: {pf:.2f}")
         lines.append(f"  atlagos hozam / pozicio: {mean:+.1f}%  (95% CI ±{ci:.1f})  ->  {verdict}")
         lines.append(f"  kiszallasok: " + ", ".join(f"{k} {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])))
@@ -1509,6 +1555,9 @@ def report_text(short=False):
         lines.append("")
         lines.append("Kihagyva (tele volt a strategia): " + (", ".join(f"{k} {v}" for k, v in sk.items()) or "-")
                      + "   nem sikerult belepni: " + (", ".join(f"{k} {v}" for k, v in mi.items()) or "-"))
+    old = {k: v for k, v in opn.items() if k not in STRAT_DESC}
+    if old and not short:
+        lines += ["", "Kivezetett strategia nyitott poziciói (meg lezarulnak): " + ", ".join(f"{k} {v}" for k, v in old.items())]
     cmp_ = exit_compare(all_rows)
     if cmp_ and not short:
         lines.append("")
@@ -1569,6 +1618,7 @@ def telegram_report(hours=2.0):
     rpc = s.get("rpc") or {}
     if rpc.get("calls", 0) >= 100 and rpc.get("errors", 0) / rpc["calls"] > 0.1:
         warn.append(f"RPC hibaarany {rpc['errors'] / rpc['calls'] * 100:.0f}%")
+    warn += strat_warnings(s)
 
     all_rows = active_rows(load_trades())
     rows = base_rows(all_rows)                   # az osszesitok az alap kiszallassal; a masol kulon
@@ -1582,21 +1632,28 @@ def telegram_report(hours=2.0):
     else:
         out.append("Lezarva az ablakban: 0 pozicio")
 
-    if rows:
+    opn = open_counts(st)
+    running = s.get("strats") or parse_strats(os.getenv("PAPER_SNIPER_STRATS"))[0]
+    keys = sorted({r["strat"] for r in rows} | {k for k in list(opn) + list(running) if k in STRAT_DESC}, key=strat_order)
+    if keys:
         out.append("")
-        out.append(f"Strategiak ({days:.1f} nap) — n | atlag ±CI | PnL SOL | nyero | itelet  [ablak n / atlag]")
+        out.append(f"Strategiak ({days:.1f} nap) — n | atlag ±CI | PnL SOL | nyero | itelet | nyitott  [ablak n / atlag]")
         by, wby = {}, {}
         for r in rows:
             by.setdefault(r["strat"], []).append(r)
         for r in win:
             wby.setdefault(r["strat"], []).append(r)
-        for k in sorted(by, key=strat_order):
+        for k in keys:
+            if k not in by:
+                out.append(f"{k}: meg nincs lezart | nyitott {opn.get(k, 0)}")
+                continue
             a = strat_stats(by[k])
             mark = {"+": "POZ", "-": "NEG", "?": "?"}[a["verdict"]]
             ws = strat_stats(wby[k]) if k in wby else None
             ci = "" if math.isnan(a["ci"]) else f"±{a['ci']:.1f}"
-            out.append(f"{k}: {a['n']} | {a['mean']:+.1f}%{ci} | {a['pnl']:+.2f} | {a['win']:.0f}% | {mark}"
+            out.append(f"{k}: {a['n']} | {a['mean']:+.1f}%{ci} | {a['pnl']:+.2f} | {a['win']:.0f}% | {mark} | {opn.get(k, 0)}"
                        + (f"  [{ws['n']} / {ws['mean']:+.1f}%]" if ws else "  [-]"))
+    if rows:
         tot = strat_stats(rows)
         out.append(f"Ossz: {tot['n']} poz., PnL {tot['pnl']:+.3f} SOL ({tot['mean']:+.1f}%/poz.)")
         pos_ = [k for k in by if strat_stats(by[k])["verdict"] == "+"]
@@ -1607,12 +1664,10 @@ def telegram_report(hours=2.0):
     if cmp_:
         out.append("")
         out += cmp_
-    pos = st.get("positions", [])
-    if pos:
-        cnt = {}
-        for p in pos:
-            cnt[p["strat"]] = cnt.get(p["strat"], 0) + 1
-        out.append(f"Nyitott: {len(pos)} (" + ", ".join(f"{k} {v}" for k, v in cnt.items()) + ")")
+    if opn:
+        old = {k: v for k, v in opn.items() if k not in STRAT_DESC}
+        out.append(f"Nyitott osszesen: {sum(opn.values())}"
+                   + (" (ebbol kivezetett strategiae, meg lezarulnak: " + ", ".join(f"{k} {v}" for k, v in old.items()) + ")" if old else ""))
     if warn:
         out.append("")
         out += ["FIGYELEM: " + w for w in warn]
@@ -1974,6 +2029,9 @@ def diag():
     seen, mig = s.get("seen", 0), s.get("migrations", 0)
     print(f"latott token: {seen}   graduacio: {mig} ({mig / seen * 100 if seen else 0:.2f}%)")
     print(f"futas: {'izolalt (konfig ' + str(ISO_ENV) + ')' if ISOLATED else 'a repobol (config/live.env + .env)'}, allapot: {STATE_DIR}")
+    print(f"strategiak (a futo sniper): {', '.join(s['strats']) if s.get('strats') is not None else '- (meg nincs mentett allapot, vagy regi allapotfajl)'}")
+    for w in strat_warnings(s):
+        print("FIGYELEM: " + w)
     rpc = s.get("rpc") or {}
     if rpc:
         print(f"RPC (a mostani futas ota): {rpc.get('calls', 0)} hivas, {rpc.get('errors', 0)} hiba"
@@ -1986,10 +2044,10 @@ def diag():
     if flat is not None:
         print(f"azonnali vetel+eladas koltsege (ar valtozas nelkul): {(flat - size - prio) / (size + prio) * 100:+.1f}%")
 
-    print("\n== Belepesek strategiankent (belepett / tele volt / nem sikerult)")
-    ent, sk, mi = s.get("entered", {}), s.get("skipped", {}), s.get("missed", {})
+    print("\n== Belepesek strategiankent (belepett / tele volt / nem sikerult / nyitott most)")
+    ent, sk, mi, opn = s.get("entered", {}), s.get("skipped", {}), s.get("missed", {}), open_counts(st)
     for k in sorted(STRAT_DESC, key=strat_order):
-        print(f"  {k:12s} {ent.get(k, '-')!s:>6} / {sk.get(k, 0):>5} / {mi.get(k, 0):>5}")
+        print(f"  {k:14s} {ent.get(k, '-')!s:>6} / {sk.get(k, 0):>5} / {mi.get(k, 0):>5} / {opn.get(k, 0):>5}")
 
     s13 = s.get("s13_skip") or {}
     if s13:
