@@ -79,6 +79,8 @@ BOT_COMMANDS = [
     {"command": "start_sniper", "description": "Sniper indítása"},
     {"command": "start_carry", "description": "Carry indítása"},
     {"command": "pull", "description": "Git pull + papír-szolgáltatások újraindítása"},
+    {"command": "set", "description": "Papír-beállítás: /set KULCS=ÉRTÉK (config/live.env)"},
+    {"command": "unset", "description": "Papír-beállítás törlése: /unset KULCS"},
     {"command": "version", "description": "Futó kódverzió, lemaradás a GitHubhoz képest"},
     {"command": "export", "description": "Adatfájlok + diag egy zip-ben"},
     {"command": "menu", "description": "Gombos menü"},
@@ -99,6 +101,8 @@ HELP_TEXT = """🤖 PAPÍR-BOTOK VEZÉRLÉSE (valódi pénz nélkül)
 ⏸ /stop_sniper, /stop_carry - leállítás (megerősítéssel)
 ▶️ /start_sniper, /start_carry - indítás
 ⬇️ /pull - git pull --rebase + papír-szolgáltatások újraindítása
+⚙️ /set - papír-beállítások listája; /set KULCS=ÉRTÉK beírja a config/live.env-be (utána /restart_sniper)
+   pl. /set PAPER_SNIPER_STRATS=S8_masol,S10_bennfentes,S13_amm,S14_volumen ; /unset KULCS törli
 📦 /version - melyik kód fut, van-e telepítetlen PR, kell-e újraindítás
 📤 /export - CSV-k, állapotfájlok és diag egy zip-ben (elemzéshez)
 🧭 /menu - gombos menü
@@ -444,6 +448,69 @@ def run_pull() -> str:
 CONFIRM_LABELS = {"stop_sniper": "⏸ A sniper leállítása", "stop_carry": "⏸ A carry leállítása"}
 
 
+LIVE_ENV_REL = "config/live.env"
+SETTABLE_RE = re.compile(r"^(PAPER_SNIPER_[A-Z0-9_]{1,40}|PAPER_CARRY_[A-Z0-9_]{1,40}|CARRY_[A-Z0-9_]{1,40}|TELEGRAM_REPORT_INTERVAL_HOURS)$")
+FORBIDDEN_IN_KEY = ("KEY", "TOKEN", "SECRET", "URL", "PRIVATE", "PASS", "WALLET")
+VALUE_RE = re.compile(r"^[A-Za-z0-9_.,:\-]{0,200}$")
+
+
+def settable_key(key: str) -> bool:
+    return bool(SETTABLE_RE.match(key)) and not any(f in key for f in FORBIDDEN_IN_KEY)
+
+
+def env_lines(rel: str) -> list[str]:
+    try:
+        return (PROJECT_ROOT / rel).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+
+
+def write_env_lines(rel: str, lines: list[str]) -> None:
+    path = PROJECT_ROOT / rel
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)                       # a live.env kulcsokat is tartalmaz
+    except OSError:
+        pass
+    tmp.replace(path)
+
+
+def set_command(text: str) -> str:
+    """papír-beállítás a config/live.env-ben; csak engedélyezett, titkot nem tartalmazó kulcsok"""
+    parts = text.strip().split(None, 1)
+    command = parts[0].split("@")[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    lines = env_lines(LIVE_ENV_REL)
+    if command == "/set" and not arg:
+        cur = [ln for ln in lines if "=" in ln and settable_key(ln.split("=", 1)[0].strip())]
+        return ("⚙️ Papír-beállítások a config/live.env-ben:\n" + ("\n".join(f"  {ln}" for ln in cur) or "  (nincs)")
+                + "\n\nMódosítás: /set KULCS=ÉRTÉK — törlés: /unset KULCS — érvényes: /restart_sniper")
+    if command == "/set":
+        key, sep, value = arg.partition("=")
+        if not sep:
+            key, _, value = arg.partition(" ")
+        key, value = key.strip().upper(), value.strip()
+    else:
+        key, value = arg.split()[0].upper() if arg else "", ""
+    if not settable_key(key):
+        return "❌ Ez a kulcs nem állítható Telegramról (csak PAPER_SNIPER_*, CARRY_*, TELEGRAM_REPORT_INTERVAL_HOURS; kulcs/URL soha)."
+    if command == "/set" and not VALUE_RE.match(value):
+        return "❌ Érvénytelen érték (csak betű, szám és _ . , : - lehet, legfeljebb 200 karakter)."
+    rest = [ln for ln in lines if not ln.strip().startswith(key + "=")]
+    if command == "/set":
+        rest.append(f"{key}={value}")
+        msg = f"✅ Beállítva: {key}={value}"
+    else:
+        if len(rest) == len(lines):
+            return f"ℹ️ Nincs ilyen sor a config/live.env-ben: {key}"
+        msg = f"✅ Törölve: {key}"
+    write_env_lines(LIVE_ENV_REL, rest)
+    if any(ln.strip().startswith(key + "=") for ln in env_lines(".env")):
+        msg += "\n⚠️ A .env-ben is van ilyen kulcs, és az ERŐSEBB (felülírja). Onnan kézzel kell törölni."
+    return msg + "\nÉrvényes az újraindítás után: /restart_sniper (vagy /restart_carry)"
+
+
 def handle_command(text: str, *, confirmed: bool = False) -> tuple[str, dict[str, Any] | None]:
     command = text.strip().split()[0].split("@")[0].lower()
     interval = report_interval_seconds()
@@ -468,6 +535,8 @@ def handle_command(text: str, *, confirmed: bool = False) -> tuple[str, dict[str
         return "🔬 SNIPER DIAG\n" + paper_script("paper_sniper", "diag"), None
     if command == "/carry":
         return "💰 CARRY\n" + paper_script("paper_carry", "status") + "\n" + paper_script("paper_carry", "report"), None
+    if command in {"/set", "/unset"}:
+        return set_command(text), None
     m = re.fullmatch(r"/(logs|restart|stop|start)_(sniper|carry)", command)
     if m:
         action, label = m.groups()

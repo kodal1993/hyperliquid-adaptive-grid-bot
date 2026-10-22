@@ -1780,6 +1780,28 @@ def test_control_bot_version_reports_pending_prs(monkeypatch):
     assert "telepítetlen" in telegram_bot.version_warning()
 
 
+def test_control_bot_set_command_only_paper_keys(tmp_path, monkeypatch):
+    telegram_bot = load_telegram_control_bot_module()
+    monkeypatch.setattr(telegram_bot, "PROJECT_ROOT", tmp_path)
+    (tmp_path / "config").mkdir()
+    secret = "TELEGRAM_BOT_TOKEN=123456:abcdefghijklmnopqrstuvwxyzABCDEF"
+    (tmp_path / "config" / "live.env").write_text(f"{secret}\nSOLANA_RPC_URL=https://x/?api-key=s3cr3t\nPAPER_SNIPER_STRATS=S6_okos\n")
+    (tmp_path / ".env").write_text("PAPER_SNIPER_SIZE_SOL=0.2\n")
+
+    listing = telegram_bot.set_command("/set")
+    assert "PAPER_SNIPER_STRATS=S6_okos" in listing and "abcdef" not in listing and "s3cr3t" not in listing
+    assert "Beállítva" in telegram_bot.set_command("/set PAPER_SNIPER_STRATS=S8_masol,S10_bennfentes,S13_amm,S14_volumen")
+    for bad in ("/set TELEGRAM_BOT_TOKEN=x", "/set SOLANA_RPC_URL=x", "/set PAPER_SNIPER_API_KEY=x", "/set HL_PRIVATE_KEY=x"):
+        assert "nem állítható" in telegram_bot.set_command(bad)
+    assert "Érvénytelen" in telegram_bot.set_command("/set PAPER_SNIPER_STRATS=a;rm -rf /")
+    assert "ERŐSEBB" in telegram_bot.set_command("/set PAPER_SNIPER_SIZE_SOL=0.1")
+    text = (tmp_path / "config" / "live.env").read_text()
+    assert secret in text and "api-key=s3cr3t" in text                     # a tobbi sor erintetlen
+    assert text.count("PAPER_SNIPER_STRATS=") == 1 and "S14_volumen" in text
+    assert "Törölve" in telegram_bot.set_command("/unset PAPER_SNIPER_SIZE_SOL")
+    assert "PAPER_SNIPER_SIZE_SOL" not in (tmp_path / "config" / "live.env").read_text()
+
+
 def _cfg_for_grid_tests(monkeypatch):
     monkeypatch.delenv("ENV_PROFILE", raising=False)
     cfg = BotConfig.from_env()

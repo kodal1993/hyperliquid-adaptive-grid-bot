@@ -1,5 +1,12 @@
 # Changelog
 
+## Telegram: `/set` és `/unset` — papír-beállítások a telefonról
+
+- `/set` listázza, `/set KULCS=ÉRTÉK` beírja vagy cseréli, `/unset KULCS` törli a beállítást a `config/live.env`-ben. Érvényes a `/restart_sniper` vagy `/restart_carry` után.
+- **Csak** `PAPER_SNIPER_*`, `PAPER_CARRY_*`, `CARRY_*` és `TELEGRAM_REPORT_INTERVAL_HOURS` állítható. Ami `KEY`, `TOKEN`, `SECRET`, `URL`, `PRIVATE`, `PASS` vagy `WALLET` szót tartalmaz, soha.
+- **Érték:** csak betű, szám és `_ . , : -`, legfeljebb 200 karakter.
+- A fájl többi sorához nem nyúl. Atomikusan ír, 600-as jogosultsággal. Figyelmeztet, ha ugyanez a kulcs a `.env`-ben is szerepel, mert az felülírja.
+
 ## Paper sniper: S6 és S12 kivezetve, puffer- és memória-optimalizálás
 
 - **Kivezetve** (statisztikailag lezárt kudarcok, `docs/KISERLETEK.md`):
