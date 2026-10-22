@@ -57,6 +57,16 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
   - Első működési adat (2026-10-22 12:21, a `/diag` szerint): S14 61 belépés (36 nyitott, 25 zárt: 24 `trail`, 1
     `trail+amm`); S13 4 belépés 69 értékelt graduációból (kihagyva: kicsi likviditás 31, több eladó 13, kicsi forgalom 8,
     klaszteres vagy másolat 6, eső ár 6, nincs pár 1), 3 zárt (`trail+amm`). Eredmény még nincs: ítélet 50 pozíciótól.
+- **Mayhem-tokenek (2026-10-22):** a pump.fun mayhem-módú tokenjeinek görbéje nem a szabványos 30 SOL-os: valódi
+  mintákban 2,66 és 11 SOL induló virtuális SOL-t láttunk. A három óránkénti `/diag`-mintából kettő a **BwWK17** (az
+  adatbázis „legjobb okos” tárcája: 559 token, 85% nyerő) díjmentes eladása ilyen görbén. Valószínűleg a pump.fun
+  mayhem-ügynöke, nem tanulható kereskedő.
+  - A token-napló „SOL a görbében” jele és a `/wallets` „görbe SOL” oszlopa ezeken eddig hibás volt (virtuális − 30).
+    Mostantól az esemény saját valódi-SOL mezőjéből jön.
+  - Tokenenként rögzítve a görbe induló SOL-ja és a mayhem-jelző (`state/paper_sniper_curves.csv`). A `/tokens` és a
+    `/wallets` külön sávban mutatja a szabványos, a mayhem és az egyéb görbéket, a `/sniper` stratégiánként görbe
+    szerint is bont, a `/wallets` 5. pontja pedig tárcánként mutatja a mayhem-tokenek arányát (a BwWK17-feltevés próbája).
+  - A szimulált kereskedéseinket ez nem érinti, mert azok a valódi görbe-fiókot olvassák.
 - **Lezárt mérések:**
   - 2026-10-21, kivezetve: S0–S5, S7, S9 és a kiszállási változatok; díjakkal statisztikailag negatív.
   - 2026-10-21: **S6_okos** (−25,2% ±9,1, n=115) és **S6_okos2** (−20,2% ±14,6, n=51) statisztikailag
@@ -96,6 +106,9 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
     végső szorzó viszont 0,92x, vagyis felfut, majd visszaesik. Két kiszállás párosítva: `alap` (csúcstól −50%,
     24 óra, graduáció után is) és `gyors` (1,3x felett csúcstól −30%, SL 0,6x, 30 perc). Kevés az
     ellenőrző nyerő (kb. 5), ezért a jel még bizonytalan.
+  - A nyitott pozíciók plafonja (`PAPER_SNIPER_MAX_OPEN`) 120 → 600 (2026-10-22). Az S14 kb. 35 belépés/óra mellett az
+    alap kiszállás akár 24 óráig nyitva tart; 120-nál a jelek egy része „tele volt” címkével kimaradt volna. Ez nem
+    stratégiahangolás: a belépési és kiszállási szabály nem változik, csak minden jel bekerül a mintába.
   - A jel 30 mp-nél jön, de a belépés a késés miatt kb. 60 mp-nél történik. A `/tokens` ezért az S14-jel
     kimenetelét a 60 mp-es pillanatkép árától is mutatja, ugyanazokra a tokenekre. Ha a „kivehető” ott 1,0
     alatt van, a jel a mi késésünkkel nem fizet.

@@ -60,6 +60,7 @@ EXPORT_FILES = [
     "state/paper_carry_state.json",
     "state/paper_sniper_migrations.csv",
     "state/paper_sniper_postgrad.csv",
+    "state/paper_sniper_curves.csv",
 ]
 WALLET_LOG_REL = "state/paper_sniper_wallet_trades.csv"   # nagy lehet: csak a fejléc + az utolsó sorok
 TOKEN_LOG_REL = "state/paper_sniper_tokens.csv"

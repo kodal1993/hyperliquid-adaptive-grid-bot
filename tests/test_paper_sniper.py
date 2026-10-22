@@ -21,7 +21,8 @@ def load_sniper(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_loader("paper_sniper_test", loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
-    for name in ("STATE_FILE", "DB_FILE", "TRADES_FILE", "TOKEN_LOG", "MIGR_LOG", "POSTGRAD_LOG", "WALLET_LOG", "STOP_FILE", "LOCK_FILE"):
+    for name in ("STATE_FILE", "DB_FILE", "TRADES_FILE", "TOKEN_LOG", "MIGR_LOG", "POSTGRAD_LOG", "WALLET_LOG", "CURVE_LOG",
+                 "STOP_FILE", "LOCK_FILE"):
         monkeypatch.setattr(mod, name, tmp_path / getattr(mod, name).name)
     monkeypatch.setattr(mod, "STATE_DIR", tmp_path)
     monkeypatch.setattr(mod, "load_env", lambda: None)
@@ -98,6 +99,8 @@ def test_decode_trade_event_fixture_lines(tmp_path, monkeypatch):
             assert ev["fee"] == pytest.approx(ev["solAmount"] * 0.0125, rel=0.01)   # 95 + 30 bps
         if exp.get("mayhemMode"):                                        # a mayhem-gorbe NEM a 30 SOL-os (V0_SOL nem ervenyes)
             assert ev["vSolInBondingCurve"] - real_sol / 1e9 < 5
+        assert ev["realSol"] == pytest.approx(exp["realSol"], abs=1e-9)
+        assert ev["mayhem"] is exp["mayhemMode"]                        # az ix_name string utani bool
 
 
 def test_decode_trade_event_rejects_other_events(tmp_path, monkeypatch):
@@ -389,3 +392,62 @@ def test_reports_show_open_positions_per_strategy(tmp_path, monkeypatch):
     assert "Nyitott osszesen: 4 (ebbol kivezetett strategiae, meg lezarulnak: S8_masol 1)" in tg
     monkeypatch.setenv("PAPER_SNIPER_STRATS", "S13_amm")                  # a konfig mar mast mond: ujrainditas kell
     assert "/restart_sniper" in mod.telegram_report(2)
+
+
+# ---------------------------------------------------------------- gorbe: valodi SOL, mayhem
+def test_curve_kind_from_trade_events_and_curve_log(tmp_path, monkeypatch):
+    mod = load_sniper(tmp_path, monkeypatch)
+    S = make_sniper(mod)
+    assert S.max_open == 600                                             # az S14 alap 24 oraig tart: sok nyitott pozicio
+    w, dev = "W" * 40, "D" * 40
+    S.wallets[w] = [3, 1, 0.0, 0]
+    kinds = {"M" * 40: (2.754909464, 0.093446296, True), "N" * 40: (30.742777365, 0.742777365, False),
+             "P" * 40: (12.342642748, 1.316464536, None)}
+    for mint, (vs, rs, mh) in kinds.items():
+        T = tracked_token(mod, S, mint, dev, time.time() - 2000)
+        m = trade(w, mint, "buy", 0.5, 1e6, vs, 0.00625)
+        m.update(realSol=rs, mayhem=mh)
+        S.on_trade(m, T["t"] + 60)
+        assert T["rs"] == rs and T["v0"] == pytest.approx(vs - rs, abs=1e-4)
+        assert S.token_features(T)["rsol"] == pytest.approx(rs, abs=1e-3)   # nem a virtualis - 30
+        assert T["tr"][w][4] == pytest.approx(rs)                        # a tarca belepesi 'gorbe SOL'-ja is
+    S.finalize_tracked()
+    codes = mod.load_curve_log()
+    assert codes == {"M" * 40: 1, "N" * 40: 0, "P" * 40: 2}             # mayhem, szabvanyos, egyeb (jelzo nelkul)
+    assert S.stats["curves"] == {"mayhem": 1, "szabvanyos": 1, "egyeb": 1}
+    assert mod.curve_kind(None, None) == "ismeretlen" and mod.curve_kind(30.0, False) == "szabvanyos"
+
+
+def test_tokens_and_wallets_reports_show_curve_band(tmp_path, monkeypatch):
+    mod = load_sniper(tmp_path, monkeypatch)
+    with mod.CURVE_LOG.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["ts", "mint", "v0", "mayhem"])
+        for i in range(100):
+            w.writerow([1, f"mint{i:03d}", 2.66 if i % 2 else 30.0, int(i % 2 == 1)])
+    rows = []
+    for i in range(100):
+        base = {k: 0 for k in mod.TOKEN_FEATS}
+        for h in ("30", "60"):
+            rows.append(dict(base, ts=1000 + i, mint=f"mint{i:03d}", h=h, died=0, buy_sol=1, px=1.0,
+                             max_mult=4.0 if i % 2 else 1.1, final_mult=1.0))
+    with mod.TOKEN_LOG.open("w", newline="") as f:
+        wr = csv.DictWriter(f, fieldnames=mod.TOKEN_FIELDS)
+        wr.writeheader()
+        wr.writerows(rows)
+    text = mod.tokens_report("30")
+    sec = text[text.index("gorbe (-1 ismeretlen"):].splitlines()
+    assert any(ln.strip().startswith("1-2") and "100.0%" in ln for ln in sec[1:4])     # a mayhem-sav: minden nyero
+    assert any(ln.strip().startswith("0-1") and "  0.0%" in ln for ln in sec[1:4])      # a szabvanyos: egy sem
+
+    smart = "S" * 40
+    db = {"wallets": {smart: [10, 8, 5.0, 0]}}
+    mod.DB_FILE.write_text(json.dumps(db))
+    with mod.WALLET_LOG.open("w", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(mod.WALLET_FIELDS)
+        for i in range(10):
+            wr.writerow([1000 + i, f"mint{i:03d}", smart, 5, 1, 0, 30, 5, 1.0, 1.2, 0, 0.2, 20, 60, 1, 1, 1, 10, 0])
+    wt = mod.wallets_report()
+    assert "a token gorbeje" in wt and "mayhem" in wt.split("a token gorbeje")[1].split("\n\n")[0]
+    assert "mayhem 50% (n=10)" in wt                                     # a legjobb okos tarca tokenjeinek fele mayhem
