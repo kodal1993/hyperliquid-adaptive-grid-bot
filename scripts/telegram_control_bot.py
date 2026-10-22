@@ -108,7 +108,7 @@ HELP_TEXT = """🤖 PAPÍR-BOTOK VEZÉRLÉSE (valódi pénz nélkül)
 ▶️ /start_sniper, /start_carry - indítás
 ⬇️ /pull - git pull --rebase + papír-szolgáltatások újraindítása
 ⚙️ /set - papír-beállítások listája; /set KULCS=ÉRTÉK beírja (sniper: a saját konfigjába, ha izolált; utána /restart_sniper)
-   pl. /set PAPER_SNIPER_STRATS=S8_masol,S10_bennfentes,S13_amm,S14_volumen ; /unset KULCS törli
+   pl. /set PAPER_SNIPER_STRATS=S10_bennfentes,S13_amm,S14_volumen ; /unset KULCS törli
 📦 /version - melyik kód fut, van-e telepítetlen PR, kell-e újraindítás
 📤 /export - CSV-k, állapotfájlok és diag egy zip-ben (elemzéshez)
 🧭 /menu - gombos menü
@@ -160,8 +160,25 @@ def register_bot_commands(token: str) -> None:
     requests.post(telegram_api(token, "setMyCommands"), json={"commands": BOT_COMMANDS}, timeout=15).raise_for_status()
 
 
+def split_message(text: str, limit: int = MAX_MESSAGE_LEN) -> list[str]:
+    """darabolás sorhatáron, hogy egy szám vagy táblázatsor ne törjön ketté; a limitnél hosszabb sor kemény vágással"""
+    chunks: list[str] = []
+    cur: list[str] = []
+    size = 0
+    for line in text.split("\n"):
+        for piece in [line[i : i + limit] for i in range(0, len(line), limit)] or [""]:
+            if cur and size + 1 + len(piece) > limit:
+                chunks.append("\n".join(cur))
+                cur, size = [], 0
+            size += len(piece) + (1 if cur else 0)
+            cur.append(piece)
+    if cur:
+        chunks.append("\n".join(cur))
+    return [c for c in chunks if c.strip()] or [text]
+
+
 def send_message(token: str, chat_id: str, text: str, reply_markup: dict[str, Any] | None = None) -> bool:
-    chunks = [text[i : i + MAX_MESSAGE_LEN] for i in range(0, len(text), MAX_MESSAGE_LEN)] or [text]
+    chunks = split_message(text)
     for idx, chunk in enumerate(chunks):
         payload: dict[str, Any] = {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True}
         if reply_markup is not None and idx == len(chunks) - 1:

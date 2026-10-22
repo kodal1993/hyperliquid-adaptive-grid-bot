@@ -74,7 +74,7 @@ def closed(mod):
 def test_decode_trade_event_fixture_lines(tmp_path, monkeypatch):
     mod = load_sniper(tmp_path, monkeypatch)
     cases = json.loads((FIXTURES / "pump_trade_events.json").read_text())
-    assert cases
+    assert any(c["source"].startswith("VALODI") for c in cases)            # legalabb egy valodi, lancrol vett sor
     for case in cases:
         assert case["line"].startswith("Program data: vdt/007mYe")      # TradeEvent discriminator base64-ben
         ev = mod.decode_trade_event(case["line"][len("Program data: "):])
@@ -82,14 +82,22 @@ def test_decode_trade_event_fixture_lines(tmp_path, monkeypatch):
         assert ev is not None, case["source"]
         for k in ("txType", "mint", "traderPublicKey", "ts"):
             assert ev[k] == exp[k], k
-        for k in ("solAmount", "tokenAmount", "vSolInBondingCurve", "vTokensInBondingCurve"):
-            assert ev[k] == pytest.approx(exp[k], rel=1e-9), k
-        # fuggetlen ellenorzes az eltolasokra: a gorbe szorzata allando, a valodi SOL = virtualis - 30
-        assert ev["vSolInBondingCurve"] * ev["vTokensInBondingCurve"] == pytest.approx(mod.K_CURVE, rel=1e-3)
+        for k in ("solAmount", "tokenAmount", "vSolInBondingCurve", "vTokensInBondingCurve", "fee"):
+            assert ev[k] == pytest.approx(exp[k], rel=1e-9, abs=1e-12), k
+        # fuggetlen ellenorzes az eltolasokra: a valodi tartalekok a 113. bajttol; a token-oldal minden gorben
+        # a szabvanyos kinalatbol indul (1073M virtualis, 793.1M valodi), ezert a kulonbseg mindig 279.9M token
         raw = base64.b64decode(case["line"][len("Program data: "):])
-        real_sol, = struct.unpack_from("<Q", raw, 113)
-        assert real_sol / 1e9 == pytest.approx(ev["vSolInBondingCurve"] - mod.V0_SOL, abs=1e-6)
-        assert real_sol / 1e9 == pytest.approx(exp["realSol"], abs=1e-6)
+        real_sol, real_tok = struct.unpack_from("<QQ", raw, 113)
+        assert real_sol / 1e9 == pytest.approx(exp["realSol"], abs=1e-9)
+        assert real_tok / 1e6 == pytest.approx(exp["realTok"], rel=1e-12)
+        assert ev["vTokensInBondingCurve"] - real_tok / 1e6 == pytest.approx(279.9e6, rel=1e-9)
+        assert real_sol / 1e9 <= ev["vSolInBondingCurve"]
+        if exp.get("standardCurve"):                                     # szabvanyos gorbe: allando szorzat, 30 SOL virtualis
+            assert ev["vSolInBondingCurve"] * ev["vTokensInBondingCurve"] == pytest.approx(mod.K_CURVE, rel=1e-3)
+            assert real_sol / 1e9 == pytest.approx(ev["vSolInBondingCurve"] - mod.V0_SOL, abs=1e-6)
+            assert ev["fee"] == pytest.approx(ev["solAmount"] * 0.0125, rel=0.01)   # 95 + 30 bps
+        if exp.get("mayhemMode"):                                        # a mayhem-gorbe NEM a 30 SOL-os (V0_SOL nem ervenyes)
+            assert ev["vSolInBondingCurve"] - real_sol / 1e9 < 5
 
 
 def test_decode_trade_event_rejects_other_events(tmp_path, monkeypatch):
@@ -99,6 +107,102 @@ def test_decode_trade_event_rejects_other_events(tmp_path, monkeypatch):
     line = json.loads((FIXTURES / "pump_trade_events.json").read_text())[0]["line"][len("Program data: "):]
     assert mod.decode_trade_event(base64.b64encode(base64.b64decode(line)[:100]).decode()) is None   # csonka
     assert mod.decode_trade_event("nem base64!!") is None
+    old = mod.decode_trade_event(base64.b64encode(base64.b64decode(line)[:113]).decode())   # regi, rovid elrendezes
+    assert old is not None and old["fee"] is None
+
+
+# ---------------------------------------------------------------- tarca-elszamolas
+def tracked_token(mod, S, mint, dev, t):
+    """ugyanazok a mezok, mint a track()-ben (call_later nelkul)"""
+    T = {"mint": mint, "curve": "C" + mint, "dev": dev, "t": t, "name": mint, "symbol": "X", "done": set(), "copy": False,
+         "tr": {}, "buyers": set(), "early_tok": 0.0, "n_buy": 0, "n_sell": 0, "dev_sold": False, "px": None, "smart": set(),
+         "pt": [], "pp": [], "leaders": {}, "snaps": {}, "pmax": {}, "buy_sol": 0.0, "max_in": 0.0, "losers": set(),
+         "vs": mod.V0_SOL, "cslot": None}
+    S.tokens[mint] = S.tracked[mint] = T
+    return T
+
+
+def trade(w, mint, side, sol, tok, vsol, fee):
+    return {"txType": side, "mint": mint, "traderPublicKey": w, "solAmount": sol, "tokenAmount": tok,
+            "vSolInBondingCurve": vsol, "vTokensInBondingCurve": mod_K / vsol, "fee": fee}
+
+
+mod_K = 30.0 * 1.073e9
+
+
+def wallet_rows(mod, w="W" * 40):
+    """a tarca naplosorai mint szerint (mas tarcak sora az 5%-os veletlen mintaba eshet)"""
+    with mod.WALLET_LOG.open() as f:
+        return {r["mint"]: r for r in csv.DictReader(f) if r["wallet"] == w}
+
+
+def test_wallet_pnl_includes_the_wallets_own_fees(tmp_path, monkeypatch):
+    mod = load_sniper(tmp_path, monkeypatch)
+    S = make_sniper(mod)
+    w, dev, mint = "W" * 40, "D" * 40, "F" * 40
+    S.wallets[w] = [3, 1, 0.0, 0]                                        # visszatero tarca: a naploba kerul
+    T = tracked_token(mod, S, mint, dev, time.time() - 2000)
+    S.on_trade(trade(w, mint, "buy", 1.0, 3e7, 40.0, 0.0125), T["t"] + 60)
+    S.on_trade(trade(w, mint, "sell", 0.6, 1.5e7, 39.0, 0.0075), T["t"] + 90)
+    S.finalize_tracked()
+    px = 39.0 / (mod_K / 39.0)
+    rem = 1.5e7 * px * (1 - S.fee)
+    exp = 0.6 + rem - 1.0 - (0.0125 + 0.0075)
+    assert float(wallet_rows(mod)[mint]["pnl"]) == pytest.approx(exp, abs=1e-4)
+    assert S.wallets[w][2] == pytest.approx(exp, abs=1e-4)
+    # dijmezo nelkul (regi esemeny): a konfig szerinti 1.25% / irany
+    m2 = "G" * 40
+    T2 = tracked_token(mod, S, m2, dev, time.time() - 2000)
+    b, sl = trade(w, m2, "buy", 1.0, 3e7, 40.0, None), trade(w, m2, "sell", 0.6, 1.5e7, 39.0, None)
+    S.on_trade(b, T2["t"] + 60)
+    S.on_trade(sl, T2["t"] + 90)
+    S.finalize_tracked()
+    assert float(wallet_rows(mod)[m2]["pnl"]) == pytest.approx(0.6 + rem - 1.0 - 1.6 * S.fee, abs=1e-4)
+
+
+def test_graduated_token_waits_for_pumpswap_price(tmp_path, monkeypatch):
+    mod = load_sniper(tmp_path, monkeypatch)
+    S = make_sniper(mod)
+    w, dev, mint = "W" * 40, "D" * 40, "H" * 40
+    S.wallets[w] = [3, 1, 0.0, 0]
+    T = tracked_token(mod, S, mint, dev, time.time() - 2000)
+    S.on_trade(trade(w, mint, "buy", 1.0, 2e7, 80.0, 0.0125), T["t"] + 60)
+    S.on_trade(trade("V" * 40, mint, "buy", 5.0, 1e7, 115.0, 0.0625), T["t"] + 400)   # a graduacio elotti csucs
+    S.on_migrate({"mint": mint})
+    assert T["grad_t"] and mint in S.postgrad_due
+    S.finalize_tracked()
+    assert mint in S.tracked                                             # var a PumpSwap-arra
+    curve_px = T["px"]
+    S.record_postgrad([mint], {mint: {"px": curve_px * 0.4, "liq": 20000.0}}, time.time())
+    assert T["px_amm"] == pytest.approx(curve_px * 0.4)
+    S.finalize_tracked()
+    assert mint not in S.tracked
+    rem = 2e7 * curve_px * 0.4 * (1 - S.amm_fee)                         # PumpSwap-ar es AMM-dij, nem a gorbe csucsa
+    assert float(wallet_rows(mod)[mint]["pnl"]) == pytest.approx(rem - 1.0 - 0.0125, abs=1e-4)
+    # ha a DexScreener nem adott arat: a probalkozasok utan a gorbe araval elszamolva, nem var orokke
+    m2 = "J" * 40
+    T2 = tracked_token(mod, S, m2, dev, time.time() - 2000)
+    S.on_trade(trade(w, m2, "buy", 1.0, 2e7, 80.0, 0.0125), T2["t"] + 60)
+    S.on_migrate({"mint": m2})
+    for _ in range(3):
+        S.record_postgrad([m2], {}, time.time())
+    S.finalize_tracked()
+    assert m2 not in S.tracked and m2 in wallet_rows(mod)
+
+
+def test_s8_retired_and_old_strat_list_still_works(tmp_path, monkeypatch):
+    mod = load_sniper(tmp_path, monkeypatch)
+    assert "S8_masol" not in mod.STRAT_DESC
+    monkeypatch.setenv("PAPER_SNIPER_STRATS", "S8_masol,S10_bennfentes,S13_amm,S14_volumen")
+    S = make_sniper(mod)
+    assert S.strats == ["S10_bennfentes", "S13_amm", "S14_volumen"]
+    # egy masolhato tarca vetele mar nem nyit poziciot
+    w, mint = "W" * 40, "K" * 40
+    S.wallets[w] = [20, 15, 5.0, 0, 20, 18, 4.0, 1.0]
+    assert S.is_copyable(w)
+    T = tracked_token(mod, S, mint, "D" * 40, time.time())
+    S.on_trade(trade(w, mint, "buy", 1.0, 3e7, 40.0, 0.0125), time.time())
+    assert T["leaders"] == {} and T["done"] == set()
 
 
 # ---------------------------------------------------------------- gorbe-matek
@@ -129,7 +233,7 @@ def test_poll_once_alap_tp_sl_and_time(tmp_path, monkeypatch):
     mod = load_sniper(tmp_path, monkeypatch)
     S = make_sniper(mod)
     p_tp = open_position(mod, S, "S10_bennfentes", "TPmint", 40.0)
-    p_sl = open_position(mod, S, "S10_bennfentes", "SLmint", 60.0)
+    open_position(mod, S, "S10_bennfentes", "SLmint", 60.0)
     p_t = open_position(mod, S, "S10_bennfentes", "IDOmint", 40.0)
     assert set(p_tp["exits"]) == {"alap", "masol"}
     p_t["t_open"] -= 31 * 60                                             # alap: max 30 perc
@@ -242,3 +346,46 @@ def test_tokens_s14_outcome_from_60s_snapshot(tmp_path, monkeypatch):
     e60 = next(ln for ln in lines if ln.strip().startswith("ellenorzo") and "60 mp-es ar" in ln)
     assert "   3 /" in e60
     assert "alapvonal (minden token, 60 mp-es ar): 0.0% (n=70)" in sec
+
+
+# ---------------------------------------------------------------- strategia-lista, nyitott poziciok
+def test_strat_warnings_unknown_missing_and_restart(tmp_path, monkeypatch):
+    mod = load_sniper(tmp_path, monkeypatch)
+    monkeypatch.setenv("PAPER_SNIPER_STRATS", "S8_masol,S10_bennfentes")
+    w = mod.strat_warnings({"strats": ["S10_bennfentes"]})
+    assert any("ismeretlen" in x and "S8_masol" in x for x in w)
+    assert any(x.startswith("nem fut: S13_amm, S14_volumen") for x in w)
+    assert not any("ujrainditas" in x for x in w)
+    monkeypatch.setenv("PAPER_SNIPER_STRATS", "")                       # ures = mind fut ...
+    w = mod.strat_warnings({"strats": ["S10_bennfentes"]})               # ... de a futo peldany meg a regi listaval
+    assert any(x.startswith("nem fut: S13_amm, S14_volumen") for x in w) and any("/restart_sniper" in x for x in w)
+    assert mod.strat_warnings({"strats": list(mod.STRAT_DESC)}) == []
+    assert mod.strat_warnings({}) == []                                  # regi allapotfajl: csak a konfig szamit
+    S = make_sniper(mod)
+    S.save(db=False)
+    assert json.loads(mod.STATE_FILE.read_text())["stats"]["strats"] == list(mod.STRAT_DESC)
+
+
+def test_reports_show_open_positions_per_strategy(tmp_path, monkeypatch):
+    mod = load_sniper(tmp_path, monkeypatch)
+    pos = [{"strat": "S13_amm", "t_open": time.time()}] * 2 + [{"strat": "S14_volumen", "t_open": time.time()},
+                                                                {"strat": "S8_masol", "t_open": time.time()}]
+    now = time.time()
+    mod.STATE_FILE.write_text(json.dumps({"positions": pos, "saved": now,
+                                          "stats": {"started": now - 3600, "strats": ["S10_bennfentes", "S13_amm", "S14_volumen"]}}))
+    with mod.TRADES_FILE.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(mod.TRADE_FIELDS)
+        for i in range(3):
+            w.writerow([round(now) - 600, round(now) - 60, "S14_volumen", f"m{i}", "n", "s", 60, 40, 41, 0.101, 0.11, 0.009, 9, "trail", 540, 0])
+    text = mod.report_text()
+    assert "S13_amm: meg nincs lezart pozicio, nyitott most 2" in text
+    assert "S10_bennfentes: meg nincs lezart pozicio, nyitott most 0" in text   # fut, de meg semmi
+    assert "lezart poziciok: 3   nyitott most: 1" in text
+    assert "S8_masol 1" in text and "meg lezarulnak" in text
+    tg = mod.telegram_report(2)
+    assert "S13_amm: meg nincs lezart | nyitott 2" in tg
+    assert any(ln.startswith("S14_volumen: 3 |") and "| 1  [" in ln for ln in tg.splitlines())
+    assert "Nyitott osszesen: 4 (ebbol kivezetett strategiae, meg lezarulnak: S8_masol 1)" in tg
+    monkeypatch.setenv("PAPER_SNIPER_STRATS", "S13_amm")                  # a konfig mar mast mond: ujrainditas kell
+    assert "/restart_sniper" in mod.telegram_report(2)

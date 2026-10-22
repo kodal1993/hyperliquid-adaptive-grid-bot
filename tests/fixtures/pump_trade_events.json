@@ -1,5 +1,26 @@
 [
   {
+    "source": "VALODI: a VPS /diag 'minta TradeEvent' sora (2026-10-22 10:25, slot 459966561). A varhato ertekek a hivatalos IDL (@pump-fun/pump-sdk 4.2.0, TradeEvent, 36 mezo) teljes borsh-elemzesebol (391 bajt, maradek nelkul), a sniper dekoderetol fuggetlenul. Mayhem-modu token: dij 0, a gorbe indulo virtualis SOL-ja ~2.66 (nem 30).",
+    "signature": "2zG6iu1UdzYnac38ty57DmM8YLHmriRoEQsaJcCVdYDbRP3tgZQ7NRiqECDGaosK4TvL3Weqxght7XQJLBMEd1hA",
+    "slot": 459966561,
+    "line": "Program data: vdt/007mYe6Pu6qm7cazMLqplPKu+N3Tom5oo4qR7OxKbmchUsaOP81DaAEAAAAAObiQr1gGAAAAootf0mq0eaapzGy/awsj62GIWjceASCsqRO+7z0TinhtyNlqAAAAABiVNKQAAAAAKjsZ53GZAwCY4JEFAAAAACqjBpvgmgIA6JMUH7GOnxV02BDheOGeMGBOMXWqLkoy38hgByfRBwkAAAAAAAAAAAAAAAAAAAAAXJT3gmFX1bcE/NmJAkdD6IqEwrv0RefDhKgJ8X4wwo8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAHNlbGwBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADNQ2gBAAAAABiVNKQAAAAAmOCRBQAAAAAAAAAAAAAAAAAAAAAAAAAAnPk/AAAAAAAAAAAAAAAAAA==",
+    "expected": {
+      "txType": "sell",
+      "mint": "Ag5Gu1SwMLQeeDRcoR74TDcYb7oJCm23z91tXYKxpump",
+      "traderPublicKey": "BwWK17cbHxwWBKZkUYvzxLcNQ1YVyaFezduWbtm2de6s",
+      "solAmount": 0.023610317,
+      "tokenAmount": 6977972.385849,
+      "vSolInBondingCurve": 2.754909464,
+      "vTokensInBondingCurve": 1013139417.676586,
+      "ts": 1792657517,
+      "fee": 0.0,
+      "realSol": 0.093446296,
+      "realTok": 733239417.676586,
+      "ixName": "sell",
+      "mayhemMode": true
+    }
+  },
+  {
     "source": "SZINTETIKUS: a pump.fun hivatalos IDL-je (@pump-fun/pump-sdk 4.2.0, TradeEvent, 36 mezo) szerint kodolva, mert a fejlesztoi kornyezet nem eri el a Solana RPC-t. Valodi sorra cserelendo: /diag 'minta TradeEvent' sor.",
     "signature": null,
     "line": "Program data: vdt/007mYe4xj1l/6ZXSxENNpbrMIxTfO22auaIUuT4MsuxxbUSqowBlzR0AAAAAoQkvNwkJAAAB0TqWh38uJk27lbeTKxShZWwKIF4W2JSvutIu0zCFlX9AitlqAAAAAAD1/G0JAAAAXwKzPuHSAgAASdlxAgAAAF9qoPJP1AEAgBaqeIuvihVn0Y+eGh+4+n1TlpwYJWIWmvsjU30xBtlfAAAAAAAAALB6SAAAAAAABXgQ9ajszumV+5q/n7ljBmw5nM2ayjvdo5RianYaOPoeAAAAAAAAAGDjFgAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAZc0dAAAAAECK2WoAAAAAAwAAAGJ1eQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -12,7 +33,10 @@
       "vSolInBondingCurve": 40.5,
       "vTokensInBondingCurve": 794814814.814815,
       "ts": 1792641600,
-      "realSol": 10.5
+      "realSol": 10.5,
+      "fee": 0.00625,
+      "realTok": 514914814.81481504,
+      "standardCurve": true
     }
   }
 ]
