@@ -21,6 +21,28 @@
     }
   },
   {
+    "source": "VALODI: a VPS /diag 'minta TradeEvent' sora (2026-10-22 11:25, slot 459983200). A varhato ertekek a hivatalos IDL (@pump-fun/pump-sdk 4.2.0) teljes borsh-elemzesebol (391 bajt, maradek nelkul). Szabvanyos gorbe: virtualis SOL - valodi SOL = 30, dij 95 + 30 bps (a buyback_fee 5000 bps a protokoll-dij fele, nem kulon dij).",
+    "signature": "5pT75LXQN7CHPsrtCmWNVEWrjHNvfwTQdRCuHuNiu6unWkc2WipqjhqGESx1j7qYKvLrrgdRdAhQGfckWzgGVXiU",
+    "slot": 459983200,
+    "line": "Program data: vdt/007mYe481G+ZRcaGCgp66dM/0BNoo1DT+nyoDBpeIBGOyVcZSc00bywAAAAAHAByw4sWAAAAfz4GdJsoHXmX5sK6sv/9DMdLXUWF1xYh+LiLWBFjVXJG1tlqAAAAABWOaSgHAAAAoNjeMU+4AwAV4kUsAAAAAKBAzOW9uQIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABfAAAAAAAAAIEQbAAAAAAASUZrZGGLbMWQQg9v1qZbJR8BIazWHlJqnTxfTs6+oOweAAAAAAAAACkgIgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAHNlbGwAAAAAAAAAAAAAAAAAAAAAAIgTAAAAAAAAQAg2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADNNG8sAAAAABWOaSgHAAAAFeJFLAAAAAAAAAAAAAAAAAAAAAAAAAAAKSAiAAAAAAAAAAAAAAAAAA==",
+    "expected": {
+      "txType": "sell",
+      "mint": "56TLo55Tmk7uZgHEgWvQruDKs7Ps7Xb6rr3z7shZ8dRr",
+      "traderPublicKey": "9ZhdiX72ZNsoia9Yg4rjnJzL1VSQvbMvCZEhVJQvNCau",
+      "solAmount": 0.745485517,
+      "tokenAmount": 24789535.293468,
+      "vSolInBondingCurve": 30.742777365,
+      "vTokensInBondingCurve": 1047075208.747168,
+      "ts": 1792661062,
+      "fee": 0.00931857,
+      "realSol": 0.742777365,
+      "realTok": 767175208.747168,
+      "ixName": "sell",
+      "mayhemMode": false,
+      "standardCurve": true
+    }
+  },
+  {
     "source": "SZINTETIKUS: a pump.fun hivatalos IDL-je (@pump-fun/pump-sdk 4.2.0, TradeEvent, 36 mezo) szerint kodolva, mert a fejlesztoi kornyezet nem eri el a Solana RPC-t. Valodi sorra cserelendo: /diag 'minta TradeEvent' sor.",
     "signature": null,
     "line": "Program data: vdt/007mYe4xj1l/6ZXSxENNpbrMIxTfO22auaIUuT4MsuxxbUSqowBlzR0AAAAAoQkvNwkJAAAB0TqWh38uJk27lbeTKxShZWwKIF4W2JSvutIu0zCFlX9AitlqAAAAAAD1/G0JAAAAXwKzPuHSAgAASdlxAgAAAF9qoPJP1AEAgBaqeIuvihVn0Y+eGh+4+n1TlpwYJWIWmvsjU30xBtlfAAAAAAAAALB6SAAAAAAABXgQ9ajszumV+5q/n7ljBmw5nM2ayjvdo5RianYaOPoeAAAAAAAAAGDjFgAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAZc0dAAAAAECK2WoAAAAAAwAAAGJ1eQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
