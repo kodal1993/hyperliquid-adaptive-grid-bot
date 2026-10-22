@@ -493,3 +493,33 @@ def test_oversold_wallet_is_not_smart_and_reports_list_it(tmp_path, monkeypatch)
     text = mod.wallets_report()
     assert "GGGGGG..GGGG" in text and "tuladott 1/20" in text
     assert "kizarva az okosok kozul" in text and "AAAAAA..AAAA  tuladott 3/5" in text
+
+
+# ---------------------------------------------------------------- /wallets: szerencse vagy tudas, hibahatarral
+def _skill_log(mod, second_good, second_rest):
+    with mod.WALLET_LOG.open("w", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(mod.WALLET_FIELDS)
+        for i in range(20):
+            first = 20 if i < 10 else -20                                # az elso fele alapjan: 10 jo, 10 tobbi
+            for k in range(10):
+                ret = first if k < 5 else (second_good if i < 10 else second_rest)[k % 2]
+                wr.writerow([1000 + k, f"m{i}{k}", f"{chr(65 + i)}" * 40, 5, 0, 0, 30, 5, 1.0, 1.0, 0, ret / 100, ret,
+                             60, 1, 1, 1, 10, 0])
+    return mod.wallets_report()
+
+
+def test_wallet_skill_verdict_needs_significance(tmp_path, monkeypatch):
+    mod = load_sniper(tmp_path, monkeypatch)
+    same = _skill_log(mod, (10, -10), (10, -10))                         # a masodik fele egyforma: nincs tudas
+    assert "atlagos hozam" in same and same.count("nem bizonyitott kulonbseg") == 2
+    assert "van kitarto tudas" not in same
+    small = _skill_log(mod, (11, -10), (10, -10))                        # +0.4 %-pont, a hibahataron belul (a riport +0.3-as esete)
+    line_s = next(ln for ln in small.splitlines() if "-> atlagos hozam" in ln)
+    assert "+0.4%-ponttal" in line_s and "nem bizonyitott kulonbseg" in line_s
+    diff = _skill_log(mod, (30, 25), (-30, 5))                           # a jok a masodik felben is jobbak
+    line_a = next(ln for ln in diff.splitlines() if "-> atlagos hozam" in ln)
+    line_w = next(ln for ln in diff.splitlines() if "-> nyero arany" in ln)
+    assert "jobbak (statisztikailag)" in line_a and "jobbak (statisztikailag)" in line_w
+    assert "100% vs 60%" in line_w
+    assert mod.num(float("nan")) == "-" and mod.num(1.234) == "1.2"

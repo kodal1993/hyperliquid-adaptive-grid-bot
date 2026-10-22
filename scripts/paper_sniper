@@ -1802,6 +1802,18 @@ def _bucket_table(rows, title, key, edges, fmt):
     return out if len(out) > 1 else []
 
 
+def num(x, spec=".1f"):
+    """szam formazasa, adat nelkul (nan) '-'"""
+    return "-" if x is None or (isinstance(x, float) and math.isnan(x)) else format(x, spec)
+
+
+def diff_verdict(d, ci):
+    """ket csoport kulonbsege a 95%-os hibahatarral: csak akkor eldontott, ha a hibahatar nem metszi a 0-t"""
+    if math.isnan(ci):
+        return "keves adat"
+    return "jobbak (statisztikailag)" if d - ci > 0 else ("rosszabbak (statisztikailag)" if d + ci < 0 else "nem bizonyitott kulonbseg")
+
+
 def _profile(rows):
     sold = [r["hold_s"] for r in rows if r["hold_s"] >= 0]
     return {"n": len(rows),
@@ -1995,7 +2007,7 @@ def wallets_report():
             out.append(f"  {name:15s} {len(g):7d}  (keves adat)")
             continue
         q = _profile(g)
-        out.append(f"  {name:15s} {q['n']:7d} {q['kor']:7.0f} {q['gorbe']:9.1f} {q['tetel']:6.2f} {q['tartas']:9.0f} {q['eladott']:8.0f}"
+        out.append(f"  {name:15s} {q['n']:7d} {q['kor']:7.0f} {num(q['gorbe']):>9s} {q['tetel']:6.2f} {num(q['tartas'], '.0f'):>9s} {q['eladott']:8.0f}"
                    f" {q['nyero']:6.0f} {q['atlag']:+7.1f} {q['median']:+7.1f}")
     out.append("  kor = a token kora a tarca elso veteleig; gorbe = valodi SOL a gorbeben akkor; tartas = elso vetel -> utolso eladas")
 
@@ -2032,15 +2044,21 @@ def wallets_report():
         first, second = xs[:h], xs[h:]
         win1 = sum(1 for r in first if r["pnl"] > 0) / len(first)
         (good if win1 >= 0.5 and sum(r["pnl"] for r in first) > 0 else rest).extend(second)
+    sts = {}
     for name, g in (("elso feleben jo", good), ("tobbi", rest)):
         if g:
-            st_ = strat_stats([{"pnl_sol": r["pnl"], "ret_pct": r["ret_pct"]} for r in g])
+            st_ = sts[name] = strat_stats([{"pnl_sol": r["pnl"], "ret_pct": r["ret_pct"]} for r in g])
             ci = "" if math.isnan(st_["ci"]) else f" ±{st_['ci']:.1f}"
             out.append(f"  {name:16s} masodik fele: n={st_['n']:6d}  atlag {st_['mean']:+.1f}%{ci}  median {st_['median']:+.1f}%"
                        f"  nyero {st_['win']:.0f}%  PnL {st_['pnl']:+.2f} SOL")
     if good and rest:
-        a = sum(r["ret_pct"] for r in good) / len(good) - sum(r["ret_pct"] for r in rest) / len(rest)
-        out.append(f"  -> a 'jo' tarcak a masodik felben {a:+.1f}%-ponttal " + ("jobbak: van kitarto tudas." if a > 0 else "nem jobbak: inkabb szerencse."))
+        g_, r_ = sts["elso feleben jo"], sts["tobbi"]
+        a, ca = g_["mean"] - r_["mean"], math.sqrt(g_["ci"] ** 2 + r_["ci"] ** 2)
+        p1, p2 = g_["win"] / 100, r_["win"] / 100
+        dw, cw = (p1 - p2) * 100, 1.96 * math.sqrt(p1 * (1 - p1) / g_["n"] + p2 * (1 - p2) / r_["n"]) * 100
+        out.append(f"  -> atlagos hozam: a 'jo' tarcak a masodik felben {a:+.1f}%-ponttal (±{num(ca)}) -> {diff_verdict(a, ca)}")
+        out.append(f"  -> nyero arany: {p1 * 100:.0f}% vs {p2 * 100:.0f}% ({dw:+.0f}%-pont ±{num(cw, '.0f')}) -> {diff_verdict(dw, cw)}")
+        out.append("     (kitarto tudas csak az, ami a hibahatarral egyutt is jobb; a nyero arany az atlagnal kevesbe zajos)")
     else:
         out.append("  (meg keves a 10+ pozicios tarca)")
 
@@ -2112,7 +2130,8 @@ def wallets_report():
                 line += f", tuladott {r[8]}/{r[8] + r[9]}"
             if len(xs) >= 3:
                 q = _profile(xs)
-                line += f" | kor {q['kor']:.0f} mp, gorbe {q['gorbe']:.1f} SOL, tetel {q['tetel']:.2f}, tartas {q['tartas']:.0f} mp, mind el {q['eladott']:.0f}%"
+                line += (f" | kor {q['kor']:.0f} mp, gorbe {num(q['gorbe'])} SOL, tetel {q['tetel']:.2f}, tartas {num(q['tartas'], '.0f')} mp,"
+                         f" mind el {q['eladott']:.0f}%")
                 known = [curves.get(x["mint"], -1) for x in xs if curves.get(x["mint"], -1) >= 0]
                 if known:
                     line += f", mayhem {sum(1 for c in known if c == 1) / len(known) * 100:.0f}% (n={len(known)})"

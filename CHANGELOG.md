@@ -1,5 +1,12 @@
 # Changelog
 
+## Paper sniper: `/wallets` „szerencse vagy tudás” hibahatárral; „nan” helyett „-”
+
+- A 3. pont eddig minden pozitív különbségre azt írta, hogy „van kitartó tudás”, például +0,3 ±7 százalékpontra is. Mostantól az átlagos hozam és a nyerő arány különbsége is a 95%-os hibahatárral együtt jelenik meg, és csak akkor „jobbak (statisztikailag)”, ha a hibahatár nem metszi a 0-t.
+- Adat nélküli medián (pl. görbe-SOL) „nan” helyett „-”.
+- `docs/KISERLETEK.md`: új szabályok: korai leállítás (legalább 50 lezárt pozíción `NEGATIV` → leállítható a határidő előtt; korai siker nincs) és kódstop futó kísérlet alatt; a sniper-kártyán az ellenőrzési pontok.
+- `docs/KISERLETEK.md`: az S8-lezárás „+18,5 százalékpontos tudás” állítása javítva. A mayhem-ügynök hamis PnL-je fújta fel; a túladás-szűrés után az átlagban nincs bizonyított különbség, a nyerő arányban van.
+
 ## Paper sniper: túladott tárca-pozíciók kizárva (több tokent ad el, mint amennyit a görbén vett)
 
 - **Mérés:** ha egy tárca egy tokenből több tokent ad el, mint amennyit a görbén vett, a különbség tárca-pozíciónként számolódik. Ilyen a mayhem-ügynök extra kínálata, egy átutalással kapott token, vagy az RPC-kiesés miatt nem látott vétel.

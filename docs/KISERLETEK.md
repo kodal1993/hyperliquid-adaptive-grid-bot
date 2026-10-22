@@ -14,6 +14,11 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
 2. **Papírteszt előre rögzített feltételekkel.** A határidő, a siker és a leállítás az indulás
    előtt kerül ide, és utólag nem módosítjuk. A paraméterek hangolása addig, amíg jó nem lesz,
    tilos: egy hangolás = új kísérlet, új határidővel.
+   **Korai leállítás** (2026-10-22-től): ha egy stratégia legalább 50 lezárt pozíción a hibahatárral együtt is
+   negatív (a riport ítélete `NEGATIV`), a határidő előtt leállítható. Ez csak a veszteseket zárja ki korábban,
+   a pozitív irányba nem torzít. Korai *siker* nincs: a pozitívat a határidőig és egy friss időszakon is igazolni kell.
+   **Kódstop** (2026-10-22-től): futó kísérlet alatt csak a mérést elrontó hibát javítjuk; új jel, stratégia vagy
+   riport-funkció csak új kísérletként, a kapukérdések után.
 3. **Mérce:** a HLP vault (2026 október: kb. 3,5% APR). Ami ennél nem jobb a kockázatához mérten,
    annál egyszerűbb a HLP.
 4. **Statisztika:**
@@ -88,9 +93,11 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
     a 93 legalább 8 pozíciós tárca közül egyik sem másolható (2026-10-21). A tárcakövetés nem profitforrás.
   - 2026-10-22: **S8_masol** (másolható tárca követése). 38 144 követő-pozíció után átlag −12,5%, nyerő 24%
     (költségpadló −4,5%); az 569 legalább 8 pozíciós tárca közül egyik sem másolható (az alsó hibahatár sehol
-    nem pozitív). Az „okos” tárcák követve −2,8%, a többi −12,1%. A tárcák tudása valódi (a 3. pont szerint a
-    második felükben is 18,5 százalékponttal jobbak), de az előnyük a sebesség: a legjobb (BwWK17, 455 token)
-    saját maga 84%-ban nyer, követve 15%-ban, −3,4%-kal; medián 25 mp-nél vesz, 69 mp-en belül elad. A mérés
+    nem pozitív). Az „okos” tárcák követve −2,8%, a többi −12,1%. A „jó” tárcák a második felükben kezdetben
+    18,5 százalékponttal jobbnak tűntek, de ezt a mayhem-ügynök hamis PnL-je fújta fel. A túladás-szűrés után
+    (2026-10-22 este) az átlagos hozamban nincs bizonyított különbség (+0,3 ±7 százalékpont), a nyerő arányban van
+    (50% vs 38%): gyakrabban nyernek, de átlagban nem keresnek többet. A „legjobb” tárca (BwWK17) a mayhem-ügynök volt
+    (lásd fent); saját maga 84%-ban „nyert”, követve 15%-ban, −3,4%-kal. A mérés
     1 mp késéssel számolt, a valódi késésünk 14–55 mp. **Lezárva: kudarc**, a kódból kivezetve. A követő-mérés
     (`/wallets` 4. pont) és a tárca-adatbázis marad: jelforrás az S10-nek és a token-naplónak.
   - Ugyanekkor javítva a tárca-elszámolás két optimista torzítása: a tárca saját díjai (a TradeEvent `fee` +
@@ -122,7 +129,11 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
 - **Mérés:** Telegram `/report`; `/diag` (S13 kihagyási okok); `/export`.
 - **Siker:** legalább 50 pozíción a hibahatárral együtt pozitív, utána egy második, friss időszak. A riport
   ítélete (`POZITIV` / `NEGATIV`, kiszállás-összevetésnél `JOBB` / `ROSSZABB`) is csak 50 pozíciótól dönt.
-- **Leállítás:** a határidőre egyik sem pozitív → `systemctl stop hyperliquid-paper-sniper`.
+- **Leállítás:** a határidőre egyik sem pozitív → `systemctl stop hyperliquid-paper-sniper`. Egy stratégia korábban is
+  leáll, ha legalább 50 lezárt pozíción `NEGATIV` (lásd a 2. szabályt): kivétel a `PAPER_SNIPER_STRATS`-ból
+  (`/set`, utána `/restart_sniper`), és ide a lezárt mérések közé kerül az eredménnyel.
+- **Ellenőrzési pontok:** 2026-10-22 este (`/report`: az S14 első ítélete), 2026-10-23 este (S10, S13), 10-28 (carry),
+  11-04 (sniper határidő).
 - **Határidő:** 2026-11-04.
 
 ### HYPE funding carry (`scripts/paper_carry`) — papír
