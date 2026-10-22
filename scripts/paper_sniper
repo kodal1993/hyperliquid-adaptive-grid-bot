@@ -56,7 +56,10 @@ TARCA-ADATBAZIS
   befizetett SOL - a tarca dijai (a TradeEvent fee + creator_fee mezoje; vetelkor a gorbe SOL-jan felul
   fizeti, eladaskor abbol vonjak le). Ha a token az ablakban graduált, az elszamolas megvarja a PumpSwap-arat
   15 perccel a graduacio utan, es a maradekot azon ertekeli (a gorbe utolso ara a csucs volna).
-  A dev es a 2 mp-en beluli vevok kimaradnak. Okos: >= SMART_MIN_N token,
+  A dev es a 2 mp-en beluli vevok kimaradnak, es az a pozicio is, amelyben a tarca tobb tokent adott el, mint
+  amennyit a gorben vett (kivulrol kapott token: mayhem-ugynok extra kinalata, atutalas, vagy az RPC-kieses miatt
+  nem latott vetel; a PnL-je hamis volna). Ezeket tarcankent szamoljuk: aki az uj adatokban rendszeresen ilyen
+  ("tuladott"), az nem lehet okos. Okos: >= SMART_MIN_N token,
   nyero >= SMART_MIN_WIN, PnL >= SMART_MIN_PNL. Kovethetoseg: minden tarca-poziciohoz a KOVETO
   hozam is (belepes COPY_LAT mp-cel a veteluk utan, kiszallas az elso eladasuk utan, a mi
   dijainkkal, +500%-nal levagva); masolhato, ha >= COPY_MIN_N ilyen pozicio es atlag - 2 SE > 0.
@@ -231,6 +234,17 @@ def strat_warnings(stats):
         out.append(f"a konfig szerint ezek futnanak: {', '.join(active) or '-'}, de a futo sniper: {', '.join(running) or '-'}"
                    " — ujrainditas kell (/restart_sniper)")
     return out
+
+
+def wallet_oversold(r):
+    """a tarca-rekord (r[8]: tuladott poziciok, r[9]: tiszta poziciok a szamlalo bevezetese ota) szerint a tarca
+    rendszeresen tobb tokent ad el, mint amennyit a gorben vett: a PnL-je nem megbizhato (pl. a mayhem-ugynok)"""
+    o = r[8] if len(r) > 9 else 0
+    return o >= 3 and o >= 0.2 * (o + r[9])
+
+
+def is_smart_rec(r, n_min, win_min, pnl_min):
+    return r[0] >= n_min and r[1] / r[0] >= win_min and r[2] >= pnl_min and not wallet_oversold(r)
 
 
 def curve_kind(v0, mayhem):
@@ -717,7 +731,7 @@ class Sniper:
 
     def is_smart(self, w):
         r = self.wallets.get(w)
-        return bool(r) and r[0] >= self.smart_n and r[1] / r[0] >= self.smart_win and r[2] >= self.smart_pnl
+        return bool(r) and is_smart_rec(r, self.smart_n, self.smart_win, self.smart_pnl)
 
     def on_trade(self, m, now=None):
         now = now or time.time()
@@ -757,7 +771,7 @@ class Sniper:
         # ..., elso eladas ideje (a koveto ekkor szall ki), az elso vetel slotja, a tarca dijai (SOL)
         slot = m.get("slot")
         rec = T["tr"].setdefault(w, [0.0, 0.0, 0.0, now, (rs if rs is not None else vs - V0_SOL) if vs > 0 else -1.0, 0.0, 0, 0,
-                                     0.0, 0.0, slot if slot is not None else -1, 0.0])
+                                     0.0, 0.0, slot if slot is not None else -1, 0.0, 0.0])   # ..., dijak, tuladott token
         fee = m.get("fee")
         rec[11] += fnum(fee) if fee is not None else sol * self.fee   # a TradeEvent dija; nelkule a konfig szerinti
         if m.get("txType") == "buy":
@@ -778,6 +792,8 @@ class Sniper:
                 T["smart"].add(w)                      # a token-naplo jele (az S6 kovetes kudarc volt)
         else:
             rec[1] += sol
+            if tok > rec[2] and len(rec) > 12:
+                rec[12] += tok - rec[2]                # tobbet ad el, mint amennyit a gorben vett (kivulrol kapott token)
             rec[2] = max(0.0, rec[2] - tok)
             rec[5] = now
             rec[7] += 1
@@ -879,6 +895,15 @@ class Sniper:
             si, so, tk, t0 = rec[:4]
             if w == T["dev"] or self.is_early(T, t0, rec[10] if len(rec) > 10 else None) or si < 0.02:
                 continue                          # dev, korai (nem kovetheto) vagy por-meretu
+            r = self.wallets.setdefault(w, [0, 0, 0.0, now])
+            while len(r) < 10:
+                r.append(0)                       # koveto: poziciok, nyero, hozam-osszeg, negyzetosszeg; tuladott, tiszta
+            if len(rec) > 12 and rec[12] > max(1.0, 0.01 * rec[8]):
+                r[8] += 1                         # kivulrol kapott tokent adott el: a PnL-je hamis, kimarad
+                r[3] = round(now)
+                self.stats["wallet_oversold"] = self.stats.get("wallet_oversold", 0) + 1
+                continue
+            r[9] += 1
             rem = tk * px * (1 - sell_fee) if px else 0.0
             pnl = so + rem - si - (rec[11] if len(rec) > 11 else 0.0)   # a tarca sajat dijai is
             prior = self.wallets.get(w)
@@ -890,9 +915,6 @@ class Sniper:
                                              round(t0 - T["t"], 1), round(e_rsol, 2), round(si, 4), round(so, 4), round(rem, 4),
                                              round(pnl, 4), round(pnl / si * 100, 1), round((t_sell or now) - t0) if t_sell else -1,
                                              round(1 - tk / mx, 3) if mx > 0 else 0.0, nb, ns, len(T["buyers"]), early_pct])
-            r = self.wallets.setdefault(w, [0, 0, 0.0, now])
-            while len(r) < 8:
-                r.append(0)                       # koveto: poziciok, nyero, hozam-osszeg, negyzetosszeg
             entry = self.px_at(T, t0 + self.copy_lat)
             if entry:
                 t_sell = rec[9] if len(rec) >= 10 else 0.0
@@ -1953,7 +1975,7 @@ def wallets_report():
         return "Meg nincs viselkedesnaplo (state/paper_sniper_wallet_trades.csv). Az uj kod indulasa utan ~15 perc mulva jon az elso."
     db = read_json(DB_FILE, {}).get("wallets", {})
     mn, mw, mp = cfg("PAPER_SNIPER_SMART_MIN_N", 5, int), cfg("PAPER_SNIPER_SMART_MIN_WIN", 0.5), cfg("PAPER_SNIPER_SMART_MIN_PNL", 0.5)
-    smart_now = {w for w, r in db.items() if r[0] >= mn and r[1] / r[0] >= mw and r[2] >= mp}
+    smart_now = {w for w, r in db.items() if is_smart_rec(r, mn, mw, mp)}
     hours = (max(r["ts"] for r in rows) - min(r["ts"] for r in rows)) / 3600
     out = [f"TARCA-VISELKEDES — {len(rows)} tarca-pozicio, {len({r['wallet'] for r in rows})} tarca, {hours:.1f} ora",
            "(a hozam a tarca sajat eredmenye a SAJAT dijaival, a kovetesi ablak vegeig, a mi kesesunk NELKUL; graduált tokennel",
@@ -2086,6 +2108,8 @@ def wallets_report():
             xs = by_w.get(w, [])
             r = db[w]
             line = f"  {w[:6]}..{w[-4:]}  {r[0]:4d} token, nyero {r[1] / r[0] * 100:3.0f}%, PnL {r[2]:+7.2f} SOL"
+            if len(r) > 9 and r[8] + r[9]:
+                line += f", tuladott {r[8]}/{r[8] + r[9]}"
             if len(xs) >= 3:
                 q = _profile(xs)
                 line += f" | kor {q['kor']:.0f} mp, gorbe {q['gorbe']:.1f} SOL, tetel {q['tetel']:.2f}, tartas {q['tartas']:.0f} mp, mind el {q['eladott']:.0f}%"
@@ -2093,7 +2117,20 @@ def wallets_report():
                 if known:
                     line += f", mayhem {sum(1 for c in known if c == 1) / len(known) * 100:.0f}% (n={len(known)})"
             out.append(line)
+    out += oversold_lines(db)
     return "\n".join(out)
+
+
+def oversold_lines(db, k=5):
+    """a tuladas miatt az okosok kozul kizart tarcak, a regi (hamis) PnL szerint"""
+    excl = sorted((w for w, r in db.items() if wallet_oversold(r)), key=lambda w: -db[w][2])[:k]
+    if not excl:
+        return []
+    out = ["  kizarva az okosok kozul, mert rendszeresen tobbet ad el, mint amennyit a gorben vett (kivulrol kapott token):"]
+    for w in excl:
+        r = db[w]
+        out.append(f"    {w[:6]}..{w[-4:]}  tuladott {r[8]}/{r[8] + r[9]} pozicio; a regi, hamis PnL {r[2]:+.2f} SOL ({r[0]} token)")
+    return out
 
 
 def diag():
@@ -2147,6 +2184,7 @@ def diag():
     print("\n== Tarca-kovetes (S10, tarca-adatbazis)")
     wst = s.get("wallets") or {}
     print(f"kereskedes-uzenet: {s.get('trade_msgs', 0)}  hibas: {s.get('trade_bad', 0)}  elszamolt tarca-pozicio: {s.get('wallet_closes', 0)}"
+          f"  kihagyva (tobbet adott el, mint vett): {s.get('wallet_oversold', 0)}"
           f"  kovetett token most: {wst.get('tracked', '-')}")
     rw = dict(s.get("rpc_ws") or {})
     if rw.get("last_error"):
@@ -2170,10 +2208,12 @@ def diag():
     wl = read_json(DB_FILE, {}).get("wallets", {})
     if wl:
         mn, mw, mp = cfg("PAPER_SNIPER_SMART_MIN_N", 5, int), cfg("PAPER_SNIPER_SMART_MIN_WIN", 0.5), cfg("PAPER_SNIPER_SMART_MIN_PNL", 0.5)
-        smart = sorted(((w, r) for w, r in wl.items() if r[0] >= mn and r[1] / r[0] >= mw and r[2] >= mp), key=lambda x: -x[1][2])
+        smart = sorted(((w, r) for w, r in wl.items() if is_smart_rec(r, mn, mw, mp)), key=lambda x: -x[1][2])
         print(f"tarcak: {len(wl)}, ebbol >= {mn} tokennel: {sum(1 for r in wl.values() if r[0] >= mn)}, okos: {len(smart)}")
         for w, r in smart[:5]:
             print(f"  {w[:6]}..{w[-4:]}  {r[0]} token, nyero {r[1] / r[0] * 100:.0f}%, PnL {r[2]:+.2f} SOL")
+        for ln in oversold_lines(wl, 3):
+            print(ln)
     elif s.get("trade_msgs", 0) == 0:
         print("  FIGYELEM: meg nem jott kereskedes-uzenet (PumpPortal subscribeTokenTrade?)")
 

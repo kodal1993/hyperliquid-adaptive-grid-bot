@@ -67,6 +67,13 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
     `/wallets` külön sávban mutatja a szabványos, a mayhem és az egyéb görbéket, a `/sniper` stratégiánként görbe
     szerint is bont, a `/wallets` 5. pontja pedig tárcánként mutatja a mayhem-tokenek arányát (a BwWK17-feltevés próbája).
   - A szimulált kereskedéseinket ez nem érinti, mert azok a valódi görbe-fiókot olvassák.
+  - **Túladás (2026-10-22):** a BwWK17 PnL-je 12:21 és 14:03 között +704-ről +922 SOL-ra nőtt, és a négy óránkénti mintából
+    három az ő díjmentes mayhem-eladása. Feltevés: olyan tokent ad el, amelyet nem a görbén vett, és az elszámolás ezt tiszta
+    nyereségnek látta. Mostantól az a tárca-pozíció, amelyben a tárca több tokent adott el, mint amennyit a görbén vett
+    (kívülről kapott token: mayhem-kínálat, átutalás, vagy az RPC-kiesés miatt nem látott vétel), kimarad a PnL-ből, a
+    naplóból és a követés-mérésből, és tárcánként számolódik. Aki az új adatokban legalább 3-szor és a pozíciói legalább
+    20%-ában ilyen, az nem lehet okos; a `/wallets` és a `/diag` külön listázza. A korábbi adatbázis-rekordok PnL-je ettől
+    még a régi, hamis érték.
 - **Lezárt mérések:**
   - 2026-10-21, kivezetve: S0–S5, S7, S9 és a kiszállási változatok; díjakkal statisztikailag negatív.
   - 2026-10-21: **S6_okos** (−25,2% ±9,1, n=115) és **S6_okos2** (−20,2% ±14,6, n=51) statisztikailag

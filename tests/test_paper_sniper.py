@@ -451,3 +451,45 @@ def test_tokens_and_wallets_reports_show_curve_band(tmp_path, monkeypatch):
     wt = mod.wallets_report()
     assert "a token gorbeje" in wt and "mayhem" in wt.split("a token gorbeje")[1].split("\n\n")[0]
     assert "mayhem 50% (n=10)" in wt                                     # a legjobb okos tarca tokenjeinek fele mayhem
+
+
+# ---------------------------------------------------------------- tuladas: tobbet ad el, mint amennyit a gorben vett
+def test_oversold_position_is_excluded_from_wallet_pnl(tmp_path, monkeypatch):
+    mod = load_sniper(tmp_path, monkeypatch)
+    S = make_sniper(mod)
+    agent, normal, dev, mint = "A" * 40, "W" * 40, "D" * 40, "Q" * 40
+    S.wallets[agent] = [3, 3, 9.0, 0]
+    S.wallets[normal] = [3, 1, 0.0, 0]
+    T = tracked_token(mod, S, mint, dev, time.time() - 2000)
+    S.on_trade(trade(agent, mint, "buy", 0.5, 1e6, 40.0, 0.0), T["t"] + 60)
+    S.on_trade(trade(agent, mint, "sell", 2.0, 5e6, 38.0, 0.0), T["t"] + 90)    # 4M tokent kivulrol kapott (pl. mayhem-ugynok)
+    S.on_trade(trade(normal, mint, "buy", 1.0, 3e6, 39.0, 0.0125), T["t"] + 100)
+    S.on_trade(trade(normal, mint, "sell", 0.9, 3e6, 38.0, 0.01125), T["t"] + 120)
+    assert T["tr"][agent][12] == pytest.approx(4e6) and T["tr"][normal][12] == 0
+    S.finalize_tracked()
+    a, n = S.wallets[agent], S.wallets[normal]
+    assert a[:3] == [3, 3, 9.0] and a[8] == 1 and a[9] == 0               # a hamis +1.5 SOL nem kerult a PnL-be
+    assert n[0] == 4 and n[8] == 0 and n[9] == 1
+    assert S.stats["wallet_oversold"] == 1
+    assert wallet_rows(mod, agent) == {}                                 # a naploba sem kerul
+    assert mint in wallet_rows(mod, normal)
+
+
+def test_oversold_wallet_is_not_smart_and_reports_list_it(tmp_path, monkeypatch):
+    mod = load_sniper(tmp_path, monkeypatch)
+    S = make_sniper(mod)
+    agent, good = "A" * 40, "G" * 40
+    S.wallets[agent] = [579, 486, 922.0, 0, 0, 0, 0, 0, 3, 2]            # a regi PnL kivalo, de az uj adatban 3/5 tuladott
+    S.wallets[good] = [20, 14, 12.0, 0, 0, 0, 0, 0, 1, 19]
+    assert mod.wallet_oversold(S.wallets[agent]) and not mod.wallet_oversold(S.wallets[good])
+    assert not S.is_smart(agent) and S.is_smart(good)
+    assert not mod.wallet_oversold([579, 486, 922.0, 0])                  # regi rekord: nincs adat, nem zarjuk ki
+    mod.DB_FILE.write_text(json.dumps({"wallets": S.wallets}))
+    with mod.WALLET_LOG.open("w", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(mod.WALLET_FIELDS)
+        for i in range(5):
+            wr.writerow([1000 + i, f"mint{i:03d}", good, 5, 1, 0, 30, 5, 1.0, 1.2, 0, 0.2, 20, 60, 1, 1, 1, 10, 0])
+    text = mod.wallets_report()
+    assert "GGGGGG..GGGG" in text and "tuladott 1/20" in text
+    assert "kizarva az okosok kozul" in text and "AAAAAA..AAAA  tuladott 3/5" in text

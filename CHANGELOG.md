@@ -1,5 +1,13 @@
 # Changelog
 
+## Paper sniper: túladott tárca-pozíciók kizárva (több tokent ad el, mint amennyit a görbén vett)
+
+- **Mérés:** ha egy tárca egy tokenből több tokent ad el, mint amennyit a görbén vett, a különbség tárca-pozíciónként számolódik. Ilyen a mayhem-ügynök extra kínálata, egy átutalással kapott token, vagy az RPC-kiesés miatt nem látott vétel.
+- **Elszámolás:** az ilyen pozíció (a túladott mennyiség több, mint a legnagyobb tartott mennyiség 1%-a) kimarad a PnL-ből, a viselkedésnaplóból és a követő-mérésből, mert a PnL-je hamis volna. A tárca-rekord két új számlálót kap: túladott és tiszta pozíciók a bevezetés óta.
+- **Okos-besorolás:** aki az új adatokban legalább 3-szor, és a pozíciói legalább 20%-ában túlad, az nem lehet okos. A token-napló „okos tárcák” jele, a `/wallets` és a `/diag` okos-listája így nem tartalmazza.
+- **Riport:** a `/wallets` 5. pontja tárcánként mutatja a túladott pozíciók arányát, és külön listázza a túladás miatt kizárt tárcákat a régi (hamis) PnL-jükkel; a `/diag` a kihagyott pozíciók számát és a legnagyobb kizártakat.
+- A korábbi adatbázis-rekordok PnL-je nem változik.
+
 ## Paper sniper: mayhem-tokenek és nem szabványos görbék külön; nyitott-plafon 600
 
 - **Valódi SOL és mayhem-jelző az eseményből:** a `decode_trade_event` a `real_sol_reserves` (113. bájt) és a `mayhem_mode` (az `ix_name` string után) mezőt is kiolvassa. A token-napló „SOL a görbében” jele (`rsol`) és a tárcanapló „görbe SOL” oszlopa ebből jön, nem a „virtuális − 30” képletből, ami a nem szabványos (pl. mayhem) görbéken hibás volt (valódi minták: 2,66 és 11 SOL induló virtuális SOL).
