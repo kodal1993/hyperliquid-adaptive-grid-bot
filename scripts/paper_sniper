@@ -32,7 +32,11 @@ TOKEN-NAPLO (nyero tokenek keresese)
   tokennel a vegso ar a PumpSwap-ar 15 perccel a graduacio utan (DexScreener), igy a graduacio utani
   zuhanas is benne van (enelkul a gorbe utolso ara optimista volna).
   'tokens' parancs: mely jelek mellett gyakori a nyero (>= 3x vagy graduacio) — az adat elso 70%-an
-  keresve, a hatralevo 30%-on ellenorizve. Az S14-jel kimenetele a 60 mp-es pillanatkep aratol is
+  keresve, a hatralevo 30%-on ellenorizve. Gorbe-naplo (state/paper_sniper_curves.csv): tokenenkent a gorbe
+  indulo virtualis SOL-ja es a mayhem-mod (a TradeEvent mezoibol). A mayhem-tokenek gorbeje nem a szabvanyos
+  30 SOL-os (lattunk 2.66 es 11 SOL-osat is), es a forgalmuk nagy reszet a pump.fun mayhem-ugynoke adja
+  (valoszinuleg a BwWK17..de6s, dij nelkul); a riportok kulon savban mutatjak oket.
+  Az S14-jel kimenetele a 60 mp-es pillanatkep aratol is
   (a belepes a keses miatt kb. ott tortenik).
 
     S14_volumen     a token-naplo elso, ellenorzott jele: 30 mp-nel (lancon merve) >= S14_MIN_BUY_SOL (25) SOL
@@ -88,7 +92,7 @@ KONFIG (mind opcionalis): izolalt telepitesben (deploy/install_paper_sniper.sh) 
     PAPER_SNIPER_AMM_FEE_BPS=120    # graduacio utani (PumpSwap) dij / irany: a friss graduált tokenek savja ~1.2%
     PAPER_SNIPER_PRIO_SOL=0.001     # prioritasi / Jito dij tranzakcionkent
     PAPER_SNIPER_TP_X=2.0 / SL_X=0.5 / MAX_HOLD_MIN=30   # az alap kiszallas
-    PAPER_SNIPER_MAX_OPEN=120       # strategiankent egyszerre nyitott poziciok
+    PAPER_SNIPER_MAX_OPEN=600       # strategiankent egyszerre nyitott poziciok (az S14 alap 24 oraig tart: sok nyitott)
     PAPER_SNIPER_POLL_SEC=10        # gorbe-lekerdezes gyakorisaga
     PAPER_SNIPER_STRATS=            # ures = mind; pl. S10_bennfentes,S14_volumen. Ismeretlen (kivezetett) nevre es kizart
                                     # strategiara figyelmeztet: induláskor, diag, Telegram-jelentes
@@ -133,6 +137,7 @@ TOKEN_LOG = STATE_DIR / "paper_sniper_tokens.csv"           # token-pillanatkepe
 MIGR_LOG = STATE_DIR / "paper_sniper_migrations.csv"         # graduaciok (ido, mint)
 POSTGRAD_LOG = STATE_DIR / "paper_sniper_postgrad.csv"       # a PumpSwap-ar 15 perccel a graduacio utan (DexScreener)
 POSTGRAD_DELAY = 15 * 60
+CURVE_LOG = STATE_DIR / "paper_sniper_curves.csv"           # tokenenkent: a gorbe indulo virtualis SOL-ja, mayhem-mod
 SNAP_SLOTS = (("30", 75), ("60", 150))                       # pillanatkep: 30 / 60 mp (~0.4 mp / slot)
 TOKEN_FEATS = ["rsol", "buyers", "n_buy", "n_sell", "buy_sol", "top_share", "dev_sol", "dev_share", "dev_sold",
                "early_pct", "clustered", "copy", "dev_prior", "dev_grad", "smart", "losers"]
@@ -225,6 +230,33 @@ def strat_warnings(stats):
     if running is not None and set(running) != set(active):
         out.append(f"a konfig szerint ezek futnanak: {', '.join(active) or '-'}, de a futo sniper: {', '.join(running) or '-'}"
                    " — ujrainditas kell (/restart_sniper)")
+    return out
+
+
+def curve_kind(v0, mayhem):
+    """'szabvanyos' (30 SOL virtualis), 'mayhem', 'egyeb' (mas indulo SOL, mayhem-jelzo nelkul) vagy 'ismeretlen'"""
+    if mayhem:
+        return "mayhem"
+    if v0 is None:
+        return "ismeretlen"
+    return "szabvanyos" if abs(v0 - V0_SOL) < 0.01 else "egyeb"
+
+
+CURVE_CODES = {"ismeretlen": -1, "szabvanyos": 0, "mayhem": 1, "egyeb": 2}
+CURVE_LABELS = {v: k for k, v in CURVE_CODES.items()}
+
+
+def load_curve_log():
+    """mint -> a gorbe fajtaja (CURVE_CODES szerint); ami nincs benne: ismeretlen"""
+    out = {}
+    try:
+        with CURVE_LOG.open() as f:
+            for r in csv.DictReader(f):
+                v0 = fnum(r.get("v0"), None) if r.get("v0") not in (None, "") else None
+                mh = r.get("mayhem")
+                out[r["mint"]] = CURVE_CODES[curve_kind(v0, mh == "1")] if mh in ("0", "1") or v0 is not None else -1
+    except (OSError, KeyError):
+        pass
     return out
 
 
@@ -387,7 +419,8 @@ def decode_trade_event(data):
     virtual_sol_reserves u64, virtual_token_reserves u64, real_sol u64, real_token u64, fee_recipient(32),
     fee_basis_points u64, fee u64 (@169), creator(32), creator_fee_basis_points u64, creator_fee u64 (@217), ...
     A sol_amount a gorbe resze: vetelkor a tarca ezen felul fizeti a dijat, eladaskor ebbol vonjak le.
-    'fee' = fee + creator_fee SOL-ban (None, ha a sor rovidebb)"""
+    'fee' = fee + creator_fee SOL-ban; 'realSol' = real_sol_reserves (@113); 'mayhem' = mayhem_mode (az ix_name string
+    utan, @262 + hossz). Mindegyik None, ha a sor rovidebb (regi elrendezes)."""
     try:
         b = base64.b64decode(data)
     except Exception:
@@ -399,9 +432,15 @@ def decode_trade_event(data):
     ts, = struct.unpack_from("<q", b, 89)
     vsol, vtok = struct.unpack_from("<QQ", b, 97)
     fee = (struct.unpack_from("<Q", b, 169)[0] + struct.unpack_from("<Q", b, 217)[0]) / 1e9 if len(b) >= 225 else None
+    real_sol = struct.unpack_from("<Q", b, 113)[0] / 1e9 if len(b) >= 121 else None
+    mayhem = None
+    if len(b) >= 262:
+        n, = struct.unpack_from("<I", b, 258)                  # ix_name hossza
+        if n <= 64 and len(b) > 262 + n:
+            mayhem = b[262 + n] == 1
     return {"txType": "buy" if is_buy else "sell", "mint": b58encode(b[8:40]), "traderPublicKey": b58encode(b[57:89]),
             "solAmount": sol / 1e9, "tokenAmount": tok / 1e6, "vSolInBondingCurve": vsol / 1e9, "vTokensInBondingCurve": vtok / 1e6,
-            "ts": ts, "fee": fee}
+            "ts": ts, "fee": fee, "realSol": real_sol, "mayhem": mayhem}
 
 
 def decode_create_event(b):
@@ -461,7 +500,7 @@ class Sniper:
         self.tp = cfg("PAPER_SNIPER_TP_X", 2.0)
         self.sl = cfg("PAPER_SNIPER_SL_X", 0.5)
         self.max_hold = cfg("PAPER_SNIPER_MAX_HOLD_MIN", 30.0) * 60
-        self.max_open = cfg("PAPER_SNIPER_MAX_OPEN", 120, int)
+        self.max_open = cfg("PAPER_SNIPER_MAX_OPEN", 600, int)
         self.exits = {k: dict(v) for k, v in EXITS.items()}
         self.exits["alap"] = {"tp": self.tp, "sl": self.sl, "max": self.max_hold / 60}
         self.amm_fee = cfg("PAPER_SNIPER_AMM_FEE_BPS", 120.0) / 1e4   # PumpSwap, friss graduált sav (~1.2% / irany)
@@ -667,7 +706,8 @@ class Sniper:
     def token_features(self, T):
         buy = T.get("buy_sol", 0.0)
         cl = T.get("clustered")
-        return {"rsol": round(T.get("vs", V0_SOL) - V0_SOL, 3), "buyers": len(T["buyers"]), "n_buy": T["n_buy"],
+        rsol = T["rs"] if "rs" in T else T.get("vs", V0_SOL) - V0_SOL
+        return {"rsol": round(rsol, 3), "buyers": len(T["buyers"]), "n_buy": T["n_buy"],
                 "n_sell": T["n_sell"], "buy_sol": round(buy, 3), "top_share": round(T.get("max_in", 0.0) / buy, 3) if buy else 0.0,
                 "dev_sol": round(T.get("dev_sol", 0.0), 3), "dev_share": round(T.get("dev_share", 0.0), 2),
                 "dev_sold": int(T["dev_sold"]), "early_pct": round(T["early_tok"] / TOTAL_SUPPLY * 100, 2),
@@ -694,6 +734,11 @@ class Sniper:
             return
         self.stats["trade_msgs"] += 1
         vs, vt = fnum(m.get("vSolInBondingCurve")), fnum(m.get("vTokensInBondingCurve"))
+        rs = m.get("realSol")
+        if rs is not None and vs > 0:
+            T["rs"] = rs                               # valodi SOL a gorbeben (minden gorben pontos; a vs - 30 csak a szabvanyoson)
+            if "v0" not in T:
+                T["v0"], T["mayhem"] = round(vs - rs, 4), m.get("mayhem")   # a gorbe indulo virtualis SOL-ja
         slot0, cs = m.get("slot"), T.get("cslot")
         if "snaps" in T and cs is not None and slot0 is not None:
             for k, off in SNAP_SLOTS:
@@ -711,8 +756,8 @@ class Sniper:
         # utolso eladas ideje, vetelek, eladasok, legtobb tartott token
         # ..., elso eladas ideje (a koveto ekkor szall ki), az elso vetel slotja, a tarca dijai (SOL)
         slot = m.get("slot")
-        rec = T["tr"].setdefault(w, [0.0, 0.0, 0.0, now, (vs - V0_SOL) if vs > 0 else -1.0, 0.0, 0, 0, 0.0, 0.0,
-                                     slot if slot is not None else -1, 0.0])
+        rec = T["tr"].setdefault(w, [0.0, 0.0, 0.0, now, (rs if rs is not None else vs - V0_SOL) if vs > 0 else -1.0, 0.0, 0, 0,
+                                     0.0, 0.0, slot if slot is not None else -1, 0.0])
         fee = m.get("fee")
         rec[11] += fnum(fee) if fee is not None else sol * self.fee   # a TradeEvent dija; nelkule a konfig szerinti
         if m.get("txType") == "buy":
@@ -792,6 +837,7 @@ class Sniper:
     def finalize_tracked(self, force=False):
         """a lejart kovetesi ablakok elszamolasa a tarca-adatbazisba, es leiratkozas"""
         now = time.time()
+        curves = []
         for mint, T in list(self.tracked.items()):
             if not force and now - T["t"] < self.trade_window:
                 continue
@@ -802,9 +848,25 @@ class Sniper:
                 self.finalize_token(mint, T, now)
             except Exception as e:
                 self.note_error("elszamolas", e)       # csak ez az egy token marad ki
+            kind = curve_kind(T.get("v0"), T.get("mayhem"))
+            cs = self.stats.setdefault("curves", {})
+            cs[kind] = cs.get(kind, 0) + 1
+            if "v0" in T:
+                mh = T.get("mayhem")
+                curves.append([round(now), mint, T["v0"], "" if mh is None else int(mh)])
             for k in ("tr", "pt", "pp", "buyers", "smart", "losers", "snaps", "pmax"):
                 T.pop(k, None)                         # memoria: a teljes kereskedesi elozmeny mar nem kell
         self.flush_wallet_log()
+        if curves:
+            try:
+                new = not CURVE_LOG.exists()
+                with CURVE_LOG.open("a", newline="") as f:
+                    w = csv.writer(f)
+                    if new:
+                        w.writerow(["ts", "mint", "v0", "mayhem"])
+                    w.writerows(curves)
+            except OSError as e:
+                log(f"gorbe-naplo hiba: {e}")
 
     def finalize_token(self, mint, T, now):
         """egy lejart token elszamolasa: token-naplo sor, tarca-pozicio naplo, tarca-adatbazis. Graduált tokennel a
@@ -1508,6 +1570,7 @@ def report_text(short=False):
     for r in rows:
         by.setdefault(r["strat"], []).append(r)
     running = st.get("strats") or parse_strats(os.getenv("PAPER_SNIPER_STRATS"))[0]
+    curves = load_curve_log() if not short else {}
     for s in sorted(set(by) | {k for k in list(opn) + list(running) if k in STRAT_DESC}, key=strat_order):
         xs = by.get(s, [])
         if not xs:                                   # fut (vagy van nyitott pozicioja), de meg nincs lezart
@@ -1542,6 +1605,12 @@ def report_text(short=False):
         lines.append(f"  atlagos hozam / pozicio: {mean:+.1f}%  (95% CI ±{ci:.1f})  ->  {verdict}")
         lines.append(f"  kiszallasok: " + ", ".join(f"{k} {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])))
         lines.append(f"  hozam eloszlas: p10 {pct(ret, .1):+.0f}%  median {pct(ret, .5):+.0f}%  p90 {pct(ret, .9):+.0f}%  max {max(ret):+.0f}%")
+        kinds = {}
+        for r in xs:
+            kinds.setdefault(CURVE_LABELS[curves.get(r["mint"], -1)], []).append(fnum(r["ret_pct"]))
+        if set(kinds) - {"ismeretlen"}:
+            lines.append("  gorbe szerint: " + " | ".join(f"{k} n={len(v)} atlag {sum(v) / len(v):+.1f}%"
+                                                         for k, v in sorted(kinds.items(), key=lambda kv: CURVE_CODES[kv[0]])))
         if grad:
             g_pnl = sum(float(r["pnl_sol"]) for r in xs if r["graduated"] == "1")
             ng = [float(r["ret_pct"]) for r in xs if r["graduated"] != "1"]
@@ -1740,6 +1809,7 @@ TOKEN_BUCKETS = [
     ("dev_grad", "dev korabbi graduaciói", [0, 1, 2, 1e9]),
     ("smart", "okos tarcak", [0, 1, 2, 3, 1e9]),
     ("losers", "ismert vesztes tarcak", [0, 1, 2, 4, 1e9]),
+    ("curve", "gorbe (-1 ismeretlen, 0 szabvanyos, 1 mayhem, 2 egyeb)", [-1, 0, 1, 2, 3]),
 ]
 
 
@@ -1758,6 +1828,7 @@ def load_token_log(h="30"):
             postgrad = {r["mint"]: fnum(r["px_amm"]) for r in csv.DictReader(f)}
     except OSError:
         pass
+    curves = load_curve_log()
     rows = []
     with TOKEN_LOG.open() as f:
         for r in csv.DictReader(f):
@@ -1775,6 +1846,7 @@ def load_token_log(h="30"):
                 d["amm_adj"] = 1
             d["sell_ratio"] = d["n_sell"] / max(1.0, d["n_buy"])
             d["win"] = int(d["max_mult"] >= 3 or d["grad"])
+            d["curve"] = curves.get(r["mint"], -1)
             rows.append(d)
     rows.sort(key=lambda r: r["ts"])
     return rows
@@ -1802,7 +1874,8 @@ def tokens_report(h="30"):
            f" (n={len(train)}), ellenorzo {bs:.1f}% (n={len(test)}); graduacio {sum(r['grad'] for r in rows) / len(rows) * 100:.1f}%"
            f" ({sum(r['grad'] for r in rows)} token, ebbol PumpSwap-arral korrigalva {sum(r['amm_adj'] for r in rows)})",
            "oszlopok: n tanito / nyero% | n ellenorzo / nyero% (nyerok) | emeles (ellenorzo) | vegso szorzo | kiveheto (csucstol -50%, 5% koltseggel)",
-           "* = mindket reszen legalabb 1.5x-es emeles es >= 30 ellenorzo token: ez lehet valodi jel", ""]
+           "* = mindket reszen legalabb 1.5x-es emeles es >= 30 ellenorzo token: ez lehet valodi jel",
+           "('SOL a gorbeben': a 2026-10-22 delutan elotti sorokban a nem szabvanyos gorbeken hibas — virtualis - 30 volt)", ""]
     cands = []
     for key, title, edges in TOKEN_BUCKETS:
         out.append(f"{title}:")
@@ -1858,7 +1931,8 @@ def s14_outcome(train, test, rate, fin, cap):
         for lab, xs in (("30 mp-es ar", r30), ("60 mp-es ar", r60)):
             out.append(f"  {part:9s} {lab}: {len(xs):4d} / {rate(xs):5.1f}% ({sum(r['win'] for r in xs):2d}) | {fin(xs):4.2f} | {cap(xs):4.2f}")
         out.append(f"  {part:9s} alapvonal (minden token, 60 mp-es ar): {rate(base60):.1f}% (n={len(base60)})"
-                   + (f"; 60 mp-ig elhalt (nincs ujabb kereskedes): {sum(int(r['died']) for r in r60)}" if r60 else ""))
+                   + (f"; 60 mp-ig elhalt (nincs ujabb kereskedes): {sum(int(r['died']) for r in r60)}" if r60 else "")
+                   + f"; a jelbol mayhem / egyeb gorbe: {sum(1 for r in r30 if r['curve'] == 1)} / {sum(1 for r in r30 if r['curve'] == 2)}")
     out.append("  A 60 mp-es sor a valosaghoz kozelebbi: ha a kiveheto ott 1.0 alatt van, a jel a mi kesesunkkel nem fizet.")
     return out
 
@@ -1917,6 +1991,9 @@ def wallets_report():
                          lambda lo, hi: f"{lo:g}-{hi:g} SOL" if hi < 1e9 else f"{lo:g}+ SOL")
     out += _bucket_table(rows, "a token korai (bundle) resze", lambda r: r["tok_early_pct"], [0, 5, 15, 30, 101],
                          lambda lo, hi: f"{lo:.0f}-{hi:.0f}%")
+    curves = load_curve_log()
+    out += _bucket_table(rows, "a token gorbeje (gorbe-naplo; a regebbi sorok ismeretlenek)", lambda r: curves.get(r["mint"], -1),
+                         [-1, 0, 1, 2, 3], lambda lo, hi: CURVE_LABELS[int(lo)])
 
     # 3. szerencse vagy tudas: elso fele alapjan okos -> masodik fele?
     out.append("")
@@ -2012,6 +2089,9 @@ def wallets_report():
             if len(xs) >= 3:
                 q = _profile(xs)
                 line += f" | kor {q['kor']:.0f} mp, gorbe {q['gorbe']:.1f} SOL, tetel {q['tetel']:.2f}, tartas {q['tartas']:.0f} mp, mind el {q['eladott']:.0f}%"
+                known = [curves.get(x["mint"], -1) for x in xs if curves.get(x["mint"], -1) >= 0]
+                if known:
+                    line += f", mayhem {sum(1 for c in known if c == 1) / len(known) * 100:.0f}% (n={len(known)})"
             out.append(line)
     return "\n".join(out)
 
@@ -2028,6 +2108,11 @@ def diag():
     seen, mig = s.get("seen", 0), s.get("migrations", 0)
     print(f"latott token: {seen}   graduacio: {mig} ({mig / seen * 100 if seen else 0:.2f}%)")
     print(f"futas: {'izolalt (konfig ' + str(ISO_ENV) + ')' if ISOLATED else 'a repobol (config/live.env + .env)'}, allapot: {STATE_DIR}")
+    cv = s.get("curves") or {}
+    if cv:
+        tot = sum(cv.values())
+        print("gorbek (elszamolt tokenek): " + ", ".join(f"{k} {v} ({v / tot * 100:.0f}%)" for k, v in
+                                                         sorted(cv.items(), key=lambda kv: CURVE_CODES.get(kv[0], 9))))
     print(f"strategiak (a futo sniper): {', '.join(s['strats']) if s.get('strats') is not None else '- (meg nincs mentett allapot, vagy regi allapotfajl)'}")
     for w in strat_warnings(s):
         print("FIGYELEM: " + w)

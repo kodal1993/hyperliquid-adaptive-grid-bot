@@ -1,5 +1,16 @@
 # Changelog
 
+## Paper sniper: mayhem-tokenek és nem szabványos görbék külön; nyitott-plafon 600
+
+- **Valódi SOL és mayhem-jelző az eseményből:** a `decode_trade_event` a `real_sol_reserves` (113. bájt) és a `mayhem_mode` (az `ix_name` string után) mezőt is kiolvassa. A token-napló „SOL a görbében” jele (`rsol`) és a tárcanapló „görbe SOL” oszlopa ebből jön, nem a „virtuális − 30” képletből, ami a nem szabványos (pl. mayhem) görbéken hibás volt (valódi minták: 2,66 és 11 SOL induló virtuális SOL).
+- **Görbe-napló** (`state/paper_sniper_curves.csv`): tokenenként a görbe induló virtuális SOL-ja és a mayhem-jelző. A riportok mint szerint illesztik, így a meglévő CSV-k sémája nem változik.
+  - `/tokens`: új sáv (ismeretlen / szabványos / mayhem / egyéb görbe); az S14-szakasz a jel mayhem- és egyéb görbéjű tokenjeit is megszámolja.
+  - `/wallets`: új sáv „a token görbéje”; az 5. pontban tárcánként a mayhem-tokenek aránya.
+  - `/sniper`: stratégiánként görbe szerinti bontás.
+  - `/diag`: az elszámolt tokenek görbék szerinti megoszlása.
+  - Az `/export` a görbe-naplót is tartalmazza.
+- **`PAPER_SNIPER_MAX_OPEN` alapértéke 120 → 600:** az S14 kb. 35 belépés/óra mellett 24 óráig tarthat nyitva, a 120-as plafon pár órán belül kihagyásokat okozott volna.
+
 ## Kísérleti napló: az S13 és az S14 2026-10-22 ~10:31-től fut; második valódi TradeEvent a tesztben
 
 - `docs/KISERLETEK.md` és a docstring: az S13 és az S14 ténylegesen 2026-10-22 ~10:31-től fut (a #127 telepítése a javított stratégialistával), az eredményeik ettől számítanak. Első működési adat (12:21): S14 61 belépés, S13 4 belépés 69 értékelt graduációból, a kihagyási okokkal.

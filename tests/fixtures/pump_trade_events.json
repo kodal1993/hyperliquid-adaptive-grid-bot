@@ -58,7 +58,8 @@
       "realSol": 10.5,
       "fee": 0.00625,
       "realTok": 514914814.81481504,
-      "standardCurve": true
+      "standardCurve": true,
+      "mayhemMode": false
     }
   }
 ]
