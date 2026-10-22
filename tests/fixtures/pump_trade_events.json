@@ -1,0 +1,18 @@
+[
+  {
+    "source": "SZINTETIKUS: a pump.fun hivatalos IDL-je (@pump-fun/pump-sdk 4.2.0, TradeEvent, 36 mezo) szerint kodolva, mert a fejlesztoi kornyezet nem eri el a Solana RPC-t. Valodi sorra cserelendo: /diag 'minta TradeEvent' sor.",
+    "signature": null,
+    "line": "Program data: vdt/007mYe4xj1l/6ZXSxENNpbrMIxTfO22auaIUuT4MsuxxbUSqowBlzR0AAAAAoQkvNwkJAAAB0TqWh38uJk27lbeTKxShZWwKIF4W2JSvutIu0zCFlX9AitlqAAAAAAD1/G0JAAAAXwKzPuHSAgAASdlxAgAAAF9qoPJP1AEAgBaqeIuvihVn0Y+eGh+4+n1TlpwYJWIWmvsjU30xBtlfAAAAAAAAALB6SAAAAAAABXgQ9ajszumV+5q/n7ljBmw5nM2ayjvdo5RianYaOPoeAAAAAAAAAGDjFgAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAZc0dAAAAAECK2WoAAAAAAwAAAGJ1eQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "expected": {
+      "txType": "buy",
+      "mint": "4LTksEDzHp7X2keAjU8kumFHtydEDkX2td43xx9w8B3G",
+      "traderPublicKey": "F5k2Qx5FRbEQT1cmnFWxRUVv8Rv9Km8ZyYExBgRFtLUW",
+      "solAmount": 0.5,
+      "tokenAmount": 9935185.185185,
+      "vSolInBondingCurve": 40.5,
+      "vTokensInBondingCurve": 794814814.814815,
+      "ts": 1792641600,
+      "realSol": 10.5
+    }
+  }
+]

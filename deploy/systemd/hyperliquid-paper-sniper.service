@@ -1,15 +1,38 @@
+# Telepites / frissites: sudo bash deploy/install_paper_sniper.sh (a repo utvonalat a telepito irja be)
 [Unit]
-Description=pump.fun PAPER sniper (valodi penz nelkul)
+Description=pump.fun PAPER sniper (valodi penz nelkul), izolalt felhasznaloval
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/root/hyperliquid-adaptive-grid-bot-live
-ExecStart=/root/hyperliquid-adaptive-grid-bot-live/.venv/bin/python scripts/paper_sniper run
+User=paper-sniper
+Group=paper-sniper
+# sajat munka- es allapot-konyvtar; konfig: /etc/paper-sniper/paper_sniper.env (a script olvassa)
+StateDirectory=paper-sniper
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/paper-sniper
+ExecStart=/root/hyperliquid-adaptive-grid-bot-live/.venv/bin/python /root/hyperliquid-adaptive-grid-bot-live/scripts/paper_sniper run
 Restart=always
 RestartSec=15
-User=root
+UMask=0027
+
+# A /root egy ures tmpfs; a repobol csak a kod es a venv latszik (csak olvashato).
+# A .env, a .env.bak* es a config/live.env (privat kulcs, Telegram-token) a szolgaltatas szamara nem letezik.
+ProtectHome=tmpfs
+BindReadOnlyPaths=/root/hyperliquid-adaptive-grid-bot-live/scripts /root/hyperliquid-adaptive-grid-bot-live/.venv
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

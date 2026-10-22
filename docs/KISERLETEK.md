@@ -41,10 +41,14 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
 
 ### pump.fun sniper (`scripts/paper_sniper`) — papír: graduáció utáni stratégiák
 - **Ki fizet nekünk, és miért:** a sebességben nem versenyzünk. Hihető forrás a nagy nyerők
-  megtartása és a graduáció utáni tapadás: ott a díj 0,30% (nem 1,25%), és nem a blokk-0
-  bundle-ökkel versenyzünk.
-- **Költségpadló:** görbén kb. −5% / pozíció; graduáció után kb. −2,6% (2 × 0,30% + 2 × 0,001 SOL prio
+  megtartása és a graduáció utáni tapadás, ahol nem a blokk-0 bundle-ökkel versenyzünk. A díj ott sem
+  sokkal kisebb: a PumpSwap a friss graduált tokenek sávjában kb. 1,2%-ot számol irányonként
+  (nem 0,30%-ot, ahogy eddig számoltunk).
+- **Költségpadló:** görbén kb. −5% / pozíció; graduáció után kb. −4,4% (2 × 1,2% + 2 × 0,001 SOL prio
   0,1 SOL-on), plusz a pool méretéből számolt csúszás.
+- **AMM-díj javítva (2026-10-22):** a `PAPER_SNIPER_AMM_FEE_BPS` alapértéke 30 → 120. **Az eddigi S13_amm sorok és
+  a graduáció után zárt S14 (`+amm`) sorok optimisták:** 0,30%-os díjjal számoltak, pozíciónként kb. 1,8 százalékponttal
+  jobbak a valóságnál (2 × 0,9). Az S13 és S14 ítéletébe ezeket a sorokat ezzel a levonással kell érteni.
 - **Lezárt mérések:**
   - 2026-10-21, kivezetve: S0–S5, S7, S9 és a kiszállási változatok; díjakkal statisztikailag negatív.
   - 2026-10-21: **S6_okos** (−25,2% ±9,1, n=115) és **S6_okos2** (−20,2% ±14,6, n=51) statisztikailag
@@ -57,10 +61,10 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
     a kódból kivezetve, ahogy az S6 is.
   - A követhető tárcák: 1 mp késéssel, a mi díjainkkal a „okos” tárcák követve −0,8%, minden tárca −7,1%,
     a 93 legalább 8 pozíciós tárca közül egyik sem másolható (2026-10-21). A tárcakövetés nem profitforrás.
-- **Felfüggesztve, valós idejű adat nélkül nem mérhető:** S8_masol. A PumpPortal kereskedés-adata
+- **Fut, de késleltetett adattal pesszimista: S8_masol.** A PumpPortal kereskedés-adata
   fizetős (0,02 SOL minimális egyenleg, 10 000 kereskedésenként 0,01 SOL; a teljes követés kb. 0,75 SOL/nap),
   a nyilvános Solana RPC kb. 33 mp-et késik, a Helius ingyenes kerete a teljes pump.fun-forgalomra kb. 16 óra
-  alatt elfogy.
+  alatt elfogy. A másolható tárca ritka (lásd fent), ezért kevés belépés várható.
 - **Fut, késleltetett adattal: `S10_bennfentes`.** A klaszter-felismerés slot alapú, ezért a késés nem
   rontja el. A bennfentesek eladását viszont kb. 33 mp-cel később látjuk, így az eredmény pesszimista.
   - Első adat (2026-10-21): +34,3% ±72,4, n=6 (egy +182%-os nyerő viszi); ez még nem bizonyíték.
@@ -69,15 +73,19 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
 - **Aktív** (`PAPER_SNIPER_STRATS=S8_masol,S10_bennfentes,S13_amm,S14_volumen`):
   - `S13_amm`: belépés graduáció után 5 perccel, ha a DexScreener szerint van tapadás (likviditás
     ≥ 8000 $, 5 perces forgalom ≥ 3000 $, vevők ≥ 1,2 × eladók, emelkedő ár). Késés-független és
-    ingyenes: csak a PumpPortal graduációs eseménye és a DexScreener kell.
-  - mindkettőnél kiszállás a csúcstól −50%-nál, legfeljebb 24 óra, felső célár nélkül.
+    ingyenes: csak a PumpPortal graduációs eseménye és a DexScreener kell. Kiszállás a csúcstól −50%-nál,
+    legfeljebb 24 óra, felső célár nélkül.
   - `S14_volumen` (2026-10-22-től): a token-napló első, ellenőrzött jele. Ha 30 mp-nél legalább 25 SOL a
     vásárlás, az ellenőrző részen 8,6% a nyerő arány, az alapvonal 1,6% (n=35, 1034 tokenből). A 15 perces
     végső szorzó viszont 0,92x, vagyis felfut, majd visszaesik. Két kiszállás párosítva: `alap` (csúcstól −50%,
     24 óra, graduáció után is) és `gyors` (1,3x felett csúcstól −30%, SL 0,6x, 30 perc). Kevés az
     ellenőrző nyerő (kb. 5), ezért a jel még bizonytalan.
+  - A jel 30 mp-nél jön, de a belépés a késés miatt kb. 60 mp-nél történik. A `/tokens` ezért az S14-jel
+    kimenetelét a 60 mp-es pillanatkép árától is mutatja, ugyanazokra a tokenekre. Ha a „kivehető” ott 1,0
+    alatt van, a jel a mi késésünkkel nem fizet.
 - **Mérés:** Telegram `/report`; `/diag` (S13 kihagyási okok); `/export`.
-- **Siker:** legalább 50 pozíción a hibahatárral együtt pozitív, utána egy második, friss időszak.
+- **Siker:** legalább 50 pozíción a hibahatárral együtt pozitív, utána egy második, friss időszak. A riport
+  ítélete (`POZITIV` / `NEGATIV`, kiszállás-összevetésnél `JOBB` / `ROSSZABB`) is csak 50 pozíciótól dönt.
 - **Leállítás:** a határidőre egyik sem pozitív → `systemctl stop hyperliquid-paper-sniper`.
 - **Határidő:** 2026-11-04.
 

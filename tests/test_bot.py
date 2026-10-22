@@ -1802,6 +1802,65 @@ def test_control_bot_set_command_only_paper_keys(tmp_path, monkeypatch):
     assert "PAPER_SNIPER_SIZE_SOL" not in (tmp_path / "config" / "live.env").read_text()
 
 
+def test_control_bot_isolated_sniper_set_and_export(tmp_path, monkeypatch):
+    import io
+    import zipfile
+
+    telegram_bot = load_telegram_control_bot_module()
+    repo, etc, var = tmp_path / "repo", tmp_path / "etc", tmp_path / "var"
+    for d in (repo / "config", repo / "state", etc, var):
+        d.mkdir(parents=True)
+    sniper_env = etc / "paper_sniper.env"
+    sniper_env.write_text("PAPER_SNIPER_STRATS=S10_bennfentes\nSOLANA_RPC_URL=https://x/?api-key=s3cr3t\n")
+    sniper_env.chmod(0o640)
+    live = repo / "config" / "live.env"
+    live.write_text("TELEGRAM_BOT_TOKEN=123456:abcdefghijklmnopqrstuvwxyzABCDEF\nPAPER_SNIPER_STRATS=S6_okos\nCARRY_X=1\n")
+    (repo / ".env").write_text("PAPER_SNIPER_STRATS=regi\n")
+    (var / "paper_sniper_trades.csv").write_text("ts_open,strat\n1,S14_volumen\n")
+    (repo / "state" / "paper_sniper_trades.csv").write_text("ts_open,strat\n1,REGI\n")
+    (repo / "state" / "paper_carry_state.json").write_text("{}")
+    monkeypatch.setattr(telegram_bot, "PROJECT_ROOT", repo)
+    monkeypatch.setattr(telegram_bot, "SNIPER_ENV_FILE", sniper_env)
+    monkeypatch.setattr(telegram_bot, "SNIPER_STATE_DIR", var)
+    monkeypatch.setattr(telegram_bot, "paper_script", lambda *a, **k: "ok")
+    monkeypatch.setattr(telegram_bot, "version_text", lambda fetch=True: "v")
+
+    listing = telegram_bot.set_command("/set")
+    assert "PAPER_SNIPER_STRATS=S10_bennfentes" in listing and "s3cr3t" not in listing and "abcdef" not in listing
+    assert "CARRY_X=1" in listing and "már nem olvassa" in listing
+    msg = telegram_bot.set_command("/set PAPER_SNIPER_STRATS=S13_amm,S14_volumen")
+    assert str(sniper_env) in msg and "ERŐSEBB" not in msg                # a .env-et az izolalt sniper nem olvassa
+    text = sniper_env.read_text()
+    assert "PAPER_SNIPER_STRATS=S13_amm,S14_volumen" in text and "api-key=s3cr3t" in text
+    assert sniper_env.stat().st_mode & 0o777 == 0o640                    # a jogosultsag marad (a sniper olvassa)
+    assert "S6_okos" in live.read_text()                                 # a live.env-hez nem nyult
+    assert "config/live.env" in telegram_bot.set_command("/set CARRY_X=2")
+
+    _, data, _ = telegram_bot.build_export()
+    z = zipfile.ZipFile(io.BytesIO(data))
+    assert "S14_volumen" in z.read("state/paper_sniper_trades.csv").decode()   # az izolalt allapot-konyvtarbol
+    assert "state/paper_carry_state.json" in z.namelist()
+
+
+def test_control_bot_sniper_runs_without_control_env(monkeypatch):
+    telegram_bot = load_telegram_control_bot_module()
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:abcdefghijklmnopqrstuvwxyzABCDEF")
+    monkeypatch.setenv("HL_PRIVATE_KEY", "0x" + "c" * 64)
+    seen = {}
+
+    def fake_run(args, timeout=60, env=None):
+        seen[args[1].split("/")[-1]] = env
+        return 0, "ok"
+
+    monkeypatch.setattr(telegram_bot, "run_cmd", fake_run)
+    telegram_bot.paper_script("paper_sniper", "diag")
+    telegram_bot.paper_script("paper_carry", "report")
+    env = seen["paper_sniper"]
+    assert env is not None and "PATH" in env
+    assert not any(k.startswith(("TELEGRAM", "HL_")) for k in env)
+    assert seen["paper_carry"] is None
+
+
 def _cfg_for_grid_tests(monkeypatch):
     monkeypatch.delenv("ENV_PROFILE", raising=False)
     cfg = BotConfig.from_env()
