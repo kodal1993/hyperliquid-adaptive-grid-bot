@@ -89,6 +89,12 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
   - 2026-10-22: **S12_futtat** −55,4% ±15,8 (n=10, 10-ből 9 veszteséges). A görbe legalább 50%-ánál a
     graduáció előtti csúcsba lép be, utána jön a zuhanás. A token-napló is ezt mutatja. **Lezárva: kudarc**,
     a kódból kivezetve, ahogy az S6 is.
+  - 2026-10-22 18:04: **S14_volumen** −35,9% ±10,7 (n=61, 15% nyerő, −2,21 SOL), ítélet `NEGATIV`. A párosított
+    `gyors` kiszállás +8,8 ±7,6 százalékponttal jobb az alapnál, de önmagában is −27,1%. A token-napló 30 mp-es jele
+    (legalább 25 SOL vásárlás) a mi kb. 60 mp-es belépésünkkel nem fizet: a felfutás tetején veszünk, utána jön a
+    zuhanás (a 40 első zárásból 38 a csúcstól −50%-kal). **Lezárva: kudarc**, korai leállítással (2. szabály), a
+    `PAPER_SNIPER_STRATS`-ból kivéve. A még nyitott kb. 97 pozíció 24 órán belül lezárul, a végső szám kicsit
+    változhat.
   - A követhető tárcák: 1 mp késéssel, a mi díjainkkal a „okos” tárcák követve −0,8%, minden tárca −7,1%,
     a 93 legalább 8 pozíciós tárca közül egyik sem másolható (2026-10-21). A tárcakövetés nem profitforrás.
   - 2026-10-22: **S8_masol** (másolható tárca követése). 38 144 követő-pozíció után átlag −12,5%, nyerő 24%
@@ -109,13 +115,13 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
   - Első adat (2026-10-21): +34,3% ±72,4, n=6 (egy +182%-os nyerő viszi); ez még nem bizonyíték.
   - Ha legalább 50 pozíción a hibahatárral együtt is pozitív → pontos teszt valós idejű adattal: PumpPortal-kulcs,
     csak a klaszteres tokenekre szűkítve, kb. 0,15 SOL/nap.
-- **Aktív** (`PAPER_SNIPER_STRATS=S10_bennfentes,S13_amm,S14_volumen`; a régi listában maradt `S8_masol`-t a
-  sniper figyelmen kívül hagyja):
+- **Aktív** (`PAPER_SNIPER_STRATS=S10_bennfentes,S13_amm`; az S14 2026-10-22 18:04-től kivéve; a régi listában
+  maradt `S8_masol`-t a sniper figyelmen kívül hagyja):
   - `S13_amm` (ténylegesen 2026-10-22 ~10:31-től): belépés graduáció után 5 perccel, ha a DexScreener szerint van tapadás (likviditás
     ≥ 8000 $, 5 perces forgalom ≥ 3000 $, vevők ≥ 1,2 × eladók, emelkedő ár). Késés-független és
     ingyenes: csak a PumpPortal graduációs eseménye és a DexScreener kell. Kiszállás a csúcstól −50%-nál,
     legfeljebb 24 óra, felső célár nélkül.
-  - `S14_volumen` (ténylegesen 2026-10-22 ~10:31-től): a token-napló első, ellenőrzött jele. Ha 30 mp-nél legalább 25 SOL a
+  - `S14_volumen` (2026-10-22 ~10:31 – 18:04, lezárva: kudarc, lásd fent): a token-napló első, ellenőrzött jele. Ha 30 mp-nél legalább 25 SOL a
     vásárlás, az ellenőrző részen 8,6% a nyerő arány, az alapvonal 1,6% (n=35, 1034 tokenből). A 15 perces
     végső szorzó viszont 0,92x, vagyis felfut, majd visszaesik. Két kiszállás párosítva: `alap` (csúcstól −50%,
     24 óra, graduáció után is) és `gyors` (1,3x felett csúcstól −30%, SL 0,6x, 30 perc). Kevés az

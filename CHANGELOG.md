@@ -1,5 +1,9 @@
 # Changelog
 
+## Kísérleti napló: S14_volumen lezárva (kudarc, korai leállítás)
+
+- 2026-10-22 18:04: S14 −35,9% ±10,7 (n=61), ítélet `NEGATIV`. A `gyors` kiszállás +8,8 ±7,6 százalékponttal jobb, de az is −27,1%. A 2. szabály szerint korán leállítva, a `PAPER_SNIPER_STRATS`-ból kivéve; aktív: S10_bennfentes, S13_amm.
+
 ## Paper sniper: `/wallets` „szerencse vagy tudás” hibahatárral; „nan” helyett „-”
 
 - A 3. pont eddig minden pozitív különbségre azt írta, hogy „van kitartó tudás”, például +0,3 ±7 százalékpontra is. Mostantól az átlagos hozam és a nyerő arány különbsége is a 95%-os hibahatárral együtt jelenik meg, és csak akkor „jobbak (statisztikailag)”, ha a hibahatár nem metszi a 0-t.
