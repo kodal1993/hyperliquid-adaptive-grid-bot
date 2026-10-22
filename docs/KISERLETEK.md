@@ -60,12 +60,17 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
   - Első adat (2026-10-21): +34,3% ±72,4, n=6 (egy +182%-os nyerő viszi); ez még nem bizonyíték.
   - Ha legalább 50 pozíción a hibahatárral együtt is pozitív → pontos teszt valós idejű adattal: PumpPortal-kulcs,
     csak a klaszteres tokenekre szűkítve, kb. 0,15 SOL/nap.
-- **Aktív** (`PAPER_SNIPER_STRATS=S10_bennfentes,S12_futtat,S13_amm`):
+- **Aktív** (`PAPER_SNIPER_STRATS=S10_bennfentes,S12_futtat,S13_amm,S14_volumen`):
   - `S12_futtat`: tapadást mutató, nem bundle-os token a görbén, graduáció után is tartva;
   - `S13_amm`: belépés graduáció után 5 perccel, ha a DexScreener szerint van tapadás (likviditás
     ≥ 8000 $, 5 perces forgalom ≥ 3000 $, vevők ≥ 1,2 × eladók, emelkedő ár). Késés-független és
     ingyenes: csak a PumpPortal graduációs eseménye és a DexScreener kell.
   - mindkettőnél kiszállás a csúcstól −50%-nál, legfeljebb 24 óra, felső célár nélkül.
+  - `S14_volumen` (2026-10-22-től): a token-napló első, ellenőrzött jele. Ha 30 mp-nél legalább 25 SOL a
+    vásárlás, az ellenőrző részen 8,6% a nyerő arány, az alapvonal 1,6% (n=35, 1034 tokenből). A 15 perces
+    végső szorzó viszont 0,92x, vagyis felfut, majd visszaesik. Két kiszállás párosítva: `alap` (csúcstól −50%,
+    24 óra, graduáció után is) és `gyors` (1,3x felett csúcstól −30%, SL 0,6x, 30 perc). Kevés az
+    ellenőrző nyerő (kb. 5), ezért a jel még bizonytalan.
 - **Mérés:** Telegram `/report`; `/diag` (S13 kihagyási okok); `/export`.
 - **Siker:** legalább 50 pozíción a hibahatárral együtt pozitív, utána egy második, friss időszak.
 - **Leállítás:** a határidőre egyik sem pozitív → `systemctl stop hyperliquid-paper-sniper`.
