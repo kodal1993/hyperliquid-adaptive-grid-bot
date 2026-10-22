@@ -88,9 +88,11 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
     a 93 legalább 8 pozíciós tárca közül egyik sem másolható (2026-10-21). A tárcakövetés nem profitforrás.
   - 2026-10-22: **S8_masol** (másolható tárca követése). 38 144 követő-pozíció után átlag −12,5%, nyerő 24%
     (költségpadló −4,5%); az 569 legalább 8 pozíciós tárca közül egyik sem másolható (az alsó hibahatár sehol
-    nem pozitív). Az „okos” tárcák követve −2,8%, a többi −12,1%. A tárcák tudása valódi (a 3. pont szerint a
-    második felükben is 18,5 százalékponttal jobbak), de az előnyük a sebesség: a legjobb (BwWK17, 455 token)
-    saját maga 84%-ban nyer, követve 15%-ban, −3,4%-kal; medián 25 mp-nél vesz, 69 mp-en belül elad. A mérés
+    nem pozitív). Az „okos” tárcák követve −2,8%, a többi −12,1%. A „jó” tárcák a második felükben kezdetben
+    18,5 százalékponttal jobbnak tűntek, de ezt a mayhem-ügynök hamis PnL-je fújta fel. A túladás-szűrés után
+    (2026-10-22 este) az átlagos hozamban nincs bizonyított különbség (+0,3 ±7 százalékpont), a nyerő arányban van
+    (50% vs 38%): gyakrabban nyernek, de átlagban nem keresnek többet. A „legjobb” tárca (BwWK17) a mayhem-ügynök volt
+    (lásd fent); saját maga 84%-ban „nyert”, követve 15%-ban, −3,4%-kal. A mérés
     1 mp késéssel számolt, a valódi késésünk 14–55 mp. **Lezárva: kudarc**, a kódból kivezetve. A követő-mérés
     (`/wallets` 4. pont) és a tárca-adatbázis marad: jelforrás az S10-nek és a token-naplónak.
   - Ugyanekkor javítva a tárca-elszámolás két optimista torzítása: a tárca saját díjai (a TradeEvent `fee` +
