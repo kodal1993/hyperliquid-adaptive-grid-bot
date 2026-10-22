@@ -50,7 +50,13 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
   - 2026-10-21: **S6_okos** (−25,2% ±9,1, n=115) és **S6_okos2** (−20,2% ±14,6, n=51) statisztikailag
     negatív: a saját PnL szerint okos tárcák késve követve veszítenek. **Lezárva: kudarc.**
   - A `masol` kiszállás +10,2 ±7,3 százalékponttal jobb az alapnál (n=172), de átlagban még így is
-    −11,4%. Tanulság: tárcakövetésnél a vezető eladására kell kiszállni.
+    −11,4%. Tanulság: tárcakövetésnél a vezető eladására kell kiszállni. (Kivétel lehet az S10: ott a
+    `masol` 33 százalékponttal rosszabb, n=13, mert a bennfentesek első eladása többnyire csak részeladás.)
+  - 2026-10-22: **S12_futtat** −55,4% ±15,8 (n=10, 10-ből 9 veszteséges). A görbe legalább 50%-ánál a
+    graduáció előtti csúcsba lép be, utána jön a zuhanás. A token-napló is ezt mutatja. **Lezárva: kudarc**,
+    a kódból kivezetve, ahogy az S6 is.
+  - A követhető tárcák: 1 mp késéssel, a mi díjainkkal a „okos” tárcák követve −0,8%, minden tárca −7,1%,
+    a 93 legalább 8 pozíciós tárca közül egyik sem másolható (2026-10-21). A tárcakövetés nem profitforrás.
 - **Felfüggesztve, valós idejű adat nélkül nem mérhető:** S8_masol. A PumpPortal kereskedés-adata
   fizetős (0,02 SOL minimális egyenleg, 10 000 kereskedésenként 0,01 SOL; a teljes követés kb. 0,75 SOL/nap),
   a nyilvános Solana RPC kb. 33 mp-et késik, a Helius ingyenes kerete a teljes pump.fun-forgalomra kb. 16 óra
@@ -60,8 +66,7 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
   - Első adat (2026-10-21): +34,3% ±72,4, n=6 (egy +182%-os nyerő viszi); ez még nem bizonyíték.
   - Ha legalább 50 pozíción a hibahatárral együtt is pozitív → pontos teszt valós idejű adattal: PumpPortal-kulcs,
     csak a klaszteres tokenekre szűkítve, kb. 0,15 SOL/nap.
-- **Aktív** (`PAPER_SNIPER_STRATS=S10_bennfentes,S12_futtat,S13_amm,S14_volumen`):
-  - `S12_futtat`: tapadást mutató, nem bundle-os token a görbén, graduáció után is tartva;
+- **Aktív** (`PAPER_SNIPER_STRATS=S8_masol,S10_bennfentes,S13_amm,S14_volumen`):
   - `S13_amm`: belépés graduáció után 5 perccel, ha a DexScreener szerint van tapadás (likviditás
     ≥ 8000 $, 5 perces forgalom ≥ 3000 $, vevők ≥ 1,2 × eladók, emelkedő ár). Késés-független és
     ingyenes: csak a PumpPortal graduációs eseménye és a DexScreener kell.

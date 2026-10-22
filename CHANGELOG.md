@@ -1,5 +1,19 @@
 # Changelog
 
+## Paper sniper: S6 és S12 kivezetve, puffer- és memória-optimalizálás
+
+- **Kivezetve** (statisztikailag lezárt kudarcok, `docs/KISERLETEK.md`):
+  - `S6_okos` / `S6_okos2`: −19,8% ±7,0 (n=196) és −25,1% ±10,2 (n=77);
+  - `S12_futtat`: −55,4% ±15,8 (n=10).
+
+  Az okos tárcák száma a token-napló jeleként marad.
+- **Puffer:** csak azokat a tokeneket puffereli, amelyeknek a `CreateEvent`-je már megjött a Solana RPC-n, de a PumpPortal create üzenete még nem. Eddig minden régi token eseményét is 30 mp-ig tárolta (a mérésen 20 000 eseményt 5000 tokenre).
+- **Memória:** elszámolás után a tokenből eltűnik a teljes kereskedési előzmény (tárcák, ártörténet, pillanatképek). A legfeljebb 5000 memóriában tartott token így csak a könnyű mezőket őrzi.
+- **Tömör JSON** az állapot- és adatbázis-fájlokban.
+- **Halott kód törölve:** a PumpPortal feliratkozási sorai (`sub_q`, `unsub_q`, `subs_sent`).
+- **A riport „Kihagyva / nem sikerült belépni” sora** csak az aktív stratégiákat mutatja.
+- **Mérés:** az RPC-értesítések feldolgozása kb. 40 000-ről 55 000/mp-re gyorsult (a valós forgalom kb. 350/mp), a késést tehát az RPC okozza, nem a kód.
+
 ## Paper sniper: token-napló és `tokens` elemzés — a nyerő tokenek korai jelei
 
 - Minden új tokenről pillanatkép 30 és 60 mp-es korban, láncon mérve (75 és 150 slot a `CreateEvent` után), így az RPC-késés nem torzítja.
