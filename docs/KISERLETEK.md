@@ -44,7 +44,7 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
 
 ## Kísérletek
 
-### pump.fun sniper (`scripts/paper_sniper`) — papír: graduáció utáni stratégiák
+### pump.fun sniper (`scripts/paper_sniper`) — lezárva: kudarc (2026-10-23)
 - **Ki fizet nekünk, és miért:** a sebességben nem versenyzünk. Hihető forrás a nagy nyerők
   megtartása és a graduáció utáni tapadás, ahol nem a blokk-0 bundle-ökkel versenyzünk. A díj ott sem
   sokkal kisebb: a PumpSwap a friss graduált tokenek sávjában kb. 1,2%-ot számol irányonként
@@ -93,8 +93,15 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
     `gyors` kiszállás +8,8 ±7,6 százalékponttal jobb az alapnál, de önmagában is −27,1%. A token-napló 30 mp-es jele
     (legalább 25 SOL vásárlás) a mi kb. 60 mp-es belépésünkkel nem fizet: a felfutás tetején veszünk, utána jön a
     zuhanás (a 40 első zárásból 38 a csúcstól −50%-kal). **Lezárva: kudarc**, korai leállítással (2. szabály), a
-    `PAPER_SNIPER_STRATS`-ból kivéve. A még nyitott kb. 97 pozíció 24 órán belül lezárul, a végső szám kicsit
-    változhat.
+    `PAPER_SNIPER_STRATS`-ból kivéve. Végső szám a nyitott pozíciók lezárulása után (2026-10-23): −24,9% ±4,6
+    (n=161, 6% nyerő, −4,05 SOL); a `gyors` kiszállás +5,4 ±3,3 százalékponttal jobb, de az is −19,5%.
+  - 2026-10-23 19:04: **S10_bennfentes** −14,2% ±8,8 (n=90, 9% nyerő, −1,29 SOL), ítélet `NEGATIV`. A klaszter-felismerés
+    működik (a tokenek kb. 5%-a klaszteres), de a bennfentesek kb. 40%-ánál már eladtak, mire beléptünk volna, a
+    többinél pedig a késéssel a felfutás után veszünk. A `masol` kiszállás +6,4 ±8,7 (nem eldöntött). A valós idejű
+    adat (fizetős PumpPortal-kulcs) feltétele, legalább 50 pozíción pozitív eredmény, nem teljesült. **Lezárva: kudarc.**
+  - 2026-10-23 19:04: **S13_amm** −54,5% ±10,7 (n=99, 12% nyerő, −5,45 SOL), ítélet `NEGATIV`. A graduáció után 5
+    perccel, „tapadás” esetén belépve is a graduáció utáni zuhanásba veszünk; a 1,2%-os AMM-díj is ellene dolgozik.
+    **Lezárva: kudarc.**
   - A követhető tárcák: 1 mp késéssel, a mi díjainkkal a „okos” tárcák követve −0,8%, minden tárca −7,1%,
     a 93 legalább 8 pozíciós tárca közül egyik sem másolható (2026-10-21). A tárcakövetés nem profitforrás.
   - 2026-10-22: **S8_masol** (másolható tárca követése). 38 144 követő-pozíció után átlag −12,5%, nyerő 24%
@@ -141,6 +148,13 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
 - **Ellenőrzési pontok:** 2026-10-22 este (`/report`: az S14 első ítélete), 2026-10-23 este (S10, S13), 10-28 (carry),
   11-04 (sniper határidő).
 - **Határidő:** 2026-11-04.
+- **Eredmény (2026-10-23): lezárva, kudarc.** Mindhárom futó stratégia statisztikailag negatív: S14 −24,9% ±4,6 (n=161),
+  S13 −54,5% ±10,7 (n=99), S10 −14,2% ±8,8 (n=90); összesen 350 pozíció, −10,8 SOL (−30,5% / pozíció) papíron. Előtte
+  kudarc volt az S0–S9 és az S12 is. Következtetés: ingyenes, 11–18 mp-cel késő nyilvános adattal (és kb. 5%-os
+  körönkénti költséggel) a pump.fun nem profitforrás nekünk. A piac a sebességé (bundle-ök, botok), a bennfenteseké és a
+  pump.fun saját mayhem-ügynökéé; a tipikus kereskedő a szabványos görbéken veszít (medián −13,4%). A sniper leállítva;
+  ugyanerre a piacra új stratégiát nem írunk. Ami megmarad: a mérőrendszer (díjak, PumpSwap-ár, túladás-szűrés,
+  stratégia-figyelmeztetés, tesztek valódi adaton) és ez a napló.
 
 ### HYPE funding carry (`scripts/paper_carry`) — papír
 - **Ki fizet nekünk, és miért:** a HYPE perp longjai fundingot fizetnek a shortoknak. Mi
