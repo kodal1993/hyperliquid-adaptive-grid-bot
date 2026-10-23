@@ -1,5 +1,10 @@
 # Changelog
 
+## Kísérleti napló: a pump.fun sniper lezárva (kudarc)
+
+- 2026-10-23 19:04: S10_bennfentes −14,2% ±8,8 (n=90) és S13_amm −54,5% ±10,7 (n=99), mindkettő `NEGATIV`; az S14 végső száma −24,9% ±4,6 (n=161).
+- A sniper-kísérlet lezárva: összesen 350 pozíció, −10,8 SOL papíron. Ingyenes, késleltetett adattal a pump.fun nem profitforrás nekünk; ugyanerre a piacra új stratégiát nem írunk. Aktív kísérlet: a HYPE carry (határidő 10-28).
+
 ## Kísérleti napló: S14_volumen lezárva (kudarc, korai leállítás)
 
 - 2026-10-22 18:04: S14 −35,9% ±10,7 (n=61), ítélet `NEGATIV`. A `gyors` kiszállás +8,8 ±7,6 százalékponttal jobb, de az is −27,1%. A 2. szabály szerint korán leállítva, a `PAPER_SNIPER_STRATS`-ból kivéve; aktív: S10_bennfentes, S13_amm.
