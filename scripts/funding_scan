@@ -25,9 +25,14 @@ AMIT MER
   5. likviditas (24h forgalom, nyitott kotesallomany)
 
 HASZNALAT (a VPS-en, ahol van halozati eleres):
-    python3 funding_scan.py                      # top 40 coin, 30 nap
-    python3 funding_scan.py --top 80 --days 60
-    python3 funding_scan.py --coins HYPE,TAO,SOL --days 90
+    python3 scripts/funding_scan                      # top 40 coin, 30 nap
+    python3 scripts/funding_scan --top 80 --days 60
+    python3 scripts/funding_scan --coins HYPE,TAO,SOL --days 90
+    python3 scripts/funding_scan --csak-spot --days 90 --tomor   # a carry 2.0 kapuja (Telegram: /funding)
+
+  Spot-fedezes: a Hyperliquid-spoton a fo eszkozok athidalt valtozatban leteznek (UBTC, UETH, USOL),
+  a perp neve BTC, ETH, SOL; ezeket is fedezhetonek vesszuk (a 'spot' oszlop mutatja, melyik tokennel).
+  Az athidalt token arfolyama a hidtol fugg: ez a fedezes sajat kockazata.
 
 Csak stdlib kell.
 """
@@ -37,6 +42,8 @@ API = "https://api.hyperliquid.xyz/info"
 HOURS_PER_YEAR = 24 * 365
 MAKER_FEE_BPS = 1.5          # egy oldal, egy lab
 LEGS_ROUNDTRIP_BPS = 4 * MAKER_FEE_BPS   # perp be+ki, spot be+ki = 6 bps
+GATE_MEDIAN_ANN = 10.0       # carry 2.0 kapu (docs/KISERLETEK.md): legalabb ennyi %/ev medianfunding ...
+GATE_POS_PCT = 70.0          # ... es az orak legalabb ennyi %-aban pozitiv, Hyperliquid-spottal fedezheto eszkozon
 
 
 def post(payload, timeout=25, retries=3):
@@ -75,21 +82,25 @@ def perp_universe():
 
 
 def spot_hedgeable():
-    """USDC-ben jegyzett spot parok bazis-token nevei (ezeket lehet hedgelni)."""
+    """perp-nev -> a fedezesre hasznalhato USDC/USDT-s spot token neve. Az athidalt fo eszkozok (UBTC, UETH,
+    USOL...) a 'U' nelkuli perp-nevhez is tartoznak (BTC, ETH, SOL); a pontos egyezes elsobbseget elvez."""
     try:
         sm = post({"type": "spotMeta"})
     except Exception:
-        return set()
+        return {}
     names = {}
     for i, tok in enumerate(sm.get("tokens", [])):
         names[tok.get("index", i)] = tok.get("name", "")
-    base = set()
+    base = {}
     for pair in sm.get("universe", []):
         toks = pair.get("tokens") or []
         if len(toks) == 2:
             b, q = names.get(toks[0], ""), names.get(toks[1], "")
-            if q in ("USDC", "USDT"):
-                base.add(b)
+            if q in ("USDC", "USDT") and b:
+                base[b] = b
+    for b in list(base):
+        if len(b) > 2 and b.startswith("U") and b[1:] not in base:
+            base[b[1:]] = b                        # UBTC -> BTC (athidalt)
     return base
 
 
@@ -126,31 +137,14 @@ def funding_history(coin, days):
     return uniq
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--top", type=int, default=40, help="hany coin forgalom szerint")
-    ap.add_argument("--coins", type=str, default="", help="konkret lista, vesszovel")
-    ap.add_argument("--days", type=int, default=30, help="visszatekintes napokban")
-    ap.add_argument("--min-vol", type=float, default=2e6, help="min 24h forgalom USD")
-    ap.add_argument("--hold-days", type=int, default=30, help="feltetelezett tartas a netto szamitashoz")
-    args = ap.parse_args()
-
-    print("Univerzum lekerese...", file=sys.stderr)
-    uni = perp_universe()
-    umap = {u["coin"]: u for u in uni}
-    hedge = spot_hedgeable()
-    print(f"  {len(uni)} perp, {len(hedge)} hedgelheto spot par", file=sys.stderr)
-
-    if args.coins:
-        coins = [c.strip() for c in args.coins.split(",") if c.strip()]
-    else:
-        coins = [u["coin"] for u in uni if u["vol"] >= args.min_vol][: args.top]
-
+def analyze(coins, days, hold_days, umap, hedge, progress=True):
+    """eszkozonkenti funding-statisztika; rangsor: perszisztens, pozitiv funding elorol"""
     rows = []
     for i, c in enumerate(coins, 1):
-        print(f"  [{i}/{len(coins)}] {c}", file=sys.stderr)
-        h = funding_history(c, args.days)
-        if len(h) < 24 * max(3, args.days // 10):
+        if progress:
+            print(f"  [{i}/{len(coins)}] {c}", file=sys.stderr)
+        h = funding_history(c, days)
+        if len(h) < 24 * max(3, days // 10):
             continue
         mean_ann = statistics.mean(h) * HOURS_PER_YEAR * 100
         med_ann = statistics.median(h) * HOURS_PER_YEAR * 100
@@ -158,27 +152,81 @@ def main():
         sd_ann = (statistics.pstdev(h) * HOURS_PER_YEAR * 100) if len(h) > 1 else 0
         u = umap.get(c, {})
         # netto becsles a feltetelezett tartasra, a ket lab dijaval
-        gross = mean_ann * args.hold_days / 365
+        gross = mean_ann * hold_days / 365
         fee = LEGS_ROUNDTRIP_BPS / 100
         net_hold = gross - fee
-        net_ann = net_hold * 365 / args.hold_days
+        net_ann = net_hold * 365 / hold_days
         rows.append({
             "coin": c, "mean": mean_ann, "med": med_ann, "pos": pos_pct,
-            "sd": sd_ann, "net": net_ann, "hedge": c in hedge,
+            "sd": sd_ann, "net": net_ann, "hedge": c in hedge, "spot": hedge.get(c, ""),
             "vol": u.get("vol", 0), "oi": u.get("oi", 0),
             "now": u.get("funding_now", 0) * HOURS_PER_YEAR * 100,
             "n": len(h),
         })
         time.sleep(0.2)
-
-    # rangsor: perszisztens, pozitiv funding elorol
     rows.sort(key=lambda r: -(r["med"] if r["pos"] > 55 else -999))
+    return rows
+
+
+def gate(rows):
+    """a carry 2.0 kapuja: a fedezheto eszkozok, amelyek a kuszobot teljesitik (a legjobb elol)"""
+    return [r for r in rows if r["hedge"] and r["med"] >= GATE_MEDIAN_ANN and r["pos"] >= GATE_POS_PCT]
+
+
+def compact(rows, days, k=15):
+    """Telegram-meretu kimenet: elol a kapu eredmenye, utana eszkozonkent egy sor"""
+    ok = gate(rows)
+    out = []
+    if ok:
+        b = ok[0]
+        out.append(f"KAPU: ATMENT — {len(ok)} eszkoz teljesiti (median >= {GATE_MEDIAN_ANN:g}%/ev, pozitiv ora >= {GATE_POS_PCT:g}%)."
+                   f" Legjobb: {b['coin']} ({b['spot']}) median {b['med']:.1f}%/ev, pozitiv {b['pos']:.0f}%")
+    else:
+        out.append(f"KAPU: NEM MENT AT — nincs fedezheto eszkoz median >= {GATE_MEDIAN_ANN:g}%/ev es pozitiv ora >= {GATE_POS_PCT:g}%"
+                   " mellett: a carry 2.0-t nem epitjuk (docs/KISERLETEK.md)")
+    out.append(f"({days} nap; oszlopok: median / atlag %/ev | pozitiv ora % | most %/ev | spot)")
+    for r in rows[:k]:
+        mark = "*" if r in ok else " "
+        out.append(f"{mark} {r['coin']:<8} {r['med']:6.1f} / {r['mean']:6.1f} | {r['pos']:3.0f}% | {r['now']:6.1f} | {r['spot'] or '-'}")
+    out.append("* = a kapu feltetele teljesul. A median a megbizhato (egy kiugras az atlagot huzza), a pozitiv ora a"
+               " perszisztencia. A delta-semleges valtozat a toke csak egy reszet koti le fedezett pozicioban: a teljes tokere a hozam ennel kisebb.")
+    return "\n".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--top", type=int, default=40, help="hany coin forgalom szerint")
+    ap.add_argument("--coins", type=str, default="", help="konkret lista, vesszovel")
+    ap.add_argument("--days", type=int, default=30, help="visszatekintes napokban")
+    ap.add_argument("--min-vol", type=float, default=2e6, help="min 24h forgalom USD")
+    ap.add_argument("--hold-days", type=int, default=30, help="feltetelezett tartas a netto szamitashoz")
+    ap.add_argument("--csak-spot", action="store_true", help="csak a Hyperliquid-spottal fedezheto eszkozok (gyorsabb)")
+    ap.add_argument("--tomor", action="store_true", help="tomor kimenet a kapu eredmenyevel (Telegram: /funding)")
+    args = ap.parse_args()
+
+    if not args.tomor:
+        print("Univerzum lekerese...", file=sys.stderr)
+    uni = perp_universe()
+    umap = {u["coin"]: u for u in uni}
+    hedge = spot_hedgeable()
+    if not args.tomor:
+        print(f"  {len(uni)} perp, {len(hedge)} hedgelheto spot par", file=sys.stderr)
+
+    if args.coins:
+        coins = [c.strip() for c in args.coins.split(",") if c.strip()]
+    else:
+        coins = [u["coin"] for u in uni if u["vol"] >= args.min_vol and (not args.csak_spot or u["coin"] in hedge)][: args.top]
+
+    rows = analyze(coins, args.days, args.hold_days, umap, hedge, progress=not args.tomor)
+    if args.tomor:
+        print(compact(rows, args.days))
+        return
 
     print(f"\n{'COIN':<10}{'vol M$':>9}{'OI M$':>8}{'atlag%':>9}{'median%':>9}"
           f"{'poz.ora%':>10}{'szoras%':>9}{'most%':>8}{'netto%':>9}{'spot':>6}  ITELET")
     print("-" * 104)
     for r in rows:
-        if r["med"] > 10 and r["pos"] > 70 and r["hedge"]:
+        if r["med"] >= GATE_MEDIAN_ANN and r["pos"] >= GATE_POS_PCT and r["hedge"]:
             v = "ERDEMES (hedgelheto)"
         elif r["med"] > 10 and r["pos"] > 70:
             v = "jo rata, DE nincs spot hedge"
@@ -190,7 +238,7 @@ def main():
             v = "nem perszisztens"
         print(f"{r['coin']:<10}{r['vol']/1e6:>9.1f}{r['oi']/1e6:>8.1f}"
               f"{r['mean']:>9.1f}{r['med']:>9.1f}{r['pos']:>10.1f}{r['sd']:>9.1f}"
-              f"{r['now']:>8.1f}{r['net']:>9.1f}{'igen' if r['hedge'] else '-':>6}  {v}")
+              f"{r['now']:>8.1f}{r['net']:>9.1f}{(r['spot'] or '-')[:6]:>6}  {v}")
 
     print(f"""
 MAGYARAZAT

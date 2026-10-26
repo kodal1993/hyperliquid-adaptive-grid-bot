@@ -1,5 +1,11 @@
 # Changelog
 
+## Kísérleti napló: Funding carry 2.0 kártya (B irány)
+
+- **Telegram `/funding`:** a carry 2.0 kapujának szkennere a telefonról (90 nap, csak a fedezhető eszközök, 1–3 perc). Az első sor: „KAPU: ÁTMENT / NEM MENT ÁT”.
+- **`funding_scan`:** az áthidalt spot-tokenek (UBTC, UETH, USOL) a perp-névhez párosítva (eddig a BTC/ETH/SOL fedezhetetlennek látszott); `--csak-spot` (gyorsabb) és `--tomor` (Telegram-kimenet a kapuval); a „spot” oszlop a fedező token nevét mutatja.
+- `docs/KISERLETEK.md`: új kísérleti kártya, kód nélkül. Eszközválasztás a fedezhető eszközök közül, rezsimkapcsoló, 65%-os fedezettség újrasúlyozással, maker-megbízások; költségpadló és várható hozam forgatókönyvenként; kapu (`funding_scan`, 90 nap: legalább 10%/év medián és legalább 70% pozitív óra); siker: HLP + 2 százalékpont; határidő az indulástól 30 nap. A megfontolt alternatívák és hogy miért nem jobbak most.
+
 ## Kísérleti napló: a pump.fun sniper lezárva (kudarc)
 
 - 2026-10-23 19:04: S10_bennfentes −14,2% ±8,8 (n=90) és S13_amm −54,5% ±10,7 (n=99), mindkettő `NEGATIV`; az S14 végső száma −24,9% ±4,6 (n=161).

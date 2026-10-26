@@ -1861,6 +1861,18 @@ def test_control_bot_sniper_runs_without_control_env(monkeypatch):
     assert seen["paper_carry"] is None
 
 
+def test_control_bot_funding_command_runs_gate_scan(monkeypatch):
+    telegram_bot = load_telegram_control_bot_module()
+    assert "funding" in {c["command"] for c in telegram_bot.BOT_COMMANDS} and "/funding" in telegram_bot.HELP_TEXT
+    calls = []
+    monkeypatch.setattr(telegram_bot, "paper_script", lambda name, *a, **k: calls.append((name, a, k)) or "KAPU: ATMENT")
+    reply, _ = telegram_bot.handle_command("/funding")
+    assert "KAPU: ATMENT" in reply
+    name, args, kw = calls[0]
+    assert name == "funding_scan" and {"--csak-spot", "--tomor"} <= set(args) and args[args.index("--days") + 1] == "90"
+    assert kw["timeout"] >= 600
+
+
 def test_control_bot_splits_messages_on_line_boundaries():
     telegram_bot = load_telegram_control_bot_module()
     text = "\n".join(["x" * 90] * 41 + ["z" * 39, "  koveto-poziciok osszesen: 38144, atlag -12.5%"] + ["y" * 90] * 5)
