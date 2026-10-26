@@ -77,6 +77,7 @@ BOT_COMMANDS = [
     {"command": "wallets", "description": "Sniper: okos tárcák viselkedése"},
     {"command": "tokens", "description": "Sniper: nyerő tokenek korai jelei"},
     {"command": "carry", "description": "Carry: állapot és összesítő"},
+    {"command": "funding", "description": "Carry 2.0 kapu: funding-szkenner (90 nap)"},
     {"command": "logs_sniper", "description": "Sniper: utolsó naplósorok"},
     {"command": "logs_carry", "description": "Carry: utolsó naplósorok"},
     {"command": "restart_sniper", "description": "Sniper újraindítása"},
@@ -103,6 +104,7 @@ HELP_TEXT = """🤖 PAPÍR-BOTOK VEZÉRLÉSE (valódi pénz nélkül)
 👛 /wallets - okos tárcák viselkedése: mi működik, szerencse vagy tudás
 🏆 /tokens - nyerő tokenek korai jelei (tanító / ellenőrző rész)
 💰 /carry - carry: állapot és összesítő
+📈 /funding - a carry 2.0 kapuja: funding-szkenner a fedezhető eszközökre (90 nap, 1–3 perc)
 📜 /logs_sniper, /logs_carry - utolsó naplósorok
 🔄 /restart_sniper, /restart_carry - újraindítás
 ⏸ /stop_sniper, /stop_carry - leállítás (megerősítéssel)
@@ -608,6 +610,9 @@ def handle_command(text: str, *, confirmed: bool = False) -> tuple[str, dict[str
         return "🔬 SNIPER DIAG\n" + paper_script("paper_sniper", "diag"), None
     if command == "/carry":
         return "💰 CARRY\n" + paper_script("paper_carry", "status") + "\n" + paper_script("paper_carry", "report"), None
+    if command == "/funding":
+        return "📈 FUNDING (carry 2.0 kapu)\n" + paper_script(
+            "funding_scan", "--csak-spot", "--days", "90", "--top", "40", "--min-vol", "1e6", "--tomor", timeout=900), None
     if command in {"/set", "/unset"}:
         return set_command(text), None
     m = re.fullmatch(r"/(logs|restart|stop|start)_(sniper|carry)", command)
@@ -761,6 +766,8 @@ def handle_update(token: str, chat: str, allowed: set[str], update: dict[str, An
         return
     if command == "/report":
         send_message(token, chat_id, "⏳ Jelentés készül...")
+    if command == "/funding":
+        send_message(token, chat_id, "⏳ Funding-szkenner fut (90 nap, a fedezhető eszközök; 1–3 perc)...")
     try:
         reply, markup = handle_command(text)
     except Exception as exc:

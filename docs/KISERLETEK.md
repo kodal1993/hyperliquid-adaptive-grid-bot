@@ -192,9 +192,10 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
 - **Költségpadló és várható hozam** (a teljes tőkére, havi egy be+ki körrel, maker díjjal): funding 7,5%/év → kb. 4,0%;
   11%/év → kb. 6,3%; 20%/év → kb. 12%. Vagyis semleges piacon a HLP körül vagy kicsit fölötte, magas fundingnál jóval
   fölötte. Ez nem nagy nyeremény, hanem hozam plusz felkészültség a magas fundingú időszakokra.
-- **Kapu (kód előtt):** a VPS-en `funding_scan --top 80 --days 90`. Akkor építjük, ha van legalább egy Hyperliquid-spottal
-  fedezhető eszköz, amelynek a 90 napos medián fundingja legalább 10%/év, és az órák legalább 70%-ában pozitív. Ha nincs,
-  nem építjük: az A (passzív hozam) marad.
+- **Kapu (kód előtt):** Telegram `/funding` (a VPS-en: `funding_scan --csak-spot --days 90 --tomor`). Akkor építjük, ha van
+  legalább egy Hyperliquid-spottal fedezhető eszköz, amelynek a 90 napos medián fundingja legalább 10%/év, és az órák
+  legalább 70%-ában pozitív. Ha nincs, nem építjük: az A (passzív hozam) marad. A fő eszközök a spoton áthidalt tokenként
+  léteznek (UBTC, UETH, USOL); ezek is fedezhetők, de a híd a fedezés saját kockázata.
 - **Mérés:** papíron, mint az 1.0 (`/carry`, 2 órás jelentés), a teljes tőkére évesített nettó hozammal, a becsült zárási
   költséggel együtt.
 - **Siker (határidőig):** a nettó évesített hozam a teljes tőkére legalább a HLP APR + 2 százalékpont, likvidálás nélkül.
