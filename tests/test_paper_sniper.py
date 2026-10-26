@@ -523,3 +523,22 @@ def test_wallet_skill_verdict_needs_significance(tmp_path, monkeypatch):
     assert "jobbak (statisztikailag)" in line_a and "jobbak (statisztikailag)" in line_w
     assert "100% vs 60%" in line_w
     assert mod.num(float("nan")) == "-" and mod.num(1.234) == "1.2"
+
+
+def test_report_curve_split_has_error_margin(tmp_path, monkeypatch):
+    mod = load_sniper(tmp_path, monkeypatch)
+    now = time.time()
+    mod.STATE_FILE.write_text(json.dumps({"positions": [], "saved": now, "stats": {"started": now - 3600, "strats": ["S10_bennfentes"]}}))
+    with mod.CURVE_LOG.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["ts", "mint", "v0", "mayhem"])
+        for i in range(6):
+            w.writerow([1, f"m{i}", 2.66 if i < 3 else 30.0, int(i < 3)])
+    with mod.TRADES_FILE.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(mod.TRADE_FIELDS)
+        for i, ret in enumerate([30, 10, 20, -40, -20, -30]):
+            w.writerow([round(now) - 600, round(now) - 60, "S10_bennfentes", f"m{i}", "n", "s", 60, 40, 41, 0.101,
+                        0.101 * (1 + ret / 100), 0.101 * ret / 100, ret, "ido", 540, 0])
+    line = next(ln for ln in mod.report_text().splitlines() if "gorbe szerint" in ln)
+    assert "szabvanyos n=3 atlag -30.0% ±11.3 nyero 0%" in line and "mayhem n=3 atlag +20.0% ±11.3 nyero 100%" in line

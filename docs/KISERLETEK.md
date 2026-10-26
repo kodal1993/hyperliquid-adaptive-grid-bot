@@ -209,6 +209,34 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
   - *Likviditás-szolgáltatás / market making*: lásd a következő kártyát; a tájékozott kereskedők elleni hátrány miatt
     most nem.
 
+### Adatbányászat: mayhem-tokenek és más szeletek (a `scripts/paper_sniper` adatai) — feltárás (2026-10-26)
+- **Ki fizet nekünk, és miért:** nyitott kérdés, ezt keressük. A kiinduló megfigyelés: a mayhem-tokeneken (a pump.fun
+  ügynöke díj nélkül kereskedik, a görbe nem szabványos) a tárcák 2026-10-22-én pozitívak voltak (medián +9,3%, n=148),
+  a szabványos görbéken negatívak (medián −13,4%, n=2205). Ha a dinamika ott más, ott lehet előny.
+- **Miért nem viszi el más:** a mayhem-mód új. Ha van hatás, lehet, hogy még nem árazták be; de az is lehet, hogy egyszeri
+  zaj volt.
+- **Költségpadló:** görbén kb. −5% / pozíció (1,25% díj irányonként + prio). A papírteszt mayhem-tokeneken is 1,25%-kal
+  számol (konzervatív: az ügynök díja 0 volt, a miénket nem tudjuk).
+- **Szabályok az adatbányászat csapdája ellen** (a feltárás előtt rögzítve):
+  1. **Feltáró adat:** ami 2026-10-26-ig összegyűlt. **Megerősítő adat:** csak a jelöltek rögzítése után gyűlő, friss adat.
+  2. **Előre felsorolt szeletek** (csak ezek; utólag nem bővítjük):
+     - a. `S10_bennfentes` görbe szerint (mayhem / szabványos / egyéb; `/sniper`, „görbe szerint” sor ±CI-vel);
+     - b. `S13_amm` ugyanígy;
+     - c. `S14_volumen` ugyanígy (a leállításig gyűlt adat);
+     - d. token-napló: a görbe-sáv nyerő aránya és a „kivehető” érték (tanító és ellenőrző rész; `/tokens`).
+  3. **Jelölt** csak az a szelet lehet, amely a feltáró adaton legalább 30 pozíción az átlag − hibahatár > 0 (a d.-nél:
+     a „kivehető” mindkét részen 1,0 fölött, legalább 30 ellenőrző tokennel).
+  4. **Megerősítés:** a jelölt(ek) papíron, friss adaton, legalább 50 pozíción. A hibahatár k jelöltnél szigorítva
+     (95% helyett 1 − 0,05/k; k = 3-nál kb. 98,3%, vagyis ±2,4 standard hiba ±1,96 helyett).
+  5. Ha egy szelet sem jelölt, vagy a megerősítés nem pozitív, az adatbányászat lezárul, kudarc.
+- **Adatforrás:** a sniper adatgyűjtésre tovább fut (S10, S13). Egy S14-jelölt megerősítéséhez az S14-et a jelölt szeletre
+  szűkítve kellene újraindítani (az új kísérlet része, nem a lezárt S14 folytatása).
+- **Mérés:** `/sniper` (görbe szerint, ±CI), `/tokens`.
+- **Siker:** legalább egy jelölt a megerősítő adaton a szigorított hibahatárral együtt is pozitív; utána a 6. szabály
+  szerint (két papír-időszak, csak utána éles szóba).
+- **Leállítás:** nincs jelölt; vagy a határidőre a megerősítés nem pozitív.
+- **Határidő:** feltárás 2026-10-27; megerősítés a jelöltek rögzítésétől 14 nap.
+
 ### Likviditás-szolgáltatás (pl. Meteora DLMM / PumpSwap pool) — ötlet, a sniper lezárása után
 - **Ki fizet nekünk, és miért:** a kereskedők díjat fizetnek a likviditásért. Itt a „ház”
   oldalán állunk, nem a díjfizetőén.
