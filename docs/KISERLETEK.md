@@ -171,6 +171,43 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
   (3%/év) alatt.
 - **Határidő:** 2026-10-28.
 
+### Funding carry 2.0 (`scripts/paper_carry` továbbfejlesztve) — ötlet; indítás a carry 1.0 lezárása (10-28) után, ha a kapu átmegy
+- **Ki fizet nekünk, és miért:** a perp longok fundingot fizetnek a shortoknak, mert tőkeáttételt akarnak. A Hyperliquid
+  funding-képletében egy fix kamatkomponens is van (ha a prémium kicsi, kb. 11%/év; a kapu ellenőrzi). Mi delta-semlegesen
+  (spot long + perp short) ezt gyűjtjük, mint az 1.0-ban.
+- **Miért nem viszi el más:** viszik (vaultok, nagy delta-semleges termékek), de ez nem verseny, hanem megosztott hozam.
+  A kérdés csak az, hogy díjak után a HLP fölött van-e.
+- **Mit tanultunk az 1.0-ból (32,6 nap, HYPE):** a 7 napos funding 7–8%/év volt, a teljes tőkére mégis csak kb. 3,3%/év
+  jött, mert (1) a 100 $-ból csak 50 $ volt fedezett pozícióban, (2) taker díjjal léptünk be, (3) a HYPE fundingját
+  negatív prémium húzta a kamatkomponens alá.
+- **Változások az 1.0-hoz képest (előre rögzítve):**
+  1. **Eszközválasztás:** nem fix HYPE, hanem a Hyperliquid-spottal fedezhető eszközök közül az, amelyiknek a 30 napos
+     medián fundingja a legmagasabb, és az órák legalább 70%-ában pozitív (`funding_scan`). Eszközváltás legfeljebb
+     7 naponként, és csak ha az új 7 napos fundingja legalább 5 százalékponttal magasabb.
+  2. **Rezsimkapcsoló:** nyitás, ha a választott eszköz 7 napos fundingja legalább 8%/év; zárás, ha 3%/év alá esik.
+  3. **Tőkehatékonyság:** fedezett méret a tőke 65%-a (az 1.0-ban 50%); a perp short kb. 2x tőkeáttétel, és
+     automatikus újrasúlyozás (spotból margin a perpbe), ha a likvidálási távolság 60% alá csökken.
+  4. **Maker-megbízások** belépéskor és kilépéskor (nem sürgős, várhatunk a teljesülésre): a körönkénti költség kb.
+     11 bps a 23 helyett.
+- **Költségpadló és várható hozam** (a teljes tőkére, havi egy be+ki körrel, maker díjjal): funding 7,5%/év → kb. 4,0%;
+  11%/év → kb. 6,3%; 20%/év → kb. 12%. Vagyis semleges piacon a HLP körül vagy kicsit fölötte, magas fundingnál jóval
+  fölötte. Ez nem nagy nyeremény, hanem hozam plusz felkészültség a magas fundingú időszakokra.
+- **Kapu (kód előtt):** a VPS-en `funding_scan --top 80 --days 90`. Akkor építjük, ha van legalább egy Hyperliquid-spottal
+  fedezhető eszköz, amelynek a 90 napos medián fundingja legalább 10%/év, és az órák legalább 70%-ában pozitív. Ha nincs,
+  nem építjük: az A (passzív hozam) marad.
+- **Mérés:** papíron, mint az 1.0 (`/carry`, 2 órás jelentés), a teljes tőkére évesített nettó hozammal, a becsült zárási
+  költséggel együtt.
+- **Siker (határidőig):** a nettó évesített hozam a teljes tőkére legalább a HLP APR + 2 százalékpont, likvidálás nélkül.
+- **Leállítás:** 30 nap után a HLP alatt; vagy egy likvidálás; vagy 3 napig nincs a nyitási feltételnek megfelelő eszköz.
+- **Határidő:** az indulástól számított 30 nap (pl. 10-29-es indulásnál 11-28).
+- **Megfontolt, de most nem jobb alternatívák:**
+  - *Passzív carry-termék* (nagy, delta-semleges funding-termékek): ugyanezt a hozamforrást profik futtatják, jobb
+    tőkehatékonysággal. Ha a cél csak a pénz, ezt érdemes a B-vel összevetni; kockázata a kibocsátó és a tőzsdék.
+  - *Tőzsdék közötti funding-arbitrázs* (Hyperliquid kontra központosított tőzsde): a különbségek néha nagyobbak, de
+    KYC, két helyen tartott tőke és átutalási költség kell; 100 $-on a fix költség elviszi. Most elvetve.
+  - *Likviditás-szolgáltatás / market making*: lásd a következő kártyát; a tájékozott kereskedők elleni hátrány miatt
+    most nem.
+
 ### Likviditás-szolgáltatás (pl. Meteora DLMM / PumpSwap pool) — ötlet, a sniper lezárása után
 - **Ki fizet nekünk, és miért:** a kereskedők díjat fizetnek a likviditásért. Itt a „ház”
   oldalán állunk, nem a díjfizetőén.
