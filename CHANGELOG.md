@@ -1,5 +1,10 @@
 # Changelog
 
+## Kísérleti napló: adatbányászati kártya (mayhem-tokenek); `/sniper` görbe-bontás hibahatárral
+
+- `docs/KISERLETEK.md`: új kártya, a feltárás előtt rögzítve. Feltáró adat 2026-10-26-ig, megerősítés csak friss adaton; négy előre felsorolt szelet (S10, S13, S14 görbe szerint; a token-napló görbe-sávja); jelölt csak legalább 30 pozíción hibahatárral pozitív szelet; megerősítés legalább 50 pozíción, k jelöltnél szigorított hibahatárral; határidők.
+- `/sniper`: a „görbe szerint” sor stratégiánként és görbefajtánként a 95%-os hibahatárt és a nyerő arányt is mutatja (eddig csak az átlagot), hogy a feltárás eldönthető legyen.
+
 ## Kísérleti napló: Funding carry 2.0 kártya (B irány)
 
 - **Telegram `/funding`:** a carry 2.0 kapujának szkennere a telefonról (90 nap, csak a fedezhető eszközök, 1–3 perc). Az első sor: „KAPU: ÁTMENT / NEM MENT ÁT”.

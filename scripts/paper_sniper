@@ -1629,10 +1629,14 @@ def report_text(short=False):
         lines.append(f"  hozam eloszlas: p10 {pct(ret, .1):+.0f}%  median {pct(ret, .5):+.0f}%  p90 {pct(ret, .9):+.0f}%  max {max(ret):+.0f}%")
         kinds = {}
         for r in xs:
-            kinds.setdefault(CURVE_LABELS[curves.get(r["mint"], -1)], []).append(fnum(r["ret_pct"]))
+            kinds.setdefault(CURVE_LABELS[curves.get(r["mint"], -1)], []).append(r)
         if set(kinds) - {"ismeretlen"}:
-            lines.append("  gorbe szerint: " + " | ".join(f"{k} n={len(v)} atlag {sum(v) / len(v):+.1f}%"
-                                                         for k, v in sorted(kinds.items(), key=lambda kv: CURVE_CODES[kv[0]])))
+            parts = []
+            for k, v in sorted(kinds.items(), key=lambda kv: CURVE_CODES[kv[0]]):
+                a = strat_stats(v)
+                parts.append(f"{k} n={a['n']} atlag {a['mean']:+.1f}%" + ("" if math.isnan(a["ci"]) else f" ±{a['ci']:.1f}")
+                             + f" nyero {a['win']:.0f}%")
+            lines.append("  gorbe szerint: " + " | ".join(parts))
         if grad:
             g_pnl = sum(float(r["pnl_sol"]) for r in xs if r["graduated"] == "1")
             ng = [float(r["ret_pct"]) for r in xs if r["graduated"] != "1"]
