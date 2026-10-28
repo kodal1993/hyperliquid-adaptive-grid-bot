@@ -156,7 +156,7 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
   ugyanerre a piacra új stratégiát nem írunk. Ami megmarad: a mérőrendszer (díjak, PumpSwap-ár, túladás-szűrés,
   stratégia-figyelmeztetés, tesztek valódi adaton) és ez a napló.
 
-### HYPE funding carry (`scripts/paper_carry`) — papír
+### HYPE funding carry (`scripts/paper_carry`) — lezárva: kudarc, kis különbséggel (2026-10-28)
 - **Ki fizet nekünk, és miért:** a HYPE perp longjai fundingot fizetnek a shortoknak. Mi
   delta-semlegesen (spot long + perp short) ezt gyűjtjük.
 - **Miért nem viszi el más:** viszik is (vaultok, pl. Neutral Trade), de a funding mindenki
@@ -170,6 +170,12 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
 - **Leállítás:** a nettó hozam a HLP alatt van, vagy a 7 napos funding tartósan a zárási küszöb
   (3%/év) alatt.
 - **Határidő:** 2026-10-28.
+- **Eredmény (2026-10-28): lezárva, kudarc (kis különbséggel).** 34,9 nap alatt +0,312 $ a 100 $-on, évesítve +3,3%
+  (funding +0,362 $, díjak −0,057 $, bázis +0,007 $), likvidálás nélkül; a becsült zárási költséggel (kb. 0,06 $)
+  kb. +2,6%/év. A mérce (HLP kb. 3,5%) alatt. A 7 napos funding végig 7–8%/év volt, a zárási küszöb fölött; a
+  hozamot a tőkehatékonyság fogta vissza (csak 50 $ fedezett). Tanulság: a funding carry pozitív, de ebben a
+  formában csak HLP-szintű; a továbbfejlesztett változat (carry 2.0) a fő eszközökön is csak a HLP körül hozna.
+  Megjegyzés: a HLP-mércét 2026 október elején becsültük, a tényleges HLP-hozamot erre az időszakra nem mértük.
 
 ### Funding carry 2.0 (`scripts/paper_carry` továbbfejlesztve) — ötlet; indítás a carry 1.0 lezárása (10-28) után, ha a kapu átmegy
 - **Ki fizet nekünk, és miért:** a perp longok fundingot fizetnek a shortoknak, mert tőkeáttételt akarnak. A Hyperliquid
@@ -236,6 +242,16 @@ előre rögzített siker- és leállítási feltételekkel, nem a „gyűjtsünk
   szerint (két papír-időszak, csak utána éles szóba).
 - **Leállítás:** nincs jelölt; vagy a határidőre a megerősítés nem pozitív.
 - **Határidő:** feltárás 2026-10-27; megerősítés a jelöltek rögzítésétől 14 nap.
+- **Eredmény (2026-10-28): lezárva, kudarc (nincs jelölt).** A feltárás (2026-10-26-i adat):
+  - a. S10: mayhem −34,4% ±46,0 (n=11, kevés), szabványos −14,1% ±6,3 (n=131);
+  - b. S13: szabványos −49,1% ±15,4 (n=40), mayhem-pozíció nincs;
+  - c. S14: szabványos −26,8% ±9,1 (n=55), mayhem-pozíció nincs;
+  - d. token-napló, mayhem-sáv: az ellenőrző részen 13,4% nyerő (alapvonal 5,1%), „kivehető” 1,12 (n=1402); a tanító
+    rész értékét a riport nem mutatja, így a feltétel formálisan nem dönthető el. Kalibráció: ugyanez a mérőszám az
+    S14-jelre 1,48-at mutatott, a valódi papír-kereskedés −24,9% lett (n=161); a mayhem-görbék kis tartaléka miatt a
+    csúszás is nagyobb. Ezért a d. sem jelölt.
+  - A listán kívüli, látványos sávok (pl. dev-részesedés 20% fölött, „kivehető” 3,01) a szabály szerint nem
+    jelöltek; ugyanaz a mérőszám áll mögöttük, és a graduációt nyerőnek számolja.
 
 ### Likviditás-szolgáltatás (pl. Meteora DLMM / PumpSwap pool) — ötlet, a sniper lezárása után
 - **Ki fizet nekünk, és miért:** a kereskedők díjat fizetnek a likviditásért. Itt a „ház”
