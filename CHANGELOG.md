@@ -1,5 +1,11 @@
 # Changelog
 
+## Kísérleti napló: a HYPE carry és az adatbányászat lezárva
+
+- HYPE funding carry (határidő 2026-10-28): +3,3%/év 34,9 nap alatt, likvidálás nélkül, a zárási költséggel kb. +2,6%; a HLP (kb. 3,5%) alatt, lezárva: kudarc, kis különbséggel.
+- Adatbányászat (feltárás 2026-10-27): egyik előre felsorolt szelet sem jelölt (S10/S13/S14 görbe szerint negatív vagy kevés; a token-napló mayhem-sávja a kalibráció alapján nem), lezárva: kudarc.
+- Aktív kísérlet nincs.
+
 ## Kísérleti napló: adatbányászati kártya (mayhem-tokenek); `/sniper` görbe-bontás hibahatárral
 
 - `docs/KISERLETEK.md`: új kártya, a feltárás előtt rögzítve. Feltáró adat 2026-10-26-ig, megerősítés csak friss adaton; négy előre felsorolt szelet (S10, S13, S14 görbe szerint; a token-napló görbe-sávja); jelölt csak legalább 30 pozíción hibahatárral pozitív szelet; megerősítés legalább 50 pozíción, k jelöltnél szigorított hibahatárral; határidők.
